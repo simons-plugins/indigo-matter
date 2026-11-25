@@ -26,7 +26,7 @@ from test_device_sync import (  # noqa: F401  (fixtures and node fixtures)
     indigo_env, ds, plugin_cls, LOCK_SETTINGS_NODE, OCCUPANCY_SENSITIVITY_NODE,
     LIGHTING_PLUG_NODE,
 )
-from test_plugin_module import _lock_dev, _lock_stub, _LOCK_PROPS  # noqa: F401
+from test_plugin_module import _lock_dev, _lock_stub, _LOCK_PROPS, _seeded_call  # noqa: F401
 from test_unread_settings import _stub, _start, _open, _rows, _lock, _sensor
 
 ARL = next(s for s in settings_for_type("matterLock") if s.key == "autoRelockTime")
@@ -126,34 +126,18 @@ def test_a_silent_ack_is_still_described_as_a_firmware_that_ignores_writes():
     assert "refused" not in message
 
 
-class _SpyDev:
-    """Records which write calls are used."""
-
-    def __init__(self, real):
-        self.real, self.calls = real, []
-
-    def __getattr__(self, name):
-        return getattr(self.real, name)
-
-
-def test_a_write_that_must_not_clear_the_error_uses_the_documented_single_key_call(
-        ds, indigo_env):
+def test_a_write_that_must_not_clear_the_error_uses_the_documented_single_key_call(ds, indigo_env):
     _i, devices = indigo_env
     ds.create_from_raw(OCCUPANCY_SENSITIVITY_NODE, "FP300")
     dev = devices[ds.lookup(0x2D, 1)]
     dev.setErrorStateOnServer("unreachable")
-    calls = []
-    real = dev.updateStateOnServer
-
-    def spy(key, value=None, **kwargs):
-        calls.append((key, value, kwargs))
-        real(key, value, **kwargs)
-
-    dev.updateStateOnServer = spy
     dev.updateStatesOnServer = lambda kv: pytest.fail("the batch call cannot opt out of clearing")
+    before = len(dev.single_key_calls)
     ds.apply_states(dev.id, [{"key": "sensitivityLevel", "value": 2, "uiValue": "High"}],
                     clear_error=False)
-    assert calls == [("sensitivityLevel", 2, {"uiValue": "High", "clearErrorState": False})]
+    assert dev.single_key_calls[before:] == [{
+        "key": "sensitivityLevel", "value": 2, "clearErrorState": False, "uiValue": "High",
+        "decimalPlaces": None, "triggerEvents": True}]
     assert dev.errorState == "unreachable"
 
 
@@ -161,16 +145,9 @@ def test_the_unknown_flag_is_display_only_and_does_not_fire_triggers(ds, indigo_
     _i, devices = indigo_env
     ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
     dev = devices[ds.lookup(0x39, 1)]
-    calls = []
-    real = dev.updateStateOnServer
-
-    def spy(key, value=None, **kwargs):
-        calls.append(kwargs)
-        real(key, value, **kwargs)
-
-    dev.updateStateOnServer = spy
     ds.mark_setting_unread(dev.id, "autoRelockTime")
-    assert calls and calls[0]["triggerEvents"] is False and calls[0]["clearErrorState"] is False
+    call = dev.single_key_calls[-1]
+    assert call["triggerEvents"] is False and call["clearErrorState"] is False
 
 
 def test_a_node_device_stays_flagged_when_its_reachable_state_is_written(ds, indigo_env):
@@ -225,27 +202,36 @@ def test_the_user_typing_a_value_after_a_stale_seed_is_written(plugin_cls, ds, i
     assert (plan.setting.key, plan.value, plan.previous) == ("autoRelockTime", 60, 120)
 
 
-def test_the_remembered_seed_is_cleared_on_close_and_on_cancel(plugin_cls, ds, indigo_env, mock_logger):
-    _i, devices = indigo_env
-    dev = _lock(ds, devices)
-    stub, _runtime = _lock_dialog_stub(plugin_cls, ds, mock_logger)
-    values = _seed_dialog(plugin_cls, stub, dev)
-    assert dev.id in vars(stub)["_dialog_seeds"]
-    plugin_cls.closedDeviceConfigUi(stub, dict(values), True, "matterLock", dev.id)       # cancel
-    assert dev.id not in vars(stub)["_dialog_seeds"]
-    values = _seed_dialog(plugin_cls, stub, dev)
-    plugin_cls.closedDeviceConfigUi(stub, dict(values), False, "matterLock", dev.id)       # Save
-    assert dev.id not in vars(stub)["_dialog_seeds"]
-
-
-def test_without_a_remembered_seed_the_state_comparison_still_applies(plugin_cls, ds, indigo_env, mock_logger):
+def test_the_remembered_seed_is_spent_on_close_and_on_cancel(plugin_cls, ds, indigo_env, mock_logger):
+    """Behavioural: after a Save or a Cancel the seed is gone, so a later Save with no
+    new open plans nothing (and says why) rather than reusing it."""
     _i, devices = indigo_env
     dev = _lock(ds, devices)
     stub, runtime = _lock_dialog_stub(plugin_cls, ds, mock_logger)
-    values = {**_LOCK_PROPS, "autoRelockTime": "30", "wrongCodeEntryLimit": "5",
+    values = _seed_dialog(plugin_cls, stub, dev)
+    plugin_cls.closedDeviceConfigUi(stub, dict(values), True, "matterLock", dev.id)       # cancel
+    values["autoRelockTime"] = "90"
+    plugin_cls.closedDeviceConfigUi(stub, dict(values), False, "matterLock", dev.id)      # no seed now
+    runtime.submit.assert_not_called()
+    assert any("starting values" in str(c) for c in mock_logger.warning.call_args_list)
+    values = _seed_dialog(plugin_cls, stub, dev)
+    values["autoRelockTime"] = "90"
+    plugin_cls.closedDeviceConfigUi(stub, dict(values), False, "matterLock", dev.id)      # Save
+    assert runtime.submit.call_count == 1
+    plugin_cls.closedDeviceConfigUi(stub, dict(values), False, "matterLock", dev.id)      # spent
+    assert runtime.submit.call_count == 1
+
+
+def test_without_a_remembered_seed_nothing_is_planned_even_for_a_changed_value(
+        plugin_cls, ds, indigo_env, mock_logger):
+    _i, devices = indigo_env
+    dev = _lock(ds, devices)
+    stub, runtime = _lock_dialog_stub(plugin_cls, ds, mock_logger)
+    values = {**_LOCK_PROPS, "autoRelockTime": "99", "wrongCodeEntryLimit": "5",
               "userCodeTemporaryDisableTime": "60"}                   # plugin restarted mid-dialog
     plugin_cls.closedDeviceConfigUi(stub, values, False, "matterLock", dev.id)
     runtime.submit.assert_not_called()
+    assert any("starting values" in str(c) for c in mock_logger.warning.call_args_list)
 
 
 # --- 5. an int32-overflowing reading un-reads an already-read setting ------
@@ -281,31 +267,6 @@ def test_L_an_unavailable_snapshot_does_not_revert_a_confirmed_write(plugin_cls,
     assert dev.states["autoRelockTime"] == 45
 
 
-def test_an_unreachable_device_says_its_values_may_be_out_of_date(plugin_cls, ds, indigo_env, mock_logger):
-    _i, devices = indigo_env
-    dev = _lock(ds, devices)
-    stub = _stub(plugin_cls, ds, mock_logger)
-    assert _open(plugin_cls, stub, dev, "matterLock")["settingsStale"] == "no"
-    dev.setErrorStateOnServer("unreachable")
-    assert _open(plugin_cls, stub, dev, "matterLock")["settingsStale"] == "yes"
-
-
-def test_every_settings_dialog_has_its_stale_marker_and_note():
-    import xml.etree.ElementTree as ET
-    from pathlib import Path
-    root = ET.parse(Path(__file__).resolve().parent.parent / "indigo-matter.indigoPlugin" / "Contents"
-                    / "Server Plugin" / "Devices.xml").getroot()
-    for device in root.findall("Device"):
-        fields = {f.get("id"): f for f in device.find("ConfigUI").findall("Field")} \
-            if device.find("ConfigUI") is not None else {}
-        if "settingsHeading" not in fields:
-            continue
-        assert "settingsStale" in fields and fields["settingsStale"].get("hidden") == "true", device.get("id")
-        note = fields.get("settingsStaleNote")
-        assert note is not None and note.get("visibleBindingId") == "settingsStale", device.get("id")
-        assert note.get("visibleBindingValue") == "yes"
-
-
 # --- 7. start-up re-checks against a FRESH device --------------------------
 
 def test_the_unknown_flag_uses_the_fresh_device_so_newly_added_states_are_seen(ds, indigo_env):
@@ -321,7 +282,7 @@ def test_the_unknown_flag_uses_the_fresh_device_so_newly_added_states_are_seen(d
     assert fresh.states["autoRelockTime.ui"] == "unknown"
 
 
-def test_a_reading_that_lands_before_the_flag_write_is_not_overwritten(ds, indigo_env):
+def test_a_flag_issued_after_a_reading_does_not_undo_it(ds, indigo_env):
     _i, devices = indigo_env
     ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
     dev = devices[ds.lookup(0x39, 1)]
@@ -381,19 +342,6 @@ def test_before_any_reconcile_one_line_explains_instead_of_blaming_the_device(
     assert sum("once the plugin has connected" in line for line in lines) == 1
 
 
-def test_closing_the_dialog_while_not_connected_refuses_up_front(plugin_cls, ds, indigo_env, mock_logger):
-    _i, devices = indigo_env
-    dev = _lock(ds, devices)
-    runtime = MagicMock()
-    stub = _stub(plugin_cls, ds, mock_logger, runtime=runtime, matter=SimpleNamespace(connected=False))
-    plugin_cls.closedDeviceConfigUi(
-        stub, {**dev.pluginProps, "autoRelockTime": "60"}, False, "matterLock", dev.id)
-    runtime.submit.assert_not_called()
-    assert "NOT connected" in str(mock_logger.error.call_args) or "nothing was written" in str(
-        mock_logger.error.call_args)
-    assert dev.errorState != "setting failed"
-
-
 # --- 10. gaps the mutation run found ---------------------------------------
 
 def test_A_closing_with_an_unread_lock_submits_a_write_for_zero(plugin_cls, mock_indigo_base, mock_logger):
@@ -402,10 +350,12 @@ def test_A_closing_with_an_unread_lock_submits_a_write_for_zero(plugin_cls, mock
     runtime = MagicMock()
     stub = _lock_stub(plugin_cls, mock_logger, runtime=runtime, matter=MagicMock())
     stub.device_sync.setting_primed.side_effect = lambda dev_id, key: False
-    plugin_cls.closedDeviceConfigUi(
+    _seeded_call("closedDeviceConfigUi", plugin_cls,
         stub, {**_LOCK_PROPS, "autoRelockTime": "0", "wrongCodeEntryLimit": "",
                "userCodeTemporaryDisableTime": ""}, False, "matterLock", 9)
     assert runtime.submit.call_count == 1
+    for call in runtime.submit.call_args_list:
+        call.args[0].close()
 
 
 def test_B_validating_an_unread_lock_still_refuses_an_out_of_range_zero(plugin_cls, mock_indigo_base, mock_logger):
@@ -413,7 +363,7 @@ def test_B_validating_an_unread_lock_still_refuses_an_out_of_range_zero(plugin_c
                                               "userCodeTemporaryDisableTime": 0})}
     stub = _lock_stub(plugin_cls, mock_logger)
     stub.device_sync.setting_primed.side_effect = lambda dev_id, key: False
-    result = plugin_cls.validateDeviceConfigUi(
+    result = _seeded_call("validateDeviceConfigUi", plugin_cls,
         stub, {**_LOCK_PROPS, "autoRelockTime": "", "wrongCodeEntryLimit": "0",
                "userCodeTemporaryDisableTime": ""}, "matterLock", 9)
     assert result[0] is False and "wrongCodeEntryLimit" in result[2]
@@ -493,11 +443,3 @@ def test_a_live_update_keeps_the_cached_reading_current(ds, indigo_env):
     assert ds._setting_readings[0x39][(1, 0x0101, 0x0023)] == 90
 
 
-def test_a_callback_test_with_a_mock_device_sync_cannot_silently_mean_read(plugin_cls, mock_indigo_base, mock_logger):
-    """_settings_stub's MagicMock device_sync returns a truthy MagicMock for
-    setting_primed - 'read'. Tests that care set it explicitly (see above)."""
-    mock_indigo_base.devices = {9: _lock_dev()}
-    stub = _lock_stub(plugin_cls, mock_logger)
-    stub.device_sync.setting_primed.return_value = False
-    values, _ = plugin_cls.getDeviceConfigUiValues(stub, dict(_LOCK_PROPS), "matterLock", 9)
-    assert values["autoRelockTime"] == ""

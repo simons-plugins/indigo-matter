@@ -117,13 +117,57 @@ def _dead_verdict_cause_text(agent) -> str:
 
 
 
-def _is_flagged_unreachable(dev_id) -> bool:
-    """Is this Indigo device currently flagged "unreachable"?"""
+def _is_flagged_unreachable(dev_id, logger=None) -> bool:
+    """Is this Indigo device currently flagged "unreachable"?
+
+    A device that is gone (KeyError) is not stale. Any OTHER failure to ask is not
+    allowed to read as "current": it is logged and treated as possibly out of date.
+    """
     try:
-        return indigo.devices[dev_id].errorState == "unreachable"
-    except Exception:  # pylint: disable=broad-except
-        # no such device yet (a new one) or an unreadable one: nothing to warn about
+        return getattr(indigo.devices[dev_id], "errorState", "") == "unreachable"
+    except KeyError:
         return False
+    except Exception as exc:  # pylint: disable=broad-except
+        # cannot tell: the safe answer for a note about staleness is "may be stale"
+        if logger is not None:
+            logger.warning("could not tell whether device %s is reachable (%s); "
+                           "its settings may be out of date", dev_id, exc)
+        return True
+
+
+def _matter_connected(plugin) -> bool:
+    """Is the plugin connected to matter-server? No permissive default: a client with
+    no ``connected`` attribute is NOT connected."""
+    client = getattr(plugin, "matter", None)
+    return client is not None and bool(getattr(client, "connected", False))
+
+
+def _connected_and_reconciled(plugin, dev_id) -> bool:
+    """Connected to matter-server AND this device's node read this run."""
+    if not _matter_connected(plugin):
+        return False
+    try:
+        node_id = indigo.devices[dev_id].pluginProps.get("nodeId")
+        return bool(plugin.device_sync.node_reconciled(int(node_id)))
+    except Exception:  # pylint: disable=broad-except
+        # cannot tell: treat as not yet reconciled (the harmless wording)
+        return False
+
+
+def _remember_seed(plugin, dev_id, seeds: dict) -> None:
+    """Remember what a dialog was seeded with, per device. A SECOND open before the
+    first closes makes the slot ambiguous: nobody can say which dialog a Save is
+    from, so neither may use the seed."""
+    slots = vars(plugin).setdefault("_dialog_seeds", {})
+    if dev_id in slots:
+        slots[dev_id]["ambiguous"] = True
+    else:
+        slots[dev_id] = {"seeds": seeds, "ambiguous": False}
+
+
+def _usable_seeds(plugin, dev_id):
+    slot = vars(plugin).get("_dialog_seeds", {}).get(dev_id)
+    return None if slot is None or slot["ambiguous"] else slot["seeds"]
 
 
 class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenuMixin,
@@ -1203,6 +1247,9 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # indigo.Dict has no `pop` (issue #366)
             if "lastSurveySummary" in valuesDict:
                 del valuesDict["lastSurveySummary"]
+        # A dialog-only marker (#388), like lastSurveySummary: never a stored prop.
+        if "settingsStale" in valuesDict:
+            del valuesDict["settingsStale"]
         created = ""
         try:
             created = indigo.devices[devId].pluginProps.get("createdTypeId", "")
@@ -1223,13 +1270,34 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         # sleepy Thread device is seconds and would freeze the dialog.
         if not settings_for_type(typeId):
             return (True, valuesDict)  # most types declare none — nothing to look up
+        seeds = _usable_seeds(self, devId)
+        if seeds is None:
+            # The dialog's starting values are unknown (never opened since the plugin
+            # started, or two dialogs share the device): nothing can be called an
+            # edit, and closedDeviceConfigUi will write nothing.
+            return (True, valuesDict)
+        limits = self._setting_limits_lookup(valuesDict)
+        lists = self._setting_attribute_list_lookup(valuesDict)
+        known = self._has_matter_node(valuesDict)
         setting_errors = device_settings.validate_settings(
-            typeId, valuesDict, self._setting_limits_lookup(valuesDict),
-            self._setting_attribute_list_lookup(valuesDict),
-            self._has_matter_node(valuesDict),
+            typeId, valuesDict, limits, lists, known,
             states=self._device_states(devId),
-            primed=self._setting_primed_lookup(devId),
-            seeds=vars(self).get("_dialog_seeds", {}).get(devId))
+            primed=self._setting_primed_lookup(devId), seeds=seeds)
+        # An edit that cannot be sent is refused HERE, where the user sees it, rather
+        # than failing after the dialog has closed.
+        edited = device_settings.edited_settings(typeId, valuesDict, limits, lists, known, seeds)
+        if edited:
+            if not _matter_connected(self):
+                reason = ("Not connected to matter-server, so this cannot be written now. "
+                          "Clear the field (or leave the picker as it was) to save the rest.")
+            elif _is_flagged_unreachable(devId, self.logger):
+                reason = ("This device is unreachable, so this cannot be written now. "
+                          "Clear the field (or leave the picker as it was) to save the rest.")
+            else:
+                reason = ""
+            if reason:
+                for setting in edited:
+                    setting_errors[setting.key] = reason
         if setting_errors:
             errors = indigo.Dict()
             for field, message in setting_errors.items():
@@ -1303,10 +1371,14 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         does not have on.
         """
         def note(setting, reason):
-            if reason.startswith(device_settings.NO_ATTRIBUTE_LIST_REASON):
+            if (reason.startswith(device_settings.NO_ATTRIBUTE_LIST_REASON)
+                    and not _connected_and_reconciled(self, dev_id)):
                 # No reconcile has cached this device's capabilities yet (the plugin
-                # has not connected to matter-server since it started): that says
-                # nothing about the DEVICE, so say it once rather than per setting.
+                # is not connected, or has not read this node since it started): that
+                # says nothing about the DEVICE, so say it once rather than per
+                # setting. Once connected and reconciled the per-setting reason below
+                # applies, so a device that never reports an AttributeList is
+                # diagnosable.
                 told = vars(self).setdefault("_settings_pending_told", set())
                 if dev_id not in told:
                     told.add(dev_id)
@@ -1531,9 +1603,14 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # What this dialog was SEEDED with, remembered until it closes: a field
             # equal to its seed is "untouched" even if the device's value moves while
             # the dialog is open (another app), so an untouched Save never overwrites it.
-            vars(self).setdefault("_dialog_seeds", {})[devId] = {
-                setting.key: values.get(setting.key, "") for setting in settings_for_type(typeId)}
-            values["settingsStale"] = "yes" if _is_flagged_unreachable(devId) else "no"
+            _remember_seed(self, devId, {
+                setting.key: values.get(setting.key, "") for setting in settings_for_type(typeId)})
+            values["settingsStale"] = "no"
+            if values.get("hasAnySetting") == "yes":
+                if not _matter_connected(self):
+                    values["settingsStale"] = "server"
+                elif _is_flagged_unreachable(devId, self.logger):
+                    values["settingsStale"] = "device"
             if typeId == "matterNode":
                 # Display-only summary of settings_report's SurveyLog for THIS
                 # node (issue #204): the store stays in pluginPrefs (see
@@ -1548,6 +1625,14 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         except Exception as exc:  # pylint: disable=broad-except
             # never block the dialog over the settings section
             self.logger.exception("could not build device settings for %s: %s", devId, exc)
+            # ...and never leave an old saved value in a field an untouched Save could
+            # write: blank every setting field, hide the section, forget the seed.
+            for setting in settings_for_type(typeId):
+                values[setting.key] = ""
+                values[device_settings.marker_field(setting)] = device_settings.MARKER_NO
+            values["hasAnySetting"] = device_settings.MARKER_NO
+            values["settingsStale"] = "no"
+            vars(self).get("_dialog_seeds", {}).pop(devId, None)
         # MUST be indigo.Dict, not a plain dict — the same shape
         # getPrefsConfigUiValues returns. Returning a plain dict fails INSIDE
         # Indigo's C++ bridge, which logs
@@ -1631,8 +1716,19 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         it shows what the device actually holds — never the value that failed.
         """
         # The remembered seed is spent either way (Save or Cancel).
-        seeds = vars(self).get("_dialog_seeds", {}).pop(devId, None)
+        slot = vars(self).get("_dialog_seeds", {}).pop(devId, None)
+        seeds = None if slot is None or slot["ambiguous"] else slot["seeds"]
         if userCancelled or not settings_for_type(typeId):
+            return
+        if seeds is None:
+            # Nothing can be called an edit without the values the dialog started
+            # with: planning against the device's state or saved props could write a
+            # value the user never chose. Say so only if a setting field has content.
+            if any(not device_settings.is_leave_alone(valuesDict.get(s.key)) for s in settings_for_type(typeId)):
+                self.logger.warning(
+                    'device %s: the dialog\'s starting values were not available (it was reopened '
+                    "or the plugin restarted), so no setting was written - please reopen the dialog "
+                    "and change the setting again", devId)
             return
         try:
             plans = device_settings.planned_writes(
@@ -1652,12 +1748,18 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             return
         if not plans:
             return
-        if self.runtime is None or self.matter is None or not getattr(self.matter, "connected", True):
+        if self.runtime is None or not _matter_connected(self):
             # Refused up front: a write that can only fail would also replace the
-            # device's "unreachable" flag with "setting failed".
+            # device's "unreachable" flag with "setting failed". (Validation refuses
+            # an unsendable edit first; this is the backstop.)
+            try:
+                name = indigo.devices[devId].name
+            except Exception:  # pylint: disable=broad-except
+                name = f"id {devId}"
             self.logger.error(
-                "cannot apply device settings — the plugin is NOT connected to matter-server "
-                "(the Matter connection is not running); nothing was written")
+                'cannot apply device settings (%s) to "%s" — the plugin is NOT connected to '
+                "matter-server (the Matter connection is not running); nothing was written",
+                ", ".join(plan.setting.label for plan in plans), name)
             return
         if not self._has_matter_node(valuesDict):
             # Belt-and-braces: planned_writes is already gated on the same
@@ -1726,7 +1828,12 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         self.logger.error("%s", message)
         try:
             dev = indigo.devices[dev_id]
-            dev.setErrorStateOnServer("setting failed")
+            if getattr(dev, "errorState", "") == "unreachable":
+                # Never replace "unreachable" with "setting failed": the device being
+                # unreachable is the more important fact, and the reason this failed.
+                self.logger.error('"%s" was unreachable, so its flag was left as it was', dev.name)
+            else:
+                dev.setErrorStateOnServer("setting failed")
             # A mismatch means the read-back told us what the device ACTUALLY
             # holds. Recording it keeps the dialog honest on next open — it
             # re-seeds from state, so leaving the stale value would show the

@@ -47,7 +47,7 @@ __all__ = [
     "OfferedSetting", "PlannedWrite", "MARKER_YES", "MARKER_NO",
     "offered_settings", "unimplemented_states", "config_ui_values",
     "validate_settings", "planned_writes", "apply_setting",
-    "RemovedStateLog", "PrimedLookup", "picker_rows", "NO_ATTRIBUTE_LIST_REASON",
+    "RemovedStateLog", "PrimedLookup", "picker_rows", "edited_settings", "NO_ATTRIBUTE_LIST_REASON",
     "UNREAD_OPTION_ID", "UNREAD_OPTION_LABEL",
 ]
 
@@ -246,7 +246,7 @@ def config_ui_values(device_type_id: str, states: dict, limits: LimitsLookup,
     by_key = {o.setting.key: o for o in offered}
 
     for setting in settings_for_type(device_type_id):
-        out[_marker_field(setting)] = MARKER_YES if setting.key in by_key else MARKER_NO
+        out[marker_field(setting)] = MARKER_YES if setting.key in by_key else MARKER_NO
         # EVERY setting field is set explicitly. ``values`` starts from the device's
         # saved props, so a field left unset here would carry a value saved by an
         # earlier dialog session straight into this Save - and into a write.
@@ -287,7 +287,7 @@ def _seed_value(current: Any) -> str:
     return str(current)
 
 
-def _marker_field(setting: DeviceSetting) -> str:
+def marker_field(setting: DeviceSetting) -> str:
     """The hidden ConfigUI field gating this setting's visibility.
 
     ``holdTime`` → ``hasHoldTime``. Mirrors the ids in Devices.xml; the two are
@@ -319,12 +319,12 @@ def _is_editing(setting, values: dict) -> bool:
     # Blank and the "not read yet" row mean "leave alone"; so does the null row
     # ("previous state", #360): it can never be written, so it is neither validated
     # nor planned. Choosing a real value from it is a different string and IS a change.
-    if _is_leave_alone(text):
+    if is_leave_alone(text):
         return False
     return not (setting.null_state is not None and text == str(setting.null_state))
 
 
-def _is_leave_alone(raw: Any) -> bool:
+def is_leave_alone(raw: Any) -> bool:
     """Blank, or the "not read yet" picker row: neither is an edit."""
     text = str(raw if raw is not None else "").strip()
     return text in ("", UNREAD_OPTION_ID)
@@ -400,10 +400,30 @@ def planned_writes(device_type_id: str, values: dict, states: dict,
 
 
 def _is_seed(seeds: Optional[dict], setting: DeviceSetting, values: dict) -> bool:
-    """Is the submitted field exactly what the dialog was seeded with?"""
+    """Is the submitted field what the dialog was seeded with? Numerically for a
+    number field ("030" is the seed "30"), by text for a picker."""
     if seeds is None or setting.key not in seeds:
         return False
-    return str(values.get(setting.key, "")).strip() == str(seeds[setting.key]).strip()
+    typed, seed = str(values.get(setting.key, "")).strip(), str(seeds[setting.key]).strip()
+    if typed == seed:
+        return True
+    if setting.is_choice:
+        return False
+    typed_int, seed_int = _as_int(typed), _as_int(seed)
+    return typed_int is not None and typed_int == seed_int
+
+
+def edited_settings(device_type_id: str, values: dict, limits: LimitsLookup,
+                    attribute_list: Optional[Callable] = None, device_known: bool = True,
+                    seeds: Optional[dict] = None) -> list:
+    """The offered settings the user has really EDITED: not blank, not a leave-alone
+    row, and different from what the dialog was seeded with. With no seed nothing can
+    be called an edit - the dialog's starting values are unknown."""
+    if seeds is None:
+        return []
+    return [offer.setting
+            for offer in offered_settings(device_type_id, limits, attribute_list, device_known)
+            if _is_editing(offer.setting, values) and not _is_seed(seeds, offer.setting, values)]
 
 
 def _unchanged(setting: DeviceSetting, typed: Any, current: Any) -> bool:

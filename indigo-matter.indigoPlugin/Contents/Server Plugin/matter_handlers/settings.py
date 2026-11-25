@@ -632,6 +632,10 @@ def verify_write(setting: DeviceSetting, intended: int, read_back: Any) -> tuple
     if read_back is NO_ANSWER:
         return False, (f"{setting.label} could not be confirmed — the device did not answer "
                        f"the read-back. The setting may or may not have been applied.")
+    if read_back is None and setting.null_state is not None:
+        # For a setting whose null is a real answer, null is what the device holds.
+        return False, (f"{setting.label} was NOT applied — the device still reports "
+                       f"{setting.null_ui} after being asked for {setting.value_text(intended)}.")
     if read_back is None:
         return False, (f"{setting.label} was NOT applied — the device answered the read-back "
                        f"with no value (null) after being asked for {setting.value_text(intended)}.")

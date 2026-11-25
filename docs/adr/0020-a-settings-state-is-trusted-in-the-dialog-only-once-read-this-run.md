@@ -51,6 +51,21 @@ unavailable node still counts as a reading (last values reported). So does a nul
 This **narrows ADR-0002's acceptance of cached state** without editing it: the dialog
 still never reads live, it just refuses to treat an unread default as a value.
 
+### Seeds, and what "untouched" means
+
+The dialog remembers, per device, the values it was seeded with when it opened. At Save a
+field equal to its seed (numerically for a number field, so "030" is "30") is untouched,
+even if the device's value has since moved (another app), so an untouched Save never
+overwrites it. "Previous value" for the log and the verification is still the current
+state. If no seed is available (the plugin restarted with the dialog open, the dialog's
+build failed, or a second dialog was opened on the same device so the slot is ambiguous),
+nothing is called an edit: no setting is written, validation does not judge the fields,
+and the log asks the user to reopen the dialog. The consequence is that a user cannot force
+a resend of the value the dialog opened with; they change it and change it back.
+
+An edit that cannot be sent (plugin not connected, or the device flagged unreachable) is
+refused in validation with a field error rather than failing after the dialog has closed.
+
 ### Consequences
 
 * Good, because 0 is no longer indistinguishable from "unread".

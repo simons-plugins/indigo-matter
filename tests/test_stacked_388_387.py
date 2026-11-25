@@ -152,10 +152,10 @@ def test_a_null_read_back_for_a_setting_with_a_null_state_is_a_real_answer(
         plugin_cls, ds, indigo_env, mock_logger, raw, type_id):
     _i, devices = indigo_env
     dev = _make(ds, devices, raw, type_id)                  # holds 1/2 -> read
-    dev.setErrorStateOnServer = lambda v: None
     stub = _stub(plugin_cls, ds, mock_logger, matter=_Matter(read=None))
     dev.pluginProps.update({"nodeId": str(raw["node_id"]), "endpointId": "1"})
     _run_apply(plugin_cls, stub, dev, device_settings.PlannedWrite(SUS[type_id], 0, 1), node=raw["node_id"])
+    assert dev.errorState == "setting failed"          # the write was not confirmed
     assert dev.states["startUpOnOff"] == 255
     assert dev.states["startUpOnOff.ui"] == "previous state"
     assert ds.setting_primed(dev.id, "startUpOnOff")

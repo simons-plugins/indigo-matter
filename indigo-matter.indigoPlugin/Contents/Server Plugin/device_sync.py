@@ -4032,7 +4032,12 @@ class DeviceSync:
             self.logger.warning("node_added parse failed: %s", exc)
             return
         self.create_devices(node)
-        self._apply_reachability(node)
+        try:
+            self._apply_reachability(node)
+        except Exception as exc:  # pylint: disable=broad-except
+            # runs on the EVENT THREAD: an escaping exception would take down the
+            # listener; the next reconcile pass reapplies reachability anyway
+            self.logger.warning("node_added reachability failed for node %s: %s", node.node_id, exc)
 
     def _on_node_event(self, evt: protocol.MatterEvent) -> None:
         """A cluster event arrived (button press, lock operation, etc.).
@@ -4250,31 +4255,42 @@ class DeviceSync:
             kvlist = self._with_setting_display(dev, kvlist)
         if not kvlist:
             return
+        failed: set = set()
         if clear_error:
             dev.updateStatesOnServer(kvlist)
         else:
-            self._write_keeping_error(dev, kvlist, trigger_events=count_as_read)
+            failed = self._write_keeping_error(dev, kvlist, trigger_events=count_as_read)
         if count_as_read:
-            self._note_settings_primed(dev, kvlist)
+            # A key whose write failed was NOT read onto the device.
+            self._note_settings_primed(dev, [kv for kv in kvlist if kv.get("key") not in failed])
         # a fresh value means the device is reachable — clear any stale error
         if clear_error and getattr(dev, "errorState", ""):
             dev.setErrorStateOnServer("")
 
-    @staticmethod
-    def _write_keeping_error(dev: Any, kvlist: list, trigger_events: bool = True) -> None:
+    def _write_keeping_error(self, dev: Any, kvlist: list, trigger_events: bool = True) -> set:
         """Write states one key at a time WITHOUT clearing the device's error state.
 
         Indigo's documented ``updateStateOnServer(key, value, clearErrorState)``; the
-        batch ``updateStatesOnServer`` is not documented as taking that argument.
+        batch ``updateStatesOnServer`` is not documented as taking that argument. One
+        key failing must not abort the rest, so each is isolated and logged; the keys
+        that failed are returned (and are not counted as read by the caller).
         """
+        failed: set = set()
         for kv in kvlist:
-            kwargs: dict = {"value": kv["value"], "clearErrorState": False}
+            kwargs: dict = {}
             for optional in ("uiValue", "decimalPlaces"):
                 if optional in kv:
                     kwargs[optional] = kv[optional]
             if not trigger_events:
                 kwargs["triggerEvents"] = False
-            dev.updateStateOnServer(kv["key"], **kwargs)
+            try:
+                dev.updateStateOnServer(kv["key"], kv["value"], False, **kwargs)
+            except Exception as exc:  # pylint: disable=broad-except
+                # one refused state write must not stop the others; named and counted
+                failed.add(kv["key"])
+                self.logger.warning("could not write state %r of device %s: %s",
+                                    kv["key"], getattr(dev, "id", "?"), exc)
+        return failed
 
     # ------------------------------------------------------------------
     # Has a setting's state been READ? (review fix pass, PR #388)
@@ -4375,6 +4391,11 @@ class DeviceSync:
         keys = self._setting_keys(dev)
         with self._lock:
             self._settings_primed -= {(int(dev.id), key) for key in keys}
+
+    def node_reconciled(self, node_id: Any) -> bool:
+        """Has an informative snapshot of this node been cached this run?"""
+        with self._lock:
+            return int(node_id) in self._setting_readings
 
     def setting_primed(self, dev_id: Any, key: str) -> bool:
         """Has a real device reading of this setting been written this run?"""

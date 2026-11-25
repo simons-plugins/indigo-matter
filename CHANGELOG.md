@@ -30,6 +30,17 @@ current version is `Info.plist`'s `PluginVersion`.
 - With the power-on behaviour setting for dimmers (2026.37.0): a device reporting "previous
   state" counts as read. It shows the "Previous state" row (not "Not read from the device
   yet"), and a write whose read-back comes back null is recorded as "previous state".
+- A setting edit that cannot be sent is now refused when you click Save, with a message on the
+  field: "Not connected to matter-server, so this cannot be written now" or "This device is
+  unreachable". Clear the field (or leave the picker as it was) to save the rest. An untouched
+  field is judged against the value the dialog opened with, so a change made by another app
+  while the dialog is open is not overwritten by saving. Only one settings dialog per device
+  can be used at a time; if the dialog's starting values are unavailable (it was reopened, or
+  the plugin restarted), nothing is written and the log says to reopen it. There is no way
+  to force a resend of the value the dialog opened with: change it and change it back.
+  The dialog says why values may be out of date (device unreachable, or plugin not connected).
+- Fix: a Matter node device's own "reachable" state was written in a way that cleared its
+  "unreachable" flag the moment it was set, so a node going offline could show as fine.
 - The existing sensor and relay setting states now carry a display value (the number with
   its unit, or the option name, such as "Standard"), and while a state shows "unknown"
   its numeric value, which triggers compare, is still the previous number.

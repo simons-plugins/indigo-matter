@@ -82,6 +82,7 @@ class FakeDev:
         self.states.update(dict(initial_states or {}))
         self.error = None
         self.errorState = ""
+        self.single_key_calls = []
         self.folderId = 0
         # See replaceOnServer: fail_replace models real Indigo's discard-on-
         # failure semantics; _name_on_server is the last name Indigo accepted.
@@ -115,8 +116,13 @@ class FakeDev:
         self.error = None
         self.errorState = ""
 
-    def updateStateOnServer(self, key, value=None, uiValue=None, clearErrorState=True,
+    def updateStateOnServer(self, key, value=None, clearErrorState=True, *, uiValue=None,
                             decimalPlaces=None, triggerEvents=True):
+        """The documented single-key call: ``(key, value, clearErrorState)`` positionally,
+        the rest keyword-only. Every call's keywords are recorded for tests to assert."""
+        self.single_key_calls.append({
+            "key": key, "value": value, "clearErrorState": clearErrorState, "uiValue": uiValue,
+            "decimalPlaces": decimalPlaces, "triggerEvents": triggerEvents})
         self._write_state(key, value, uiValue)
         if clearErrorState:
             self.error = None
@@ -133,6 +139,10 @@ class FakeDev:
 
     def stateListOrDisplayStateIdChanged(self):
         self.state_list_rebuilds += 1
+        # Opt-in per test: set ``declared_on_refresh`` to the states a refresh adds (at
+        # Indigo's Integer default 0), as the real refresh does for a fielded device.
+        for key in getattr(self, "declared_on_refresh", ()):
+            self.states.setdefault(key, 0)
 
     def setErrorStateOnServer(self, value):
         self.error = value

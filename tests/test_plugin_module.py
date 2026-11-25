@@ -413,14 +413,14 @@ def test_validate_allows_unstamped_device(plugin_cls, mock_indigo_base, mock_log
     # carries settings since #186, so this now runs the settings path too.
     mock_indigo_base.devices = {5: _dev({})}
     stub = _settings_stub(plugin_cls, mock_logger, limits={}, attr_lists={})
-    result = plugin_cls.validateDeviceConfigUi(stub, {}, "matterRelay", 5)
+    result = _seeded_call("validateDeviceConfigUi", plugin_cls, stub, {}, "matterRelay", 5)
     assert result[0] is True
 
 
 def test_validate_allows_unknown_device_id(plugin_cls, mock_indigo_base, mock_logger):
     mock_indigo_base.devices = {}
     stub = _settings_stub(plugin_cls, mock_logger, limits={}, attr_lists={})
-    result = plugin_cls.validateDeviceConfigUi(stub, {}, "matterRelay", 999)
+    result = _seeded_call("validateDeviceConfigUi", plugin_cls, stub, {}, "matterRelay", 999)
     assert result[0] is True
 
 
@@ -1523,7 +1523,21 @@ _FP300_ATTR_LISTS = {
 }
 
 
-def _settings_stub(plugin_cls, mock_logger, limits=None, runtime=None, matter=None,
+_UNSET = object()
+
+
+def _seeded_call(method, plugin_cls, stub, valuesDict, *rest):
+    """Call a Save-time callback the way Indigo does: the dialog was OPENED first, so a
+    seed is remembered (without one, nothing can be called an edit - PR #388)."""
+    type_id, dev_id = rest[-2], rest[-1]
+    if dev_id not in vars(stub).get("_dialog_seeds", {}):
+        plugin_cls.getDeviceConfigUiValues(
+            stub, {k: valuesDict[k] for k in ("nodeId", "endpointId") if k in valuesDict}, type_id, dev_id)
+    return getattr(plugin_cls, method)(stub, valuesDict, *rest)
+
+
+
+def _settings_stub(plugin_cls, mock_logger, limits=None, runtime=None, matter=_UNSET,
                    attr_lists=None):
     """A Plugin stand-in wired to a limits table instead of a live node.
 
@@ -1542,6 +1556,8 @@ def _settings_stub(plugin_cls, mock_logger, limits=None, runtime=None, matter=No
     lists = _FP300_ATTR_LISTS if attr_lists is None else attr_lists
     device_sync.attribute_list.side_effect = (
         lambda node, ep, cluster: lists.get(cluster))
+    if matter is _UNSET:
+        matter = SimpleNamespace(connected=True)
     stub = SimpleNamespace(device_sync=device_sync, logger=mock_logger,
                            runtime=runtime, matter=matter)
     stub._setting_limits_lookup = (
@@ -1696,7 +1712,7 @@ def test_config_ui_values_non_node_types_get_no_survey_summary_field(plugin_cls,
 def test_validate_rejects_an_out_of_range_hold_time(plugin_cls, mock_indigo_base, mock_logger):
     mock_indigo_base.devices = {5: _fp300_dev()}
     stub = _settings_stub(plugin_cls, mock_logger)
-    ok, _values, errors = plugin_cls.validateDeviceConfigUi(
+    ok, _values, errors = _seeded_call("validateDeviceConfigUi", plugin_cls, 
         stub, {"nodeId": "56", "endpointId": "1", "holdTime": "9999"},
         "matterMotionSensor", 5)
     assert ok is False
@@ -1706,7 +1722,7 @@ def test_validate_rejects_an_out_of_range_hold_time(plugin_cls, mock_indigo_base
 def test_validate_accepts_an_in_range_hold_time(plugin_cls, mock_indigo_base, mock_logger):
     mock_indigo_base.devices = {5: _fp300_dev()}
     stub = _settings_stub(plugin_cls, mock_logger)
-    result = plugin_cls.validateDeviceConfigUi(
+    result = _seeded_call("validateDeviceConfigUi", plugin_cls, 
         stub, {"nodeId": "56", "endpointId": "1", "holdTime": "45"},
         "matterMotionSensor", 5)
     assert result[0] is True
@@ -1741,7 +1757,7 @@ def test_closing_the_dialog_submits_only_changed_settings(plugin_cls, mock_indig
     runtime = MagicMock()
     stub = _settings_stub(plugin_cls, mock_logger, runtime=runtime, matter=MagicMock())
     stub._apply_setting = MagicMock(return_value="coro")
-    plugin_cls.closedDeviceConfigUi(
+    _seeded_call("closedDeviceConfigUi", plugin_cls, 
         stub, {"nodeId": "56", "endpointId": "1", "holdTime": "30",
                "sensitivityLevel": "1"},
         False, "matterMotionSensor", 5)
@@ -1755,7 +1771,7 @@ def test_cancelling_the_dialog_writes_nothing(plugin_cls, mock_indigo_base, mock
     mock_indigo_base.devices = {5: _fp300_dev()}
     runtime = MagicMock()
     stub = _settings_stub(plugin_cls, mock_logger, runtime=runtime, matter=MagicMock())
-    plugin_cls.closedDeviceConfigUi(
+    _seeded_call("closedDeviceConfigUi", plugin_cls, 
         stub, {"nodeId": "56", "endpointId": "1", "holdTime": "30"},
         True, "matterMotionSensor", 5)
     runtime.submit.assert_not_called()
@@ -1766,7 +1782,7 @@ def test_saving_an_unchanged_dialog_writes_nothing(plugin_cls, mock_indigo_base,
     mock_indigo_base.devices = {5: _fp300_dev()}
     runtime = MagicMock()
     stub = _settings_stub(plugin_cls, mock_logger, runtime=runtime, matter=MagicMock())
-    plugin_cls.closedDeviceConfigUi(
+    _seeded_call("closedDeviceConfigUi", plugin_cls, 
         stub, {"nodeId": "56", "endpointId": "1", "holdTime": "10",
                "sensitivityLevel": "1"},
         False, "matterMotionSensor", 5)
@@ -1778,7 +1794,7 @@ def test_a_device_type_with_no_settings_never_touches_the_settings_path(plugin_c
     mock_indigo_base.devices = {}
     runtime = MagicMock()
     stub = _settings_stub(plugin_cls, mock_logger, runtime=runtime, matter=MagicMock())
-    plugin_cls.closedDeviceConfigUi(stub, {"nodeId": "56", "endpointId": "1"},
+    _seeded_call("closedDeviceConfigUi", plugin_cls, stub, {"nodeId": "56", "endpointId": "1"},
                                     False, "matterTemperatureSensor", 5)
     runtime.submit.assert_not_called()
     stub.device_sync.setting_limits.assert_not_called()
@@ -1788,7 +1804,7 @@ def test_settings_are_not_applied_while_the_connection_is_down(plugin_cls, mock_
     """Better an error naming the reason than a write silently dropped."""
     mock_indigo_base.devices = {5: _fp300_dev()}
     stub = _settings_stub(plugin_cls, mock_logger, runtime=None, matter=None)
-    plugin_cls.closedDeviceConfigUi(
+    _seeded_call("closedDeviceConfigUi", plugin_cls, 
         stub, {"nodeId": "56", "endpointId": "1", "holdTime": "30"},
         False, "matterMotionSensor", 5)
     assert any("not running" in str(c) for c in mock_logger.error.call_args_list)
@@ -1937,7 +1953,7 @@ def test_closing_a_dimmers_dialog_submits_the_changed_setting(plugin_cls, mock_i
     stub = _settings_stub(plugin_cls, mock_logger, limits={}, runtime=runtime,
                           matter=MagicMock(), attr_lists=_DIMMER_ATTR_LISTS)
     stub._apply_setting = MagicMock(return_value="coro")
-    plugin_cls.closedDeviceConfigUi(
+    _seeded_call("closedDeviceConfigUi", plugin_cls, 
         stub, {"nodeId": "6", "endpointId": "1", "startUpOnOff": "2"}, False, type_id, 7)
     assert runtime.submit.call_count == 1
     node_id, endpoint_id, dev_id, plan = stub._apply_setting.call_args.args
@@ -2082,9 +2098,9 @@ def test_an_untouched_startup_setting_never_validates_into_a_write(
     if other_edit:
         values["nodeId"] = "6"
         values["vendorName"] = "Edited"
-    ok = plugin_cls.validateDeviceConfigUi(stub, dict(values), type_id, 7)
+    ok = _seeded_call("validateDeviceConfigUi", plugin_cls, stub, dict(values), type_id, 7)
     assert ok[0] is True
-    plugin_cls.closedDeviceConfigUi(stub, dict(values), False, type_id, 7)
+    _seeded_call("closedDeviceConfigUi", plugin_cls, stub, dict(values), False, type_id, 7)
     runtime.submit.assert_not_called()
 
 
@@ -2093,7 +2109,7 @@ def test_validate_rejects_an_out_of_enum_value_on_a_dimmer_with_a_field_error(
         plugin_cls, mock_indigo_base, mock_logger, type_id):
     mock_indigo_base.devices = {7: _dimmer_dev(type_id)}
     stub = _settings_stub(plugin_cls, mock_logger, limits={}, attr_lists=_DIMMER_ATTR_LISTS)
-    result = plugin_cls.validateDeviceConfigUi(
+    result = _seeded_call("validateDeviceConfigUi", plugin_cls, 
         stub, {"nodeId": "6", "endpointId": "1", "startUpOnOff": "7"}, type_id, 7)
     assert result[0] is False and "startUpOnOff" in result[2]
 
@@ -2107,7 +2123,7 @@ def test_picking_off_while_the_device_holds_null_submits_a_write_of_zero(
     stub = _settings_stub(plugin_cls, mock_logger, limits={}, runtime=runtime,
                           matter=MagicMock(), attr_lists=_DIMMER_ATTR_LISTS)
     stub._apply_setting = MagicMock(return_value="coro")
-    plugin_cls.closedDeviceConfigUi(
+    _seeded_call("closedDeviceConfigUi", plugin_cls, 
         stub, {"nodeId": "6", "endpointId": "1", "startUpOnOff": "0"}, False, type_id, 7)
     assert runtime.submit.call_count == 1
     plan = stub._apply_setting.call_args.args[3]
@@ -2238,13 +2254,13 @@ def _declared_settings():
 
 
 def test_every_declared_setting_has_its_configui_field(plugin_cls):
-    from device_settings import _marker_field
+    from device_settings import marker_field
     for setting in _declared_settings():
         for type_id in sorted(setting.device_types):
             fields = _device_config_fields(type_id)
             assert setting.key in fields, \
                 f"{type_id} declares setting {setting.key!r} with no <Field id={setting.key!r}>"
-            marker = _marker_field(setting)
+            marker = marker_field(setting)
             assert marker in fields, \
                 f"{type_id}: setting {setting.key!r} needs its hidden marker <Field id={marker!r}>"
             assert fields[setting.key].get("visibleBindingId") == marker, \
@@ -2278,12 +2294,12 @@ def test_numeric_settings_have_a_range_field_and_choices_have_a_picker(plugin_cl
 def test_no_orphan_setting_fields_in_the_xml(plugin_cls):
     """The other direction: an XML field with no declaration behind it renders
     as a control that does nothing."""
-    from device_settings import _marker_field
+    from device_settings import marker_field
     declared = {}
     for setting in _declared_settings():
         for type_id in setting.device_types:
             declared.setdefault(type_id, set()).update(
-                {setting.key, _marker_field(setting)})
+                {setting.key, marker_field(setting)})
             if not setting.is_choice:
                 declared[type_id].add(f"{setting.key}Range")
     for type_id, keys in declared.items():
@@ -2859,7 +2875,7 @@ def test_a_bad_lock_value_blocks_the_save_with_a_field_error(plugin_cls, mock_in
     stub = _lock_stub(plugin_cls, mock_logger)
     for field, bad in (("wrongCodeEntryLimit", "0"), ("userCodeTemporaryDisableTime", "999"),
                        ("autoRelockTime", "soon")):
-        result = plugin_cls.validateDeviceConfigUi(
+        result = _seeded_call("validateDeviceConfigUi", plugin_cls, 
             stub, {**_LOCK_PROPS, field: bad}, "matterLock", 9)
         assert result[0] is False
         assert field in result[2]
@@ -2867,7 +2883,7 @@ def test_a_bad_lock_value_blocks_the_save_with_a_field_error(plugin_cls, mock_in
 
 def test_a_good_lock_value_passes_validation(plugin_cls, mock_indigo_base, mock_logger):
     mock_indigo_base.devices = {9: _lock_dev()}
-    result = plugin_cls.validateDeviceConfigUi(
+    result = _seeded_call("validateDeviceConfigUi", plugin_cls, 
         _lock_stub(plugin_cls, mock_logger),
         {**_LOCK_PROPS, "autoRelockTime": "0", "wrongCodeEntryLimit": "255"}, "matterLock", 9)
     assert result[0] is True
@@ -2879,7 +2895,7 @@ def test_closing_the_lock_dialog_submits_only_the_changed_setting(plugin_cls, mo
     runtime = MagicMock()
     stub = _lock_stub(plugin_cls, mock_logger, runtime=runtime, matter=MagicMock())
     stub._apply_setting = MagicMock(return_value="coro")
-    plugin_cls.closedDeviceConfigUi(
+    _seeded_call("closedDeviceConfigUi", plugin_cls, 
         stub, {**_LOCK_PROPS, "autoRelockTime": "30", "wrongCodeEntryLimit": "3",
                "userCodeTemporaryDisableTime": "60"},
         False, "matterLock", 9)
@@ -2982,7 +2998,7 @@ def test_a_lock_holding_a_value_outside_our_range_still_saves_the_dialog(
     mock_indigo_base.devices = {9: _lock_dev({"autoRelockTime": 100000, "wrongCodeEntryLimit": 0,
                                               "userCodeTemporaryDisableTime": 60})}
     stub = _lock_stub(plugin_cls, mock_logger)
-    result = plugin_cls.validateDeviceConfigUi(
+    result = _seeded_call("validateDeviceConfigUi", plugin_cls, 
         stub, {**_LOCK_PROPS, "autoRelockTime": "100000", "wrongCodeEntryLimit": "0",
                "userCodeTemporaryDisableTime": "60"}, "matterLock", 9)
     assert result[0] is True
@@ -2996,6 +3012,8 @@ def test_dialog_save_to_wire_for_a_lock(plugin_cls, mock_indigo_base, mock_logge
     wire = []
 
     class _Matter:
+        connected = True
+
         async def write(self, write, timeout=None):
             wire.append(write)
 
@@ -3005,7 +3023,7 @@ def test_dialog_save_to_wire_for_a_lock(plugin_cls, mock_indigo_base, mock_logge
     runtime = MagicMock()
     runtime.submit.side_effect = lambda coro: asyncio.run(coro)
     stub = _lock_stub(plugin_cls, mock_logger, runtime=runtime, matter=_Matter())
-    plugin_cls.closedDeviceConfigUi(
+    _seeded_call("closedDeviceConfigUi", plugin_cls, 
         stub, {**_LOCK_PROPS, "autoRelockTime": "30", "wrongCodeEntryLimit": "5",
                "userCodeTemporaryDisableTime": "90"},
         False, "matterLock", 9)

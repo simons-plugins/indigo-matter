@@ -45,9 +45,15 @@
                 <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home. A blank field, or a picker showing "Not read from the device yet", means the value has not been read; leave it alone to change nothing. Values shown are the last the device reported.</Label>
             </Field>
             <Field id="settingsStale" type="textfield" hidden="true" defaultValue="no"/>
+            <!-- One marker, two values (a contains match: "device" and "server" are not
+                 substrings of each other or of "no"), so the note names the real cause. -->
             <Field id="settingsStaleNote" type="label" fontColor="orange"
-                   visibleBindingId="settingsStale" visibleBindingValue="yes">
+                   visibleBindingId="settingsStale" visibleBindingValue="device">
                 <Label>This device is not reachable right now: the values below are its last report and may be out of date.</Label>
+            </Field>
+            <Field id="settingsStaleServerNote" type="label" fontColor="orange"
+                   visibleBindingId="settingsStale" visibleBindingValue="server">
+                <Label>The plugin is not connected to matter-server; these are the last values it read.</Label>
             </Field>
             <Field id="startUpOnOff" type="menu"
                    visibleBindingId="hasStartUpOnOff" visibleBindingValue="yes">
@@ -134,9 +140,15 @@
                 <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home. A blank field, or a picker showing "Not read from the device yet", means the value has not been read; leave it alone to change nothing. Values shown are the last the device reported.</Label>
             </Field>
             <Field id="settingsStale" type="textfield" hidden="true" defaultValue="no"/>
+            <!-- One marker, two values (a contains match: "device" and "server" are not
+                 substrings of each other or of "no"), so the note names the real cause. -->
             <Field id="settingsStaleNote" type="label" fontColor="orange"
-                   visibleBindingId="settingsStale" visibleBindingValue="yes">
+                   visibleBindingId="settingsStale" visibleBindingValue="device">
                 <Label>This device is not reachable right now: the values below are its last report and may be out of date.</Label>
+            </Field>
+            <Field id="settingsStaleServerNote" type="label" fontColor="orange"
+                   visibleBindingId="settingsStale" visibleBindingValue="server">
+                <Label>The plugin is not connected to matter-server; these are the last values it read.</Label>
             </Field>
             <Field id="startUpOnOff" type="menu"
                    visibleBindingId="hasStartUpOnOff" visibleBindingValue="yes">
@@ -198,9 +210,15 @@
                 <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home. A blank field, or a picker showing "Not read from the device yet", means the value has not been read; leave it alone to change nothing. Values shown are the last the device reported.</Label>
             </Field>
             <Field id="settingsStale" type="textfield" hidden="true" defaultValue="no"/>
+            <!-- One marker, two values (a contains match: "device" and "server" are not
+                 substrings of each other or of "no"), so the note names the real cause. -->
             <Field id="settingsStaleNote" type="label" fontColor="orange"
-                   visibleBindingId="settingsStale" visibleBindingValue="yes">
+                   visibleBindingId="settingsStale" visibleBindingValue="device">
                 <Label>This device is not reachable right now: the values below are its last report and may be out of date.</Label>
+            </Field>
+            <Field id="settingsStaleServerNote" type="label" fontColor="orange"
+                   visibleBindingId="settingsStale" visibleBindingValue="server">
+                <Label>The plugin is not connected to matter-server; these are the last values it read.</Label>
             </Field>
             <Field id="startUpOnOff" type="menu"
                    visibleBindingId="hasStartUpOnOff" visibleBindingValue="yes">
@@ -343,9 +361,15 @@
                 <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home. A blank field, or a picker showing "Not read from the device yet", means the value has not been read; leave it alone to change nothing. Values shown are the last the device reported.</Label>
             </Field>
             <Field id="settingsStale" type="textfield" hidden="true" defaultValue="no"/>
+            <!-- One marker, two values (a contains match: "device" and "server" are not
+                 substrings of each other or of "no"), so the note names the real cause. -->
             <Field id="settingsStaleNote" type="label" fontColor="orange"
-                   visibleBindingId="settingsStale" visibleBindingValue="yes">
+                   visibleBindingId="settingsStale" visibleBindingValue="device">
                 <Label>This device is not reachable right now: the values below are its last report and may be out of date.</Label>
+            </Field>
+            <Field id="settingsStaleServerNote" type="label" fontColor="orange"
+                   visibleBindingId="settingsStale" visibleBindingValue="server">
+                <Label>The plugin is not connected to matter-server; these are the last values it read.</Label>
             </Field>
             <Field id="holdTime" type="textfield"
                    visibleBindingId="hasHoldTime" visibleBindingValue="yes">
@@ -418,9 +442,15 @@
                 <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home. A blank field, or a picker showing "Not read from the device yet", means the value has not been read; leave it alone to change nothing. Values shown are the last the device reported.</Label>
             </Field>
             <Field id="settingsStale" type="textfield" hidden="true" defaultValue="no"/>
+            <!-- One marker, two values (a contains match: "device" and "server" are not
+                 substrings of each other or of "no"), so the note names the real cause. -->
             <Field id="settingsStaleNote" type="label" fontColor="orange"
-                   visibleBindingId="settingsStale" visibleBindingValue="yes">
+                   visibleBindingId="settingsStale" visibleBindingValue="device">
                 <Label>This device is not reachable right now: the values below are its last report and may be out of date.</Label>
+            </Field>
+            <Field id="settingsStaleServerNote" type="label" fontColor="orange"
+                   visibleBindingId="settingsStale" visibleBindingValue="server">
+                <Label>The plugin is not connected to matter-server; these are the last values it read.</Label>
             </Field>
             <Field id="sensitivityLevel" type="menu"
                    visibleBindingId="hasSensitivity" visibleBindingValue="yes">
@@ -572,9 +602,15 @@
                 <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home. A blank field, or a picker showing "Not read from the device yet", means the value has not been read; leave it alone to change nothing. Values shown are the last the device reported.</Label>
             </Field>
             <Field id="settingsStale" type="textfield" hidden="true" defaultValue="no"/>
+            <!-- One marker, two values (a contains match: "device" and "server" are not
+                 substrings of each other or of "no"), so the note names the real cause. -->
             <Field id="settingsStaleNote" type="label" fontColor="orange"
-                   visibleBindingId="settingsStale" visibleBindingValue="yes">
+                   visibleBindingId="settingsStale" visibleBindingValue="device">
                 <Label>This device is not reachable right now: the values below are its last report and may be out of date.</Label>
+            </Field>
+            <Field id="settingsStaleServerNote" type="label" fontColor="orange"
+                   visibleBindingId="settingsStale" visibleBindingValue="server">
+                <Label>The plugin is not connected to matter-server; these are the last values it read.</Label>
             </Field>
             <Field id="autoRelockTime" type="textfield"
                    visibleBindingId="hasAutoRelockTime" visibleBindingValue="yes">
