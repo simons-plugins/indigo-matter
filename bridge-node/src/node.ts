@@ -520,7 +520,11 @@ export class BridgeNode implements BridgeFacade {
         // client can ask — and so the log reads in the order things happened.
         this.#endpointMap.load();
         this.#countdowns.load();
-        this.#countdowns.prune(this.#endpointMap.uniqueIds());
+        // An unreadable map loads as EMPTY and says nothing about which endpoints exist, so pruning against it
+        // would wipe every marker.
+        if (this.#endpointMap.problem === undefined) {
+            this.#countdowns.prune(this.#endpointMap.uniqueIds());
+        }
 
         // …and before `server.start()`, which is the whole of issue #141: the
         // aggregator must already have its children the first time a controller

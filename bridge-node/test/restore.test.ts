@@ -1903,6 +1903,21 @@ describe("issue #203: a countdown lost across a real node restart", () => {
         }
     });
 
+    it("an unreadable endpoint map does not wipe the markers at boot (pruning against an empty map would)", async () => {
+        const storagePath = storage();
+        await restartMidCountdown(storagePath);
+        writeFileSync(join(storagePath, ENDPOINT_MAP_FILE), "{ not json");
+        const session = await boot(storagePath);
+        try {
+            assert.ok(
+                readCountdowns(storagePath)[uniqueIdFor(KITCHEN)] !== undefined,
+                "a map that could not be read says nothing about which endpoints exist",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
     it("an attach that says the device is off sends nothing", async () => {
         const storagePath = storage();
         await restartMidCountdown(storagePath);
