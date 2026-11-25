@@ -4355,6 +4355,8 @@ class DeviceSync:
     def _setting_display(self, dev: Any, setting: Any, value: Any) -> str:
         if not setting.is_choice:
             return f"{value}{setting.unit}"
+        if setting.null_state is not None and value == setting.null_state:
+            return setting.null_ui
         try:
             props = dev.pluginProps
             bounds = setting.resolve_bounds(

@@ -142,23 +142,6 @@ def test_a_device_start_still_primes_a_setting_that_is_not_yet_read(plugin_cls, 
 
 # --- 2. an unread picker is shown with a "not read yet" row ----------------
 
-def test_P1_a_null_start_up_on_off_still_offers_the_picker_with_an_unread_row(
-        plugin_cls, ds, indigo_env, mock_logger):
-    _i, devices = indigo_env
-    node = copy.deepcopy(LIGHTING_PLUG_NODE)
-    node["attributes"]["1/6/16387"] = None               # StartUpOnOff null = restore previous
-    ds.create_from_raw(node, "Plug")
-    dev = devices[ds.lookup(0x34, 1)]
-    ds.reconcile_all([node])
-    stub = _stub(plugin_cls, ds, mock_logger)
-    values = _open(plugin_cls, stub, dev, "matterRelay")
-    assert values["hasStartUpOnOff"] == "yes" and values["hasAnySetting"] == "yes"
-    assert values["startUpOnOff"] == device_settings.UNREAD_OPTION_ID
-    rows = _rows(plugin_cls, stub, dev, "matterRelay", "startUpOnOff")
-    assert rows[0] == (device_settings.UNREAD_OPTION_ID, UNREAD_LABEL)
-    assert [v for v, _l in rows[1:]] == ["0", "1", "2"]
-
-
 def test_P5_a_setting_marked_unread_gets_its_unread_row_back(plugin_cls, ds, indigo_env, mock_logger):
     _i, devices = indigo_env
     ds.create_from_raw(LIGHTING_PLUG_NODE, "Plug")
@@ -347,11 +330,11 @@ def test_a_picker_setting_reading_carries_the_option_label_as_its_display_value(
 # --- 7. small ---------------------------------------------------------------
 
 def test_a_null_read_back_makes_the_setting_unread(plugin_cls, ds, indigo_env, mock_logger):
+    """For a setting with NO declared null state (see test_stacked_388_387 for one with)."""
     _i, devices = indigo_env
-    ds.create_from_raw(LIGHTING_PLUG_NODE, "Plug")
-    dev = devices[ds.lookup(0x34, 1)]
+    dev = _lock(ds, devices)
     dev.setErrorStateOnServer = lambda v: None
-    dev.pluginProps.update({"nodeId": "52", "endpointId": "1"})
+    dev.pluginProps.update({"nodeId": "57", "endpointId": "1"})
 
     class _Matter:
         async def write(self, write, timeout=None):
@@ -362,9 +345,9 @@ def test_a_null_read_back_makes_the_setting_unread(plugin_cls, ds, indigo_env, m
 
     stub = _stub(plugin_cls, ds, mock_logger, matter=_Matter())
     plan = device_settings.PlannedWrite(
-        next(s for s in settings_for_type("matterRelay") if s.key == "startUpOnOff"), 2, 1)
-    asyncio.run(plugin_cls._apply_setting(stub, 52, 1, dev.id, plan))
-    assert not ds.setting_primed(dev.id, "startUpOnOff")
+        next(s for s in settings_for_type("matterLock") if s.key == "autoRelockTime"), 45, 30)
+    asyncio.run(plugin_cls._apply_setting(stub, 57, 1, dev.id, plan))
+    assert not ds.setting_primed(dev.id, "autoRelockTime")
 
 
 def test_a_failing_reprime_and_a_failing_flag_are_reported_separately_with_a_traceback(

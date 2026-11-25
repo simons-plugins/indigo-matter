@@ -1609,7 +1609,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 continue
             rows = device_settings.picker_rows(
                 offer, self._setting_primed_lookup(targetId),
-                current=(valuesDict or {}).get(offer.setting.key))
+                current=(valuesDict or {}).get(offer.setting.key),
+                state=self._device_states(targetId).get(offer.setting.key))
             if rows is not None:
                 return rows
         return []

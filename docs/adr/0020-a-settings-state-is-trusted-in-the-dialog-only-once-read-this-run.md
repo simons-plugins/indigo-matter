@@ -46,7 +46,7 @@ unchanged" row), `planned_writes` treats the previous value as unknown so any en
 value is written and verified, and the state's display is "unknown". A write whose
 read-back is unanswered or null makes the setting unread again, and its cached reading
 is dropped so a later restart of the device cannot re-vouch for it. A snapshot of an
-unavailable node still counts as a reading (last values reported).
+unavailable node still counts as a reading (last values reported). So does a null for a setting that declares a null state (PR #387's "previous state"): it is the device's answer, not an absence of one.
 
 This **narrows ADR-0002's acceptance of cached state** without editing it: the dialog
 still never reads live, it just refuses to treat an unread default as a value.

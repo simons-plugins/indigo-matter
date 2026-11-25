@@ -27,6 +27,9 @@ current version is `Info.plist`'s `PluginVersion`.
   change. After a change the lock does not confirm, the setting is "not read" again the
   next time you open it. Restarting a device in Indigo no longer overwrites a newer
   value with an older one, and no longer clears its unreachable flag.
+- With the power-on behaviour setting for dimmers (2026.37.0): a device reporting "previous
+  state" counts as read. It shows the "Previous state" row (not "Not read from the device
+  yet"), and a write whose read-back comes back null is recorded as "previous state".
 - The existing sensor and relay setting states now carry a display value (the number with
   its unit, or the option name, such as "Standard"), and while a state shows "unknown"
   its numeric value, which triggers compare, is still the previous number.

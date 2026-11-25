@@ -1964,7 +1964,7 @@ def test_a_dimmer_write_the_device_ignores_flags_the_device_and_keeps_the_real_v
     assert mock_logger.error.called
     dev.setErrorStateOnServer.assert_called_once_with("setting failed")
     stub.device_sync.apply_states.assert_called_once_with(
-        7, [{"key": "startUpOnOff", "value": 1}])
+        7, [{"key": "startUpOnOff", "value": 1}], clear_error=False)
 
 
 @pytest.mark.parametrize("type_id", _DIMMER_TYPES)
@@ -2130,7 +2130,8 @@ def test_a_failed_write_whose_readback_is_null_records_the_null_value(
     _run_apply(plugin_cls, stub, PlannedWrite(settings_for_type(type_id)[0], 0, 255), dev_id=7)
     assert mock_logger.error.called
     stub.device_sync.apply_states.assert_called_once_with(
-        7, [{"key": "startUpOnOff", "value": 255, "uiValue": "previous state"}])
+        7, [{"key": "startUpOnOff", "value": 255, "uiValue": "previous state"}],
+        clear_error=False)
 
 
 def test_a_crash_in_the_write_path_never_kills_the_loop(plugin_cls, mock_indigo_base,

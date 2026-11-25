@@ -131,7 +131,12 @@
                    visibleBindingId="hasAnySetting" visibleBindingValue="yes"/>
             <Field id="settingsHeading" type="label" fontColor="darkgray"
                    visibleBindingId="hasAnySetting" visibleBindingValue="yes">
-                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home.</Label>
+                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home. A blank field, or a picker showing "Not read from the device yet", means the value has not been read; leave it alone to change nothing. Values shown are the last the device reported.</Label>
+            </Field>
+            <Field id="settingsStale" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="settingsStaleNote" type="label" fontColor="orange"
+                   visibleBindingId="settingsStale" visibleBindingValue="yes">
+                <Label>This device is not reachable right now: the values below are its last report and may be out of date.</Label>
             </Field>
             <Field id="startUpOnOff" type="menu"
                    visibleBindingId="hasStartUpOnOff" visibleBindingValue="yes">
@@ -190,7 +195,12 @@
                    visibleBindingId="hasAnySetting" visibleBindingValue="yes"/>
             <Field id="settingsHeading" type="label" fontColor="darkgray"
                    visibleBindingId="hasAnySetting" visibleBindingValue="yes">
-                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home.</Label>
+                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home. A blank field, or a picker showing "Not read from the device yet", means the value has not been read; leave it alone to change nothing. Values shown are the last the device reported.</Label>
+            </Field>
+            <Field id="settingsStale" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="settingsStaleNote" type="label" fontColor="orange"
+                   visibleBindingId="settingsStale" visibleBindingValue="yes">
+                <Label>This device is not reachable right now: the values below are its last report and may be out of date.</Label>
             </Field>
             <Field id="startUpOnOff" type="menu"
                    visibleBindingId="hasStartUpOnOff" visibleBindingValue="yes">

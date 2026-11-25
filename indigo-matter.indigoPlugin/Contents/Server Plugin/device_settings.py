@@ -86,22 +86,27 @@ UNREAD_OPTION_LABEL = "Not read from the device yet (leave unchanged)"
 
 
 def picker_rows(offer: "OfferedSetting", primed: Optional[PrimedLookup],
-                current: Any = None) -> Optional[list]:
-    """A choice setting's picker rows, led by the "not read yet" row while unread.
+                current: Any = None, state: Any = None) -> Optional[list]:
+    """A choice setting's picker rows, with at most ONE special leading row.
 
-    A menu cannot be blank, so an unread picker offers an explicit "leave unchanged"
-    row rather than being hidden: hiding it took the section away, with no
-    explanation, for a null value, an unavailable node or an unanswered read-back.
-    None for a setting that is not a picker.
+    * unread (or the dialog was seeded with the unread row, even if a reading has
+      landed since - the field's own value must always be one of its rows): the
+      "not read yet (leave unchanged)" row leads;
+    * read and holding the setting's null state (#360, "previous state"): that row
+      leads, because it cannot be chosen but the seeded value must match a row;
+    * read and holding 0/1/2: neither.
+
+    Never both: a null is a device reading, so an unread setting is not "null". Both
+    special rows mean "leave alone". None for a setting that is not a picker.
     """
-    rows = offer.setting.option_rows(offer.bounds)
+    seeded_unread = str(current or "").strip() == UNREAD_OPTION_ID
+    unread = not _is_primed(primed, offer.setting) or seeded_unread
+    rows = offer.setting.option_rows(offer.bounds, None if unread else state)
     if rows is None:
         return None
-    # Also when the dialog was seeded with the unread row, even if a reading has landed
-    # since: the field's own value must always be one of its rows.
-    if _is_primed(primed, offer.setting) and str(current or "").strip() != UNREAD_OPTION_ID:
-        return rows
-    return [(UNREAD_OPTION_ID, UNREAD_OPTION_LABEL), *rows]
+    if unread:
+        return [(UNREAD_OPTION_ID, UNREAD_OPTION_LABEL), *rows]
+    return rows
 
 
 @dataclass(frozen=True)
