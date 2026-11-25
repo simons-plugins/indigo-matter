@@ -464,6 +464,61 @@
             <Field id="productName" type="textfield" readonly="yes">
                 <Label>Product:</Label>
             </Field>
+            <!-- Writable device settings (issue #368) — DoorLock attributes
+                 0x0023 / 0x0030 / 0x0031, declared in matter_handlers/settings.py.
+                 The hasX markers are set per DEVICE by getDeviceConfigUiValues from
+                 the lock's OWN AttributeList, so a lock lacking an attribute is
+                 never shown its field. Not offered, on purpose: OperatingMode
+                 (0x0025, separate work) and RequirePinForRemoteOperation (0x0033 —
+                 Indigo locks and unlocks without a PIN, so enabling it would make
+                 the lock refuse every command Indigo sends). -->
+            <Field id="hasAutoRelockTime" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="hasWrongCodeEntryLimit" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="hasUserCodeTemporaryDisableTime" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="hasAnySetting" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="settingsSeparator" type="separator"
+                   visibleBindingId="hasAnySetting" visibleBindingValue="yes"/>
+            <Field id="settingsHeading" type="label" fontColor="darkgray"
+                   visibleBindingId="hasAnySetting" visibleBindingValue="yes">
+                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home.</Label>
+            </Field>
+            <Field id="autoRelockTime" type="textfield"
+                   visibleBindingId="hasAutoRelockTime" visibleBindingValue="yes">
+                <Label>Auto-relock (seconds):</Label>
+            </Field>
+            <!-- A textfield takes only a Label (no Description), so the note is a
+                 small label aligned under the control. 0 = disabled is the
+                 spec's own text for this attribute. -->
+            <Field id="autoRelockTimeNote" type="label" fontSize="small" fontColor="darkgray"
+                   alignWithControl="true"
+                   visibleBindingId="hasAutoRelockTime" visibleBindingValue="yes">
+                <Label>0 turns auto-relock off.</Label>
+            </Field>
+            <Field id="autoRelockTimeRange" type="textfield" readonly="yes"
+                   visibleBindingId="hasAutoRelockTime" visibleBindingValue="yes">
+                <Label>Allowed range:</Label>
+            </Field>
+            <Field id="wrongCodeEntryLimit" type="textfield"
+                   visibleBindingId="hasWrongCodeEntryLimit" visibleBindingValue="yes">
+                <Label>Wrong-code limit (attempts):</Label>
+            </Field>
+            <Field id="wrongCodeEntryLimitRange" type="textfield" readonly="yes"
+                   visibleBindingId="hasWrongCodeEntryLimit" visibleBindingValue="yes">
+                <Label>Allowed range:</Label>
+            </Field>
+            <Field id="userCodeTemporaryDisableTime" type="textfield"
+                   visibleBindingId="hasUserCodeTemporaryDisableTime" visibleBindingValue="yes">
+                <Label>Lockout time (seconds):</Label>
+            </Field>
+            <Field id="userCodeTemporaryDisableTimeNote" type="label" fontSize="small"
+                   fontColor="darkgray" alignWithControl="true"
+                   visibleBindingId="hasUserCodeTemporaryDisableTime" visibleBindingValue="yes">
+                <Label>How long the lock ignores commands after too many wrong codes.</Label>
+            </Field>
+            <Field id="userCodeTemporaryDisableTimeRange" type="textfield" readonly="yes"
+                   visibleBindingId="hasUserCodeTemporaryDisableTime" visibleBindingValue="yes">
+                <Label>Allowed range:</Label>
+            </Field>
         </ConfigUI>
         <States>
             <!-- onOffState is native to the relay base type — do not redefine it. -->
@@ -476,6 +531,26 @@
                 <ValueType>String</ValueType>
                 <TriggerLabel>Lock State</TriggerLabel>
                 <ControlPageLabel>Lock State</ControlPageLabel>
+            </State>
+            <!-- DoorLock settings (issue #368). States rather than props alone so
+                 the dialog shows the current value without a live read and a
+                 change made from another ecosystem lands. Declared for the TYPE;
+                 getDeviceStateList removes one per unit when the lock's own
+                 AttributeList says it does not implement the attribute (#190). -->
+            <State id="autoRelockTime">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Auto-Relock Time (seconds)</TriggerLabel>
+                <ControlPageLabel>Auto-Relock Time (seconds)</ControlPageLabel>
+            </State>
+            <State id="wrongCodeEntryLimit">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Wrong-Code Attempt Limit</TriggerLabel>
+                <ControlPageLabel>Wrong-Code Attempt Limit</ControlPageLabel>
+            </State>
+            <State id="userCodeTemporaryDisableTime">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Lockout Time After Wrong Codes (seconds)</TriggerLabel>
+                <ControlPageLabel>Lockout Time After Wrong Codes (seconds)</ControlPageLabel>
             </State>
         </States>
         <UiDisplayStateId>onOffState</UiDisplayStateId>

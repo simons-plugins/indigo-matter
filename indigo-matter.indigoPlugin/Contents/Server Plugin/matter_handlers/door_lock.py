@@ -19,6 +19,11 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .base import ClusterHandler, IndigoDeviceSpec, MatterCommand, base_props, node_endpoint
+from .settings import (
+    ATTR_AUTO_RELOCK_TIME,
+    ATTR_USER_CODE_TEMPORARY_DISABLE_TIME,
+    ATTR_WRONG_CODE_ENTRY_LIMIT,
+)
 
 CLUSTER_DOOR_LOCK = 0x0101
 
@@ -59,12 +64,37 @@ class DoorLockHandler(ClusterHandler):
             )
         ]
 
+    #: Attribute id → Indigo state, for the writable DoorLock settings (issue
+    #: #368), so the Edit Device dialog can show the current value without a live
+    #: read and a change made from another ecosystem still arrives. Same shape as
+    #: ``OnOffHandler.SETTING_STATES``. RequirePinForRemoteOperation and
+    #: OperatingMode are deliberately absent — see ``settings.py``.
+    SETTING_STATES = {
+        ATTR_AUTO_RELOCK_TIME: "autoRelockTime",
+        ATTR_WRONG_CODE_ENTRY_LIMIT: "wrongCodeEntryLimit",
+        ATTR_USER_CODE_TEMPORARY_DISABLE_TIME: "userCodeTemporaryDisableTime",
+    }
+
     def attributes_to_subscribe(self) -> list[int]:
-        return [ATTR_LOCK_STATE]
+        return [ATTR_LOCK_STATE, *self.SETTING_STATES]
+
+    def _setting_update(self, indigo_dev: Any, attribute_id: int, value: Any) -> dict:
+        state_key = self.SETTING_STATES.get(attribute_id)
+        if state_key is None or value is None:
+            return {}
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return {}  # not a number: leave the state alone rather than invent one
+        # Locks fielded before #368 have no such state until Indigo rebuilds
+        # their state list (deviceStartComm) — writing an undeclared key errors.
+        if state_key not in getattr(indigo_dev, "states", {}):
+            return {}
+        return {state_key: number}
 
     def on_attribute_update(self, indigo_dev: Any, attribute_id: int, value: Any) -> dict:
         if attribute_id != ATTR_LOCK_STATE:
-            return {}
+            return self._setting_update(indigo_dev, attribute_id, value)
 
         if value is None:
             # Nullable attribute — do NOT fabricate a state from a null value;

@@ -39,6 +39,7 @@ _SUPPORTS_TO_STATE = {
 # BooleanStateConfigHandler's guard (issue #85 — "sensitivityLevel" not in
 # indigo_dev.states) needs this modelled; matterLock's lockState needs no
 # guard (door_lock.py writes it unconditionally) so it needs no seeding here.
+# (the DoorLock SETTING states are guarded, and are seeded below).
 _STATIC_DEVICE_TYPE_STATES = {
     # Mirrors the <States> each type declares in Devices.xml — real Indigo
     # creates a device with every declared state present, and the handlers'
@@ -46,6 +47,8 @@ _STATIC_DEVICE_TYPE_STATES = {
     "matterMotionSensor": {"sensitivityLevel", "holdTime"},
     "matterContactSensor": {"sensitivityLevel"},
     "matterRelay": {"startUpOnOff"},
+    # issue #368 — the three DoorLock settings' states, as Devices.xml declares them.
+    "matterLock": {"autoRelockTime", "wrongCodeEntryLimit", "userCodeTemporaryDisableTime"},
     # issue #204 / ADR-0008 — declared unconditionally in Devices.xml (no
     # Supports* prop gates any of them), same custom-type discipline as
     # matterEnergyMeter/matterUnknown's `reachable`. curEnergyLevel/

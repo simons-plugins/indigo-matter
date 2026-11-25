@@ -2538,3 +2538,181 @@ def test_a_protocol_error_is_NOT_reported_as_unreachable(plugin_cls, mock_logger
         raise AssertionError("a protocol error must not be reported as unreachable")
     except protocol.ProtocolError:
         pass
+
+
+# ===========================================================================
+# DoorLock settings in the Edit Device dialog — issue #368
+# ===========================================================================
+
+_LOCK_ATTR_LISTS = {0x0101: [0, 1, 2, 3, 0x23, 0x25, 0x30, 0x31, 0x33,
+                             65528, 65529, 65531, 65532, 65533]}
+_LOCK_PROPS = {"nodeId": "57", "endpointId": "1"}
+
+
+def _lock_dev(states=None):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        id=9, name="Side Gate", deviceTypeId="matterLock", pluginProps=dict(_LOCK_PROPS),
+        states={"autoRelockTime": 30, "wrongCodeEntryLimit": 5,
+                "userCodeTemporaryDisableTime": 60} if states is None else states,
+    )
+
+
+def _lock_stub(plugin_cls, mock_logger, attr_lists=None, **kwargs):
+    return _settings_stub(plugin_cls, mock_logger, limits={},
+                          attr_lists=_LOCK_ATTR_LISTS if attr_lists is None else attr_lists,
+                          **kwargs)
+
+
+def test_a_lock_dialog_is_seeded_with_every_implemented_setting(plugin_cls, mock_indigo_base, mock_logger):
+    from indigo import Dict
+    mock_indigo_base.devices = {9: _lock_dev()}
+    values, _errors = plugin_cls.getDeviceConfigUiValues(
+        _lock_stub(plugin_cls, mock_logger), dict(_LOCK_PROPS), "matterLock", 9)
+    assert isinstance(values, Dict)          # ConfigUI pre-population must be an indigo.Dict
+    assert [values[k] for k in ("hasAutoRelockTime", "hasWrongCodeEntryLimit",
+                                "hasUserCodeTemporaryDisableTime")] == ["yes"] * 3
+    assert values["autoRelockTime"] == "30"
+    assert values["wrongCodeEntryLimitRange"] == "1-255 attempts"
+    assert values["userCodeTemporaryDisableTimeRange"] == "1-255 seconds"
+
+
+def test_a_lock_lacking_an_attribute_is_not_offered_that_setting(plugin_cls, mock_indigo_base, mock_logger):
+    mock_indigo_base.devices = {9: _lock_dev()}
+    stub = _lock_stub(plugin_cls, mock_logger,
+                      attr_lists={0x0101: [0, 1, 0x30, 65528, 65529, 65531, 65532, 65533]})
+    values, _errors = plugin_cls.getDeviceConfigUiValues(
+        stub, dict(_LOCK_PROPS), "matterLock", 9)
+    assert values["hasWrongCodeEntryLimit"] == "yes"
+    assert values["hasAutoRelockTime"] == "no"
+    assert values["hasUserCodeTemporaryDisableTime"] == "no"
+
+
+def test_a_lock_with_no_capability_data_yet_is_offered_nothing(plugin_cls, mock_indigo_base, mock_logger):
+    mock_indigo_base.devices = {9: _lock_dev()}
+    stub = _lock_stub(plugin_cls, mock_logger, attr_lists={})
+    values, _errors = plugin_cls.getDeviceConfigUiValues(
+        stub, dict(_LOCK_PROPS), "matterLock", 9)
+    assert values["hasAnySetting"] == "no"
+
+
+def test_a_bad_lock_value_blocks_the_save_with_a_field_error(plugin_cls, mock_indigo_base, mock_logger):
+    mock_indigo_base.devices = {9: _lock_dev()}
+    stub = _lock_stub(plugin_cls, mock_logger)
+    for field, bad in (("wrongCodeEntryLimit", "0"), ("userCodeTemporaryDisableTime", "999"),
+                       ("autoRelockTime", "soon")):
+        result = plugin_cls.validateDeviceConfigUi(
+            stub, {**_LOCK_PROPS, field: bad}, "matterLock", 9)
+        assert result[0] is False
+        assert field in result[2]
+
+
+def test_a_good_lock_value_passes_validation(plugin_cls, mock_indigo_base, mock_logger):
+    mock_indigo_base.devices = {9: _lock_dev()}
+    result = plugin_cls.validateDeviceConfigUi(
+        _lock_stub(plugin_cls, mock_logger),
+        {**_LOCK_PROPS, "autoRelockTime": "0", "wrongCodeEntryLimit": "255"}, "matterLock", 9)
+    assert result[0] is True
+
+
+def test_closing_the_lock_dialog_submits_only_the_changed_setting(plugin_cls, mock_indigo_base, mock_logger):
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {9: _lock_dev()}
+    runtime = MagicMock()
+    stub = _lock_stub(plugin_cls, mock_logger, runtime=runtime, matter=MagicMock())
+    stub._apply_setting = MagicMock(return_value="coro")
+    plugin_cls.closedDeviceConfigUi(
+        stub, {**_LOCK_PROPS, "autoRelockTime": "30", "wrongCodeEntryLimit": "3",
+               "userCodeTemporaryDisableTime": "60"},
+        False, "matterLock", 9)
+    assert runtime.submit.call_count == 1
+    plan = stub._apply_setting.call_args.args[3]
+    assert (plan.setting.key, plan.setting.cluster, plan.setting.attribute, plan.value) == (
+        "wrongCodeEntryLimit", 0x0101, 0x0030, 3)
+
+
+def _lock_plan(key="autoRelockTime", value=45, previous=30):
+    from matter_handlers.settings import settings_for_type
+    from device_settings import PlannedWrite
+    return PlannedWrite(next(s for s in settings_for_type("matterLock") if s.key == key),
+                        value, previous)
+
+
+def _run_lock_apply(plugin_cls, stub, plan):
+    import asyncio
+    return asyncio.run(plugin_cls._apply_setting(stub, 57, 1, 9, plan))
+
+
+def test_a_verified_lock_setting_is_written_through_to_its_state(plugin_cls, mock_indigo_base, mock_logger):
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {9: _lock_dev()}
+    stub = _lock_stub(plugin_cls, mock_logger, matter=MagicMock())
+    stub.matter.write = _async_none
+    stub.matter.read = _async_value(45)
+    _run_lock_apply(plugin_cls, stub, _lock_plan())
+    stub.device_sync.apply_states.assert_called_once_with(
+        9, [{"key": "autoRelockTime", "value": 45}])
+
+
+def test_a_failed_lock_write_is_an_error_and_never_shows_the_requested_value(
+        plugin_cls, mock_indigo_base, mock_logger):
+    from unittest.mock import MagicMock
+    dev = _lock_dev()
+    dev.setErrorStateOnServer = MagicMock()
+    mock_indigo_base.devices = {9: dev}
+    stub = _lock_stub(plugin_cls, mock_logger, matter=MagicMock())
+
+    async def refuse(*_args, **_kwargs):
+        raise RuntimeError("UNSUPPORTED_WRITE")
+
+    stub.matter.write = refuse
+    stub.matter.read = _async_value(30)        # the lock still holds the old value
+    _run_lock_apply(plugin_cls, stub, _lock_plan())
+    assert mock_logger.error.called
+    assert "UNSUPPORTED_WRITE" in str(mock_logger.error.call_args)
+    dev.setErrorStateOnServer.assert_called_once_with("setting failed")
+    stub.device_sync.apply_states.assert_called_once_with(
+        9, [{"key": "autoRelockTime", "value": 30}])      # what the lock holds, not 45
+
+
+def test_getDeviceStateList_gives_a_lock_only_the_states_it_implements(plugin_cls, mock_indigo_base, mock_logger):
+    from types import SimpleNamespace
+    plugin = _state_list_plugin(
+        plugin_cls, mock_indigo_base, mock_logger,
+        {0x0101: [0, 1, 0x23, 65528, 65529, 65531, 65532, 65533]})
+    plugin.base_state_lists["matterLock"] = [
+        {"Key": key, "StateLabel": key, "TriggerLabel": key}
+        for key in ("onOffState", "lockState", "autoRelockTime",
+                    "wrongCodeEntryLimit", "userCodeTemporaryDisableTime")]
+    dev = SimpleNamespace(id=9, name="Side Gate", deviceTypeId="matterLock",
+                          pluginProps=dict(_LOCK_PROPS))
+    keys = [state["Key"] for state in plugin.getDeviceStateList(dev)]
+    assert keys == ["onOffState", "lockState", "autoRelockTime"]
+
+
+def test_getDeviceStateList_keeps_every_lock_state_while_the_list_is_unknown(
+        plugin_cls, mock_indigo_base, mock_logger):
+    from types import SimpleNamespace
+    plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, {})
+    plugin.base_state_lists["matterLock"] = [
+        {"Key": key, "StateLabel": key, "TriggerLabel": key}
+        for key in ("onOffState", "autoRelockTime")]
+    dev = SimpleNamespace(id=9, name="Side Gate", deviceTypeId="matterLock",
+                          pluginProps=dict(_LOCK_PROPS))
+    assert [s["Key"] for s in plugin.getDeviceStateList(dev)] == ["onOffState", "autoRelockTime"]
+
+
+def test_a_lock_device_start_asks_indigo_to_rebuild_its_state_list(plugin_cls, mock_indigo_base, mock_logger):
+    """The rollout mechanism for locks that already exist: deviceStartComm
+    refreshes the state list, so the new states appear without recreation."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    dev = SimpleNamespace(id=9, name="Side Gate", deviceTypeId="matterLock",
+                          pluginProps={**_LOCK_PROPS, "createdTypeId": "matterLock"},
+                          stateListOrDisplayStateIdChanged=MagicMock(), states={})
+    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock(), matter=None, runtime=None)
+    try:
+        plugin_cls.deviceStartComm(stub, dev)
+    except Exception:  # pylint: disable=broad-except
+        pass  # the rest of startComm needs a live plugin; only the refresh is under test
+    dev.stateListOrDisplayStateIdChanged.assert_called_once()

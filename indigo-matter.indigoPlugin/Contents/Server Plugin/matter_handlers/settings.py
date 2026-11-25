@@ -65,6 +65,8 @@ __all__ = [
     "CLUSTER_OCCUPANCY_SENSING", "ATTR_HOLD_TIME", "ATTR_HOLD_TIME_LIMITS",
     "CLUSTER_ON_OFF", "ATTR_START_UP_ON_OFF", "ATTR_ON_TIME", "ATTR_OFF_WAIT_TIME",
     "ATTR_ATTRIBUTE_LIST",
+    "CLUSTER_DOOR_LOCK", "ATTR_AUTO_RELOCK_TIME", "ATTR_WRONG_CODE_ENTRY_LIMIT",
+    "ATTR_USER_CODE_TEMPORARY_DISABLE_TIME",
 ]
 
 # OccupancySensing (0x0406) — HoldTime and its limits. Matter 1.4 (cluster
@@ -102,6 +104,30 @@ CLUSTER_ON_OFF = 0x0006
 ATTR_ON_TIME = 0x4001
 ATTR_OFF_WAIT_TIME = 0x4002
 ATTR_START_UP_ON_OFF = 0x4003
+
+# DoorLock (0x0101) — three of its writable settings (issue #368). Ranges are the
+# pinned @matter/model 0.17.8's own (door-lock-cluster.element.js), not guesses:
+#
+#   AutoRelockTime (0x0023)              uint32, NO constraint; spec text "0=disabled"
+#   WrongCodeEntryLimit (0x0030)         uint8,  constraint "1 to 255" (a 0 write is a
+#                                        CONSTRAINT_ERROR per the spec text)
+#   UserCodeTemporaryDisableTime (0x0031) uint8, constraint "1 to 255", seconds
+#
+# Access is "R[W] VM" / "R[W] VA" — Manage / Administer privilege, NOT timed
+# writes (no T flag). The plugin's controller is an admin of its own fabric, and
+# the write is read back like every other setting, so a lock that refuses (the
+# "[W]" means a device may implement the attribute read-only) is reported, not
+# assumed.
+#
+# Deliberately NOT here: OperatingMode (0x0025) needs SupportedOperatingModes
+# handling, and RequirePinForRemoteOperation (0x0033) must never be offered —
+# the plugin locks and unlocks without a PIN, so turning it on would make the
+# lock refuse every command Indigo sends (see settings_report.
+# DELIBERATELY_NOT_OFFERED).
+CLUSTER_DOOR_LOCK = 0x0101
+ATTR_AUTO_RELOCK_TIME = 0x0023
+ATTR_WRONG_CODE_ENTRY_LIMIT = 0x0030
+ATTR_USER_CODE_TEMPORARY_DISABLE_TIME = 0x0031
 
 #: AttributeList (0xFFFB) — the device's own list of the attribute ids it
 #: implements on a cluster. THE capability check: it is what the device says it
@@ -416,6 +442,36 @@ SETTINGS: tuple = (
         # what the device is set to.
         bounds=EnumValues(((0, "Off"), (1, "On"), (2, "Toggle (opposite of before)"))),
         device_types=frozenset({"matterRelay"}),
+    ),
+    # --- DoorLock settings (issue #368) --------------------------------------
+    # Ranges: see the DoorLock block above. AutoRelockTime has no spec
+    # constraint, so only the uint32 type's own bounds are enforced.
+    DeviceSetting(
+        key="autoRelockTime",
+        label="Auto-relock time",
+        cluster=CLUSTER_DOOR_LOCK,
+        attribute=ATTR_AUTO_RELOCK_TIME,
+        bounds=StaticRange(0, 0xFFFFFFFF),
+        device_types=frozenset({"matterLock"}),
+        unit=" seconds",
+    ),
+    DeviceSetting(
+        key="wrongCodeEntryLimit",
+        label="Wrong-code attempt limit",
+        cluster=CLUSTER_DOOR_LOCK,
+        attribute=ATTR_WRONG_CODE_ENTRY_LIMIT,
+        bounds=StaticRange(1, 255),
+        device_types=frozenset({"matterLock"}),
+        unit=" attempts",
+    ),
+    DeviceSetting(
+        key="userCodeTemporaryDisableTime",
+        label="Lockout time after wrong codes",
+        cluster=CLUSTER_DOOR_LOCK,
+        attribute=ATTR_USER_CODE_TEMPORARY_DISABLE_TIME,
+        bounds=StaticRange(1, 255),
+        device_types=frozenset({"matterLock"}),
+        unit=" seconds",
     ),
 )
 

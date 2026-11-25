@@ -5894,3 +5894,91 @@ def test_priming_a_thread_nodes_cached_snapshot_does_not_stamp_anything(ds, indi
 
     assert result["nodeDeviceId"] is not None, "sanity: the matterNode device was actually created"
     assert ds.thread_event_stamps() == {}
+
+
+# ---------------------------------------------------------------------------
+# DoorLock settings — issue #368: priming, and rollout to locks that already exist
+# ---------------------------------------------------------------------------
+
+#: The Aqara U500 as its reporter dumped it: AutoRelockTime, WrongCodeEntryLimit
+#: and UserCodeTemporaryDisableTime implemented (plus OperatingMode and
+#: RequirePinForRemoteOperation, which the plugin does not offer).
+LOCK_SETTINGS_NODE = {
+    "node_id": 0x39,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Aqara",
+        "0/40/3": "Smart Gate Lock U500",
+        "1/29/0": [{"0": 10}],
+        "1/257/0": 1,
+        "1/257/35": 30,
+        "1/257/37": 0,
+        "1/257/48": 5,
+        "1/257/49": 60,
+        "1/257/51": False,
+        "1/257/65531": [0, 35, 37, 48, 49, 51, 65528, 65529, 65531, 65532, 65533],
+    },
+}
+_LOCK_SETTING_STATES = ("autoRelockTime", "wrongCodeEntryLimit", "userCodeTemporaryDisableTime")
+
+
+def test_lock_settings_are_primed_onto_a_new_lock(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
+    dev = devices[ds.lookup(0x39, 1)]
+    assert dev.deviceTypeId == "matterLock"
+    assert (dev.states["autoRelockTime"], dev.states["wrongCodeEntryLimit"],
+            dev.states["userCodeTemporaryDisableTime"]) == (30, 5, 60)
+
+
+def test_the_lock_capability_cache_holds_its_attribute_list(ds, indigo_env):
+    ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
+    listed = ds.attribute_list(0x39, 1, 0x0101)
+    assert {0x23, 0x30, 0x31} <= set(listed)
+
+
+def test_operating_mode_and_require_pin_never_become_states(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
+    dev = devices[ds.lookup(0x39, 1)]
+    assert set(dev.states) - {"onOffState", "lockState", *_LOCK_SETTING_STATES} == set()
+
+
+def test_an_existing_lock_gains_the_settings_on_upgrade_without_recreation(ds, indigo_env):
+    """A lock created by 2026.34.x has none of the three states. The upgrade path
+    is deviceStartComm -> stateListOrDisplayStateIdChanged() (adds the declared
+    states), then the next reconcile primes them — the same device, never recreated.
+    """
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
+    dev_id = ds.lookup(0x39, 1)
+    dev = devices[dev_id]
+    # Rewind it to the pre-upgrade shape: the states did not exist.
+    for key in _LOCK_SETTING_STATES:
+        del dev.states[key]
+
+    ds.reconcile_all([LOCK_SETTINGS_NODE])
+    assert not any(key in dev.states for key in _LOCK_SETTING_STATES), \
+        "an undeclared state must not be written (Indigo would error)"
+
+    for key in _LOCK_SETTING_STATES:        # Indigo rebuilds the state list on start
+        dev.states[key] = 0
+    ds.reconcile_all([LOCK_SETTINGS_NODE])
+    assert ds.lookup(0x39, 1) == dev_id, "the device is the same one"
+    assert dev.states["autoRelockTime"] == 30
+    assert dev.states["wrongCodeEntryLimit"] == 5
+    assert dev.states["userCodeTemporaryDisableTime"] == 60
+
+
+def test_a_lock_whose_attribute_list_arrives_later_gets_its_state_list_rebuilt(ds, indigo_env):
+    """The AttributeList decides which states a lock keeps (#190); a changed list
+    must rebuild the state list rather than wait for a restart."""
+    import copy
+    _indigo, devices = indigo_env
+    bare = copy.deepcopy(LOCK_SETTINGS_NODE)
+    bare["attributes"]["1/257/65531"] = [0, 65528, 65529, 65531, 65532, 65533]
+    ds.create_from_raw(bare, "Side Gate")
+    dev = devices[ds.lookup(0x39, 1)]
+    before = dev.state_list_rebuilds
+    ds.reconcile_all([LOCK_SETTINGS_NODE])
+    assert dev.state_list_rebuilds > before
