@@ -43,8 +43,9 @@ check moves.
   dropped and the device stays on, as before); a recovery that fails is reported in the Indigo log. A controller changing the On-time
   of a running countdown moves or cancels the record with it. A countdown that is still
   running (a plugin-only reconnect) and a device Indigo reports off are left alone.
-  **Known limitations:** countdowns started under bridge 0.17.x have no recorded end time
-  and are not recovered; and if you turn the device off and on again in Indigo while the
+  **Known limitations:** a countdown already running when the bridge is upgraded (started under
+  bridge 0.17.x, or recorded by an earlier unreleased build) has no recorded end time and is not
+  recovered; and if you turn the device off and on again in Indigo while the
   node is down, that deliberate "on" is indistinguishable from the lost countdown and is
   turned off.
 - Fix (issue #355): un-exporting a device, restarting the bridge node and exporting it

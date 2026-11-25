@@ -94,14 +94,13 @@ export interface EndpointIdentity {
 
 /**
  * #203 — where the registry keeps each endpoint's timed-on countdown marker,
- * keyed on the published identity. {@link EndpointMapStore} is the real one (the
- * marker rides the endpoint's `endpoint-map.json` record, so it is written
- * atomically in the map's own style and dies with the record); the registry
- * falls back to an in-memory one when none is given.
+ * keyed on the published identity. {@link CountdownStore} (`countdowns.json`, its
+ * own file beside the endpoint map, written atomically) is the real one; the
+ * registry falls back to an in-memory one when none is given.
  */
 export interface CountdownMarkers {
     countdownDeadline(uniqueId: string): number | undefined;
-    /** False when there is nowhere to record it (no map record yet). */
+    /** False when the deadline is unusable (non-finite or not positive) and so was not recorded. */
     setCountdown(uniqueId: string, deadlineMs: number): boolean;
     clearCountdown(uniqueId: string): void;
 }
@@ -500,8 +499,8 @@ export class EndpointRegistry {
             mark: remainingMs => {
                 if (!this.#markers.setCountdown(publishedAs, this.#now() + remainingMs)) {
                     this.#log(
-                        `Endpoint ${indigoDeviceId}: a timed-on countdown started but there is no endpoint-map ` +
-                            "record to note it in yet, so a node restart could not recover it (#203)",
+                        `Endpoint ${indigoDeviceId}: a timed-on countdown started but its end time could not be recorded ` +
+                            "(unusable deadline), so a node restart could not recover it (#203)",
                     );
                 }
             },

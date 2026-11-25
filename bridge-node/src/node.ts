@@ -486,8 +486,8 @@ export class BridgeNode implements BridgeFacade {
             bridgeIdentity: this.bridgedIdentity,
             log: message => this.log(message),
             emit: data => this.#command?.(data),
-            // #203 — the marker rides the endpoint's own map record (ADR-0016's
-            // witness file), and a failed recovery goes out through `warnings`.
+            // #203 — markers live in their own `countdowns.json`, deliberately NOT in the
+            // endpoint map (the identity witness), and a failed recovery goes out through `warnings`.
             countdowns: this.#countdowns,
             warn: (key, message) => {
                 if (message === undefined) {
