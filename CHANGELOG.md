@@ -3,6 +3,29 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.38.0 — Door lock settings, and a restart hint when commissioning finds no device
+
+- New (issue #368): a Matter lock's **Edit Device** dialog now offers up to three
+  settings, each shown only if that lock says it implements it: **Auto-relock**
+  (seconds; 0 turns it off), **Wrong-code limit** (attempts, 1-255) and **Lockout
+  time** (seconds, 1-255; how long the lock ignores commands after too many wrong
+  codes). Like other device settings they are stored on the lock itself, are read
+  back after a change, and each has a state you can use in triggers. Locks you
+  already have gain them on upgrade with no need to recreate the device. The
+  Auto-relock field accepts any whole number up to 4294967295 because the Matter
+  model sets no tighter limit.
+- Not offered, on purpose: **Require PIN for remote operation**, because the plugin
+  locks and unlocks without a PIN, so switching it on would make the lock refuse
+  Indigo's commands. The "settable attributes not offered yet" report no longer
+  lists it or invites a request for it. **Operating mode** is still listed there;
+  it needs more work.
+- Fix (issue #368): when matter-server reports "No commissionable device was
+  discovered", the error (Event Log, and the message the iOS app shows) now
+  suggests Plugins ▸ Matter ▸ **Restart the Matter controller** and retrying with a
+  fresh pairing code. That was the fix for the reporter's Aqara lock after a
+  long-running matter-server stopped hearing it. The cause is not confirmed, and
+  nothing is restarted automatically. Other commissioning errors are unchanged.
+
 ## 2026.34.1 — Stopping the bridge node on purpose is no longer reported as a failure
 
 - Fix (issue #366): an un-export that had completed was repeated on every plugin
