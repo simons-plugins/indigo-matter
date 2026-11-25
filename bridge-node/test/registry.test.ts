@@ -3699,6 +3699,7 @@ describe("a countdown across a node restart (issue #203)", () => {
                     h.commands.length = 0;
                     await part(h, 1).set({ onOff: { onTime } } as never);
                     await waitFor(() => markerOf(h, 1) === marker(h), 2000);
+                    assert.equal(markerOf(h, 1), marker(h), "the marker followed the controller's write");
                     h.clock.now += 3_600_000; // far past every deadline involved
                     await h.registry.reconcile([on(1)], false);
                     await h.registry.sweepCountdowns();
@@ -3719,6 +3720,7 @@ describe("a countdown across a node restart (issue #203)", () => {
                     await startCountdown(part(first, 1), 600); // old deadline t0 + 60 s
                     await part(first, 1).set({ onOff: { onTime } } as never);
                     await waitFor(() => markerOf(first, 1) === marker(first), 2000);
+                    assert.equal(markerOf(first, 1), marker(first), "the marker followed the controller's write");
                 } finally {
                     await first.close();
                 }
