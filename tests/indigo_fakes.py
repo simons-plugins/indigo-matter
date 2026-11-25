@@ -46,6 +46,8 @@ _STATIC_DEVICE_TYPE_STATES = {
     "matterMotionSensor": {"sensitivityLevel", "holdTime"},
     "matterContactSensor": {"sensitivityLevel"},
     "matterRelay": {"startUpOnOff"},
+    "matterDimmer": {"startUpOnOff"},       # issue #360
+    "matterColorDimmer": {"startUpOnOff"},
     # issue #204 / ADR-0008 — declared unconditionally in Devices.xml (no
     # Supports* prop gates any of them), same custom-type discipline as
     # matterEnergyMeter/matterUnknown's `reachable`. curEnergyLevel/

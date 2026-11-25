@@ -415,7 +415,9 @@ SETTINGS: tuple = (
         # to express, and silently mapping it to something else would misreport
         # what the device is set to.
         bounds=EnumValues(((0, "Off"), (1, "On"), (2, "Toggle (opposite of before)"))),
-        device_types=frozenset({"matterRelay"}),
+        # Dimmers carry the same cluster with the same attribute (#360), so the
+        # one declaration serves all three Lighting-capable types.
+        device_types=frozenset({"matterRelay", "matterDimmer", "matterColorDimmer"}),
     ),
 )
 

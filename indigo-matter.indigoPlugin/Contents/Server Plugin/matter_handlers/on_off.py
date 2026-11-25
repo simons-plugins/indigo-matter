@@ -95,7 +95,8 @@ class OnOffHandler(ClusterHandler):
             # it, so the state is left alone rather than given a value the
             # device does not hold.
             return {}
-        # Guard: relays fielded before #186 have no such state until Indigo
+        # Guard: relays fielded before #186 (and dimmers before #360) have no such
+        # state until Indigo
         # rebuilds their state list (deviceStartComm) — same reason as holdTime.
         if state_key not in getattr(indigo_dev, "states", {}):
             return {}

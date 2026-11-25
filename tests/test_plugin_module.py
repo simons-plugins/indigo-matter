@@ -1897,7 +1897,7 @@ def test_a_dimmers_dialog_is_seeded_with_the_current_value(plugin_cls, mock_indi
     stub = _settings_stub(plugin_cls, mock_logger, limits={}, attr_lists=_DIMMER_ATTR_LISTS)
     values, _errors = plugin_cls.getDeviceConfigUiValues(
         stub, {"nodeId": "6", "endpointId": "1"}, type_id, 7)
-    assert type(values).__name__ in ("Dict", "dict") and values["hasStartUpOnOff"] == "yes"
+    assert values["hasStartUpOnOff"] == "yes"
     assert values["startUpOnOff"] == "1"
 
 
