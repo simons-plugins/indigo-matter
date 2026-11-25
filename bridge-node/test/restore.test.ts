@@ -40,6 +40,8 @@ import {
     type EndpointMapFile,
     type EndpointMapFileV1,
 } from "../src/endpoint-map.js";
+import { COUNTDOWNS_FILE } from "../src/countdowns.js";
+import { EndpointMapStore } from "../src/endpoint-map.js";
 import { IndigoOnOffServer, uniqueIdFor } from "../src/endpoints.js";
 import { BridgeNode, ENDPOINT_COUNT_ADVISORY, ENDPOINT_COUNT_WARNING, matterJsVersion } from "../src/node.js";
 import { ErrorCode, PROTOCOL_VERSION, RefuseReason } from "../src/protocol.js";
@@ -175,6 +177,11 @@ async function attach(
         }
         events.push(frame);
     }
+}
+
+function readCountdowns(storagePath: string): Record<string, number> {
+    return (JSON.parse(readFileSync(join(storagePath, COUNTDOWNS_FILE), "utf8")) as { countdowns: Record<string, number> })
+        .countdowns;
 }
 
 function readMap(storagePath: string): EndpointMapFile {
@@ -1766,7 +1773,7 @@ describe("issue #203: a countdown lost across a real node restart", () => {
                 }),
             );
             assert.ok(
-                readMap(storagePath).endpoints[uniqueIdFor(KITCHEN)]?.countdownDeadline !== undefined,
+                readCountdowns(storagePath)[uniqueIdFor(KITCHEN)] !== undefined,
                 "the countdown must be recorded on disk",
             );
         } finally {
@@ -1776,14 +1783,13 @@ describe("issue #203: a countdown lost across a real node restart", () => {
 
     /** Move the recorded deadline, or drop it, so the restart's clock position is not at the mercy of boot time. */
     function setDeadline(storagePath: string, deadline: number | undefined): void {
-        const map = readMap(storagePath);
-        const record = map.endpoints[uniqueIdFor(KITCHEN)]!;
+        const countdowns = readCountdowns(storagePath);
         if (deadline === undefined) {
-            delete record.countdownDeadline;
+            delete countdowns[uniqueIdFor(KITCHEN)];
         } else {
-            record.countdownDeadline = deadline;
+            countdowns[uniqueIdFor(KITCHEN)] = deadline;
         }
-        writeFileSync(join(storagePath, ENDPOINT_MAP_FILE), JSON.stringify(map));
+        writeFileSync(join(storagePath, COUNTDOWNS_FILE), JSON.stringify({ version: 1, countdowns }));
     }
 
     it("sends the off only AFTER the attach response, once, with its reason; a confirmed off ends it for good", async () => {
@@ -1851,6 +1857,52 @@ describe("issue #203: a countdown lost across a real node restart", () => {
         }
     });
 
+    it("countdown activity never touches endpoint-map.json — it is the identity witness, the markers have their own file", async () => {
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        const proto = EndpointMapStore.prototype as unknown as { persist: (...args: unknown[]) => boolean };
+        const originalPersist = proto.persist;
+        try {
+            await attach(session.client, "a1", [{ ...KITCHEN_SPEC, states: { onOff: true } }]);
+            const before = readFileSync(join(storagePath, ENDPOINT_MAP_FILE));
+            let persists = 0;
+            proto.persist = function (): boolean {
+                persists += 1;
+                throw new Error("the endpoint map must not be rewritten for a countdown");
+            };
+            const kitchen = childOf(session.bridge.server, KITCHEN);
+            assert.ok(kitchen !== undefined);
+            await kitchen.act(agent =>
+                agent.get(OnOffLighting).onWithTimedOff({ onOffControl: { acceptOnlyWhenOn: false }, onTime: 600, offWaitTime: 0 }),
+            );
+            assert.ok(readCountdowns(storagePath)[uniqueIdFor(KITCHEN)] !== undefined, "start wrote a marker");
+            await setStateOne(session.client, "s1", { onOff: false });
+            assert.equal(readCountdowns(storagePath)[uniqueIdFor(KITCHEN)], undefined, "the off cleared it");
+            assert.equal(persists, 0);
+            assert.ok(readFileSync(join(storagePath, ENDPOINT_MAP_FILE)).equals(before), "byte for byte");
+        } finally {
+            proto.persist = originalPersist;
+            await session.close();
+        }
+    });
+
+    it("a marker for an endpoint the map no longer knows is pruned at boot", async () => {
+        const storagePath = storage();
+        await restartMidCountdown(storagePath);
+        writeFileSync(
+            join(storagePath, COUNTDOWNS_FILE),
+            JSON.stringify({ version: 1, countdowns: { ...readCountdowns(storagePath), "indigo-999": Date.now() } }),
+        );
+        const session = await boot(storagePath);
+        try {
+            const kept = readCountdowns(storagePath);
+            assert.equal(kept["indigo-999"], undefined);
+            assert.ok(kept[uniqueIdFor(KITCHEN)] !== undefined, "the live endpoint's marker stays");
+        } finally {
+            await session.close();
+        }
+    });
+
     it("an attach that says the device is off sends nothing", async () => {
         const storagePath = storage();
         await restartMidCountdown(storagePath);
@@ -1863,7 +1915,7 @@ describe("issue #203: a countdown lost across a real node restart", () => {
             assert.deepEqual(await framesWithin(second.client, 800), []);
             const kitchen = childOf(second.bridge.server, KITCHEN);
             assert.equal((kitchen?.stateOf("onOff") as { onTime?: number } | undefined)?.onTime, 0);
-            assert.equal(readMap(storagePath).endpoints[uniqueIdFor(KITCHEN)]?.countdownDeadline, undefined);
+            assert.equal(readCountdowns(storagePath)[uniqueIdFor(KITCHEN)], undefined);
         } finally {
             await second.close();
         }

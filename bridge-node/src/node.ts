@@ -53,6 +53,7 @@ import {
 
 import { ChurnDetector, churnWarning } from "./churn.js";
 import type { BridgeConfig } from "./config.js";
+import { CountdownStore } from "./countdowns.js";
 import { ENDPOINT_MAP_FILE, EndpointMapStore, type LiveEndpointNumber, refuseReasonFor } from "./endpoint-map.js";
 import { type BridgedIdentity, isSupportedRole } from "./endpoints.js";
 import {
@@ -264,6 +265,7 @@ export class BridgeNode implements BridgeFacade {
     #reopening = false;
     #commissionableCheck?: NodeJS.Timeout;
     readonly #endpointMap: EndpointMapStore;
+    readonly #countdowns: CountdownStore;
     /** The identity, rebound by {@link markCommissioned}/{@link clearCommissioned}. */
     #identity: BridgeIdentity;
     /** Why we are refusing everything but the §1.1 recovery trio, if we are. */
@@ -365,6 +367,7 @@ export class BridgeNode implements BridgeFacade {
         this.#identity = identity;
         this.#refusal = initialRefusal;
         this.#endpointMap = new EndpointMapStore(config.storagePath, message => this.log(message));
+        this.#countdowns = new CountdownStore(config.storagePath, message => this.log(message));
         this.#window = new CommissioningWindow({
             log: message => this.log(message),
             onExpire: () => this.endMatterCommissioning(),
@@ -483,7 +486,7 @@ export class BridgeNode implements BridgeFacade {
             emit: data => this.#command?.(data),
             // #203 — the marker rides the endpoint's own map record (ADR-0016's
             // witness file), and a failed recovery goes out through `warnings`.
-            countdowns: this.#endpointMap,
+            countdowns: this.#countdowns,
             warn: (key, message) => {
                 if (message === undefined) {
                     this.#warnings.delete(key);
@@ -514,6 +517,8 @@ export class BridgeNode implements BridgeFacade {
         // Before the stack goes online, so the answer is available the moment a
         // client can ask — and so the log reads in the order things happened.
         this.#endpointMap.load();
+        this.#countdowns.load();
+        this.#countdowns.prune(this.#endpointMap.uniqueIds());
 
         // …and before `server.start()`, which is the whole of issue #141: the
         // aggregator must already have its children the first time a controller
@@ -1942,6 +1947,7 @@ export class BridgeNode implements BridgeFacade {
                 `${preserveEndpointNumbers ? "preserved" : "DISCARDED"})`,
         );
         await this.server.erase();
+        this.#countdowns.clearAll();
         this.applyWitness(
             WARN_IDENTITY_WRITE,
             clearCommissioned(this.config.storagePath, this.identity, message => this.log(message)),

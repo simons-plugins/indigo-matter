@@ -14,7 +14,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -37,7 +37,8 @@ import { ExtendedColorLightDevice } from "@matter/main/devices/extended-color-li
 import { OnOffLightDevice } from "@matter/main/devices/on-off-light";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
 
-import { EndpointMapStore, ENDPOINT_MAP_FILE } from "../src/endpoint-map.js";
+import { COUNTDOWNS_FILE, CountdownStore } from "../src/countdowns.js";
+import { EndpointMapStore } from "../src/endpoint-map.js";
 import {
     applyStates,
     endpointIdFor,
@@ -117,8 +118,9 @@ interface Harness {
     commands: CommandEventData[];
     logs: string[];
     storagePath: string;
-    /** #203 — the real map store the registry keeps countdown markers in, loaded from `storagePath`. */
     map: EndpointMapStore;
+    /** #203 — the real marker store (`countdowns.json`), loaded from `storagePath`. */
+    countdowns: CountdownStore;
     /** #203 — the registry's wall clock; set `clock.now` to move it. */
     clock: { now: number };
     /** #203 — the §4.3 warnings the registry has raised, by key. */
@@ -179,12 +181,14 @@ async function harness(
     const logs: string[] = [];
     const map = new EndpointMapStore(storagePath);
     map.load();
+    const countdowns = new CountdownStore(storagePath);
+    countdowns.load();
     const clock = { now: 1_000_000_000 };
     const warnings = new Map<string, string>();
     const registry = new EndpointRegistry({
         aggregator,
         bridgeIdentity: BRIDGE_IDENTITY,
-        countdowns: map,
+        countdowns,
         now: () => clock.now,
         warn: (key, message) => (message === undefined ? warnings.delete(key) : warnings.set(key, message)),
         emit: data => {
@@ -213,6 +217,7 @@ async function harness(
         logs,
         storagePath,
         map,
+        countdowns,
         clock,
         warnings,
         recordIdentities: () => {
@@ -3496,7 +3501,7 @@ describe("a countdown across a node restart (issue #203)", () => {
     });
     const onTimeOf = (endpoint: Endpoint): unknown => (endpoint.stateOf("onOff") as Record<string, unknown>).onTime;
     const markerOf = (h: Harness, deviceId: number): number | undefined =>
-        h.map.countdownDeadline(uniqueIdFor(deviceId));
+        h.countdowns.countdownDeadline(uniqueIdFor(deviceId));
     const on = (id: number): EndpointSpec => spec(id, Role.onOffLight, { states: { onOff: true } });
     const off = (id: number): EndpointSpec => spec(id, Role.onOffLight, { states: { onOff: false } });
 
@@ -3729,12 +3734,7 @@ describe("a countdown across a node restart (issue #203)", () => {
 
     it("storage written before the marker existed (no marker) is never treated as a lost countdown", async () => {
         const storagePath = await restartMidCountdown();
-        const file = join(storagePath, ENDPOINT_MAP_FILE);
-        const parsed = JSON.parse(readFileSync(file, "utf8")) as { endpoints: Record<string, Record<string, unknown>> };
-        for (const record of Object.values(parsed.endpoints)) {
-            delete record.countdownDeadline;
-        }
-        writeFileSync(file, JSON.stringify(parsed));
+        rmSync(join(storagePath, COUNTDOWNS_FILE)); // what a pre-upgrade install looks like
         const second = await reboot(storagePath, [on(1)]);
         try {
             assert.ok((onTimeOf(part(second, 1)) as number) > 0, "precondition: a stale onTime IS on disk");
