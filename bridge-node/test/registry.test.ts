@@ -60,6 +60,7 @@ import {
     type RoleValue,
 } from "../src/protocol.js";
 import { EndpointRegistry } from "../src/registry.js";
+import { golden } from "./stub-bridge.js";
 import { closeSharedMdns, LOOPBACK, settleMatterWrites } from "./loopback.js";
 
 const PRODUCT_NAME = "Indigo Matter Bridge";
@@ -3206,13 +3207,57 @@ describe("onOff commands (§4.2, §7, #143, #201)", () => {
                 if ((endpoint.stateOf("onOff") as Record<string, unknown>).onOff !== true) {
                     failures.push(`#${i}: attribute still false after the on push`);
                 }
-                await h.registry.setState(1, { onOff: false });
+                try {
+                    await h.registry.setState(1, { onOff: false }); // the reset can lose the same race
+                } catch (error) {
+                    failures.push(`#${i} (reset): ${String(error)}`);
+                }
             }
             assert.deepEqual(failures, [], "an on push lost the race against the countdown's tick lock");
         } finally {
             await h.close();
         }
     });
+
+    /** Hold the onOff lock in another transaction until `release()` is called. */
+    async function holdOnOffLock(endpoint: Endpoint): Promise<{ release: () => void; done: Promise<void> }> {
+        let release!: () => void;
+        const held = new Promise<void>(resolve => (release = resolve));
+        let locked!: () => void;
+        const lockTaken = new Promise<void>(resolve => (locked = resolve));
+        const done = endpoint.act(async agent => {
+            const behavior = agent.get(OnOffLighting);
+            await agent.context.transaction.addResources(behavior);
+            await agent.context.transaction.begin();
+            locked();
+            await held;
+        }) as Promise<void>;
+        await lockTaken;
+        return { release, done };
+    }
+
+    for (const target of [false, true]) {
+        it(`deterministic: ${target ? "an on" : "an off"} push while another transaction holds the onOff lock waits, then lands (#338)`, async () => {
+            const h = await harness();
+            try {
+                await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+                const endpoint = only(h);
+                await h.registry.setState(1, { onOff: !target });
+                const lock = await holdOnOffLock(endpoint);
+                const push = h.registry.setState(1, { onOff: target });
+                let settled = false;
+                push.then(() => (settled = true), () => (settled = true));
+                await new Promise(resolve => setTimeout(resolve, 50));
+                assert.equal(settled, false, "the push must wait for the lock, not resolve or reject while it is held");
+                lock.release();
+                await lock.done;
+                await push;
+                assert.equal((endpoint.stateOf("onOff") as Record<string, unknown>).onOff, target);
+            } finally {
+                await h.close();
+            }
+        });
+    }
 
     it("a redundant push does not kill a live countdown (§7.3)", async () => {
         const h = await harness();
@@ -3510,7 +3555,7 @@ describe("a countdown across a node restart (issue #203)", () => {
             await second.registry.sweepCountdowns();
             assert.deepEqual(second.commands, [OFF_WITH_REASON(1)]);
             assert.ok(
-                second.logs.some(line => /Endpoint 1/.test(line) && /countdown/i.test(line)),
+                second.logs.some(line => /^Endpoint 1:/.test(line) && /countdown/i.test(line)),
                 "the node log says why",
             );
         } finally {
@@ -3763,7 +3808,7 @@ describe("a countdown across a node restart (issue #203)", () => {
             await second.registry.sweepCountdowns();
             assert.equal(onTimeOf(part(second, 1)), 0);
             assert.deepEqual(second.commands, []);
-            assert.equal(second.logs.filter(line => /Endpoint 1/.test(line) && /leftover onTime/.test(line)).length, 1);
+            assert.equal(second.logs.filter(line => /^Endpoint 1:/.test(line) && /leftover onTime/.test(line)).length, 1);
 
             // A countdown whose ON Indigo has not confirmed yet: attribute off, timer RUNNING, onTime counting.
             await startCountdown(part(second, 1), 100);
@@ -3833,6 +3878,77 @@ describe("a create-time applyStates failure (issue #355)", () => {
         } finally {
             proto.applyIndigoOnOff = original;
             await h.close();
+        }
+    });
+
+    it("a create whose states cannot be applied fails the reconcile, stays live, and bumps ConfigurationVersion", async () => {
+        const h = await harness();
+        const version = (): number =>
+            (h.node.state.basicInformation as { configurationVersion?: number }).configurationVersion ?? 0;
+        const proto = Endpoint.prototype as unknown as { set: (...args: unknown[]) => Promise<void> };
+        const originalSet = proto.set;
+        try {
+            const start = version();
+            proto.set = function (this: Endpoint, ...args: unknown[]): Promise<void> {
+                const values = args[0] as Record<string, unknown> | undefined;
+                if (this.id === uniqueIdFor(7) && values?.levelControl !== undefined) {
+                    return Promise.reject(new Error("storage refused the create-time level"));
+                }
+                return originalSet.apply(this, args);
+            };
+            const error = await rejects(
+                () => h.registry.reconcile([spec(7, Role.dimmableLight, { states: { onOff: true, level: 60 } })], false),
+                ErrorCode.internal,
+            );
+            proto.set = originalSet;
+            assert.match(error.message, /device 7/);
+            assert.match(error.message, /storage refused the create-time level/);
+            assert.equal([...h.aggregator.parts].length, 1, "the endpoint stays registered for the next update to retry");
+            assert.ok(version() > start, `ConfigurationVersion must move: ${start} -> ${version()}`);
+        } finally {
+            proto.set = originalSet;
+            await h.close();
+        }
+    });
+
+    it("re-exporting every role over different persisted states emits no command (create-time applyStates is local)", async () => {
+        const storagePath = mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-355all-"));
+        scratchRoots.push(storagePath);
+        const specs = (golden.attach_all_roles.request.args as { endpoints: EndpointSpec[] }).endpoints.map(entry => ({
+            ...spec(entry.indigoDeviceId, entry.role),
+            states: entry.states,
+            battery: entry.battery ?? false,
+            options: entry.options ?? {},
+        }));
+        const ids = new Set(specs.map(entry => entry.indigoDeviceId));
+        const pushes = Object.entries(golden as unknown as Record<string, unknown>)
+            .filter(([name]) => name.startsWith("set_state_"))
+            .map(
+                ([, example]) =>
+                    (example as { request: { args: { indigoDeviceId: number; states: Record<string, unknown> } } })
+                        .request.args,
+            )
+            .filter(args => ids.has(args.indigoDeviceId));
+        assert.ok(specs.length >= 20 && pushes.length > 0, `precondition: ${specs.length} roles, ${pushes.length} pushes`);
+        const first = await harness({ storagePath });
+        try {
+            await first.registry.reconcile(specs, false);
+            for (const args of pushes) {
+                await first.registry.setState(args.indigoDeviceId, args.states);
+            }
+            for (const entry of specs) {
+                await first.registry.remove(entry.indigoDeviceId);
+            }
+        } finally {
+            await first.close();
+        }
+        const second = await harness({ storagePath });
+        try {
+            await second.registry.reconcile(specs, false);
+            await new Promise(resolve => setTimeout(resolve, 300));
+            assert.deepEqual(second.commands, [], "create-time applyStates echoed a command to the plugin");
+        } finally {
+            await second.close();
         }
     });
 });

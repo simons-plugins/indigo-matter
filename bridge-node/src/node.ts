@@ -25,6 +25,7 @@ import { join } from "node:path";
 import {
     Endpoint,
     Environment,
+    Seconds,
     ServerNode,
     UninitializedDependencyError,
     VendorId,
@@ -2141,6 +2142,11 @@ export class BridgeNode implements BridgeFacade {
                 salt,
             });
             await server.env.get(DeviceCommissioner).allowEnhancedCommissioning(discriminator, paseServer, {
+                // matter.js 0.18 starts its own window timer (0.17.8 built one and never
+                // started it), defaulting to 15 minutes on a commissioned node. Our duration, so
+                // the two agree; `CommissioningWindow.noteEnded` treats an end at that deadline
+                // as the expiry it is.
+                timeout: Seconds(durationSeconds),
                 onClose: () => {
                     this.#window.noteEnded();
                 },
@@ -2163,12 +2169,10 @@ export class BridgeNode implements BridgeFacade {
             },
         ]);
 
-        // DeviceCommissioner *does* build a STANDARD_COMMISSIONING_TIMEOUT timer
-        // in `#enterCommissioningMode`, but never calls `.start()` on it — a
-        // matter.js 0.17.8 bug — so nothing on the Matter side would ever close
-        // this window. Ours is the only timer. If upstream fixes that, the two
-        // race, which is why we cap durationSeconds at Matter's own 900s maximum:
-        // whichever fires first, the outcome is the same.
+        // Two timers now run, ours and matter.js 0.18's (started above with the same
+        // `timeout`, a few ms earlier). Whichever fires first the outcome is the same: ours
+        // reports "expired" and ends the Matter window; matter.js's calls `onClose`, which
+        // `CommissioningWindow.noteEnded` also reports as "expired" when it lands at the deadline.
         const expiresAt = this.#window.open(durationSeconds, manualPairingCode, qrPairingCode);
         return { manualPairingCode, qrPairingCode, windowExpiresAt: expiresAt.toISOString() };
     }

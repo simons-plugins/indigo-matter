@@ -21,6 +21,17 @@ export const defaultScheduler: Scheduler = (callback, ms) => {
     return () => clearTimeout(timer);
 };
 
+/**
+ * matter.js 0.18 starts a window timer of its own, set to the same duration but
+ * begun a few milliseconds BEFORE ours (it starts inside
+ * `allowEnhancedCommissioning`, ours once the pairing codes are encoded). Its end
+ * callback is {@link CommissioningWindow.noteEnded}, so an end this close to our
+ * deadline is the expiry, not a commissioner finishing. Generous on purpose: a
+ * pairing that completes in the last two seconds is vanishingly rare, and
+ * misreporting it as "expired" only costs a readout line.
+ */
+export const EXPIRY_SLACK_MS = 2000;
+
 export interface OpenWindow {
     expiresAt: Date;
     manualPairingCode: string;
@@ -49,7 +60,7 @@ export class CommissioningWindow {
 
     constructor(options: CommissioningWindowOptions = {}) {
         this.#schedule = options.schedule ?? defaultScheduler;
-        this.#now = options.now ?? Date.now;
+        this.#now = options.now ?? (() => Date.now());
         this.#log = options.log ?? (() => {});
         this.#onExpire = options.onExpire;
     }
@@ -100,7 +111,13 @@ export class CommissioningWindow {
         if (this.#open === undefined) {
             return false;
         }
+        const expired = this.#now() >= this.#open.expiresAt.getTime() - EXPIRY_SLACK_MS;
         this.#discard();
+        if (expired) {
+            this.#log("Commissioning window expired");
+            this.#emit("expired");
+            return true;
+        }
         this.#log("Commissioning window closed by commissioner");
         this.#emit("commissioned");
         return true;

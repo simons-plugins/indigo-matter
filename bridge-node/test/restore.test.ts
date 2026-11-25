@@ -26,9 +26,10 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, describe, it } from "node:test";
+import { after, describe, it, mock } from "node:test";
 
-import { type Endpoint, Logger, ServerNode } from "@matter/main";
+import { type Endpoint, Logger, Seconds, ServerNode } from "@matter/main";
+import { DeviceCommissioner } from "@matter/main/protocol";
 import { OnOffServer } from "@matter/main/behaviors/on-off";
 
 import {
@@ -1604,6 +1605,22 @@ describe("issue #274 at node level: remove_endpoint destroys, so a later upsert 
     });
 });
 
+async function setStateFor(
+    client: TestClient,
+    messageId: string,
+    indigoDeviceId: number,
+    states: Record<string, unknown>,
+): Promise<void> {
+    client.send({ message_id: messageId, command: "set_state", args: { indigoDeviceId, states } });
+    for (;;) {
+        const frame = await client.next(10_000);
+        if (frame.message_id === messageId) {
+            assert.equal(frame.error_code, undefined, JSON.stringify(frame));
+            return;
+        }
+    }
+}
+
 describe("issue #355: un-export, restart, re-export", () => {
     it("the states sent with the re-export win over what matter.js persisted for that id", async () => {
         // ADR-0016 deletes the removed endpoint's map record, so the next boot
@@ -1620,7 +1637,7 @@ describe("issue #355: un-export, restart, re-export", () => {
             first.client.send({
                 message_id: "s1",
                 command: "set_state",
-                args: { indigoDeviceId: LOUNGE, states: { onOff: false } },
+                args: { indigoDeviceId: LOUNGE, states: { onOff: false, level: 20 } },
             });
             for (;;) {
                 const frame = await first.client.next(10_000);
@@ -1630,6 +1647,11 @@ describe("issue #355: un-export, restart, re-export", () => {
                 }
             }
             assert.equal(onOffOf(first.bridge.server, LOUNGE), false, "fixture setup: persisted state is off");
+            assert.notEqual(
+                currentLevelOf(first.bridge.server, LOUNGE),
+                152,
+                "fixture setup: the persisted level (20%) differs from the one the re-export carries (60%)",
+            );
             await removeOne(first.client, "r1", LOUNGE);
         } finally {
             await first.close();
@@ -1654,6 +1676,38 @@ describe("issue #355: un-export, restart, re-export", () => {
                 [],
                 "applying initial states must not emit command events to the plugin",
             );
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("a re-export's colour temperature wins over a different persisted one", async () => {
+        const CT_SPEC = {
+            indigoDeviceId: HALL,
+            role: "colorTemperatureLight",
+            label: "Hall Strip",
+            reachable: true,
+            states: { onOff: true, level: 60, colorTempMireds: 320 },
+            options: {},
+        };
+        const mireds = (server: ServerNode): unknown =>
+            (childOf(server, HALL)?.stateOf("colorControl") as { colorTemperatureMireds?: number } | undefined)
+                ?.colorTemperatureMireds;
+        const storagePath = storage();
+        const first = await boot(storagePath);
+        try {
+            await attach(first.client, "a1", [CT_SPEC]);
+            await setStateFor(first.client, "s1", HALL, { colorTempMireds: 200 });
+            assert.equal(mireds(first.bridge.server), 200, "fixture setup: the persisted colour temperature is 200");
+            await removeOne(first.client, "r1", HALL);
+        } finally {
+            await first.close();
+        }
+        const second = await boot(storagePath);
+        try {
+            const { events } = await attach(second.client, "a2", [CT_SPEC]);
+            assert.equal(mireds(second.bridge.server), 320, "the export's colour temperature, not the persisted one");
+            assert.deepEqual(events.filter(frame => frame.event === "command"), []);
         } finally {
             await second.close();
         }
@@ -1769,6 +1823,32 @@ describe("issue #203: a countdown lost across a real node restart", () => {
         }
     });
 
+    it("a plugin-only reattach while a countdown is genuinely running sends nothing; the countdown's own expiry then sends one off, without a reason", async () => {
+        const session = await boot(storage());
+        try {
+            await attach(session.client, "a1", [{ ...KITCHEN_SPEC, states: { onOff: true } }]);
+            const kitchen = childOf(session.bridge.server, KITCHEN);
+            assert.ok(kitchen !== undefined);
+            await kitchen.act(agent =>
+                agent.get(OnOffLighting).onWithTimedOff({
+                    onOffControl: { acceptOnlyWhenOn: false },
+                    onTime: 20,
+                    offWaitTime: 0,
+                }),
+            );
+            // The countdown's own ON frame, drained so it cannot land in the second attach.
+            const on = await session.client.next(5_000);
+            assert.deepEqual(on.data, { indigoDeviceId: KITCHEN, command: "onOff", args: { value: true } });
+            const { events } = await attach(session.client, "a2", [{ ...KITCHEN_SPEC, states: { onOff: true } }]);
+            assert.deepEqual(commandsIn(events), [], "a reattach must not end a live countdown");
+            const frame = await session.client.next(5_000);
+            assert.deepEqual(frame.data, { indigoDeviceId: KITCHEN, command: "onOff", args: { value: false } });
+            assert.deepEqual(commandsIn(await framesWithin(session.client, 500)), [], "exactly one");
+        } finally {
+            await session.close();
+        }
+    });
+
     it("an attach that says the device is off sends nothing", async () => {
         const storagePath = storage();
         await restartMidCountdown(storagePath);
@@ -1828,6 +1908,73 @@ describe("issue #203: a countdown lost across a real node restart", () => {
         }
     });
 });
+
+describe("the commissioning window's timeout agrees with matter.js 0.18's own timer", () => {
+    it("passes our duration as the timeout, and a window matter.js closes at that deadline reports 'expired'", async () => {
+        const session = await boot(storage());
+        const proto = DeviceCommissioner.prototype as unknown as {
+            allowEnhancedCommissioning: (...args: unknown[]) => Promise<void>;
+        };
+        const original = proto.allowEnhancedCommissioning;
+        let captured: { timeout?: number; onClose?: () => unknown } | undefined;
+        // Not forwarded: matter.js 0.18 refuses an Enhanced window on a node that is not yet
+        // commissioned (its own Basic window is in place), and what is under test is the options we pass.
+        proto.allowEnhancedCommissioning = function (this: DeviceCommissioner, ...args: unknown[]): Promise<void> {
+            captured = args[2] as typeof captured;
+            return Promise.resolve();
+        };
+        try {
+            const opened = await session.client.request(
+                { message_id: "w1", command: "attach", args: { protocolVersion: PROTOCOL_VERSION, pluginVersion: "t", endpoints: [] } },
+                10_000,
+            );
+            assert.equal(opened.error_code, undefined, JSON.stringify(opened));
+            const response = await session.client.request(
+                { message_id: "w2", command: "open_commissioning_window", args: { durationSeconds: 180 } },
+                10_000,
+            );
+            assert.equal(response.error_code, undefined, JSON.stringify(response));
+            assert.ok(captured !== undefined, "the window must be opened through DeviceCommissioner");
+            assert.equal(captured.timeout, Seconds(180), "matter.js's timer must run for OUR duration, not its own default");
+
+            // matter.js's timer ending the window at its deadline: onClose, with the clock at the deadline.
+            const realNow = Date.now();
+            const clock = mock.method(Date, "now", () => realNow + 180_000);
+            try {
+                await captured.onClose?.();
+            } finally {
+                clock.mock.restore();
+            }
+            const frame = await session.client.next(5000);
+            assert.deepEqual(frame, { event: "window_closed", data: { reason: "expired" } });
+        } finally {
+            proto.allowEnhancedCommissioning = original;
+            await session.close();
+        }
+    });
+
+    it("matter.js ending the window reaches the plugin as window_closed 'commissioned'", async () => {
+        // The `onClose` callback is the ONLY path by which a commissioner finishing is noticed.
+        const session = await boot(storage());
+        try {
+            await attach(session.client, "a1", []);
+            const commissioner = session.bridge.server.env.get(DeviceCommissioner);
+            await commissioner.endCommissioning(); // the node's own basic window
+            await session.bridge.openCommissioningWindow(180);
+            await commissioner.endCommissioning();
+            for (;;) {
+                const frame = await session.client.next(5_000);
+                if (frame.event === "window_closed") {
+                    assert.deepEqual(frame.data, { reason: "commissioned" });
+                    break;
+                }
+            }
+        } finally {
+            await session.close();
+        }
+    });
+});
+
 
 describe("restore binds to the DRIVING device, and never to a retired identity (issue #240)", () => {
     it("restores an accessory bound to the map's deviceId, not to its key", async () => {
