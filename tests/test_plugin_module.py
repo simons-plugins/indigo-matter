@@ -1549,6 +1549,8 @@ def _settings_stub(plugin_cls, mock_logger, limits=None, runtime=None, matter=No
         lambda props: plugin_cls._setting_attribute_list_lookup(stub, props))
     stub._has_matter_node = plugin_cls._has_matter_node
     stub._log_setting_skips = lambda dev_id: plugin_cls._log_setting_skips(stub, dev_id)
+    stub._setting_primed_lookup = lambda dev_id: plugin_cls._setting_primed_lookup(stub, dev_id)
+    stub._apply_setting = lambda *args: plugin_cls._apply_setting(stub, *args)
     return stub
 
 
@@ -1616,6 +1618,7 @@ def _node_dev_stub(plugin_cls, mock_logger, device_sync=None):
     stub._has_matter_node = plugin_cls._has_matter_node
     stub._log_setting_skips = lambda dev_id: plugin_cls._log_setting_skips(stub, dev_id)
     stub._survey_summary_for = lambda props: plugin_cls._survey_summary_for(stub, props)
+    stub._setting_primed_lookup = lambda dev_id: plugin_cls._setting_primed_lookup(stub, dev_id)
     return stub
 
 
@@ -2662,14 +2665,19 @@ def test_a_failed_lock_write_is_an_error_and_never_shows_the_requested_value(
     mock_indigo_base.devices = {9: dev}
     stub = _lock_stub(plugin_cls, mock_logger, matter=MagicMock())
 
+    from protocol import ProtocolError
+
     async def refuse(*_args, **_kwargs):
-        raise RuntimeError("UNSUPPORTED_WRITE")
+        # What matter-server answers a write it refuses: its own error code and a
+        # detail naming the Matter Interaction Model status (0x88 UnsupportedWrite).
+        raise ProtocolError(136, "Write failed: UnsupportedWrite (Matter status 0x88)")
 
     stub.matter.write = refuse
     stub.matter.read = _async_value(30)        # the lock still holds the old value
     _run_lock_apply(plugin_cls, stub, _lock_plan())
     assert mock_logger.error.called
-    assert "UNSUPPORTED_WRITE" in str(mock_logger.error.call_args)
+    assert "UnsupportedWrite" in str(mock_logger.error.call_args)
+    assert "0x88" in str(mock_logger.error.call_args)
     dev.setErrorStateOnServer.assert_called_once_with("setting failed")
     stub.device_sync.apply_states.assert_called_once_with(
         9, [{"key": "autoRelockTime", "value": 30}])      # what the lock holds, not 45
@@ -2702,17 +2710,83 @@ def test_getDeviceStateList_keeps_every_lock_state_while_the_list_is_unknown(
     assert [s["Key"] for s in plugin.getDeviceStateList(dev)] == ["onOffState", "autoRelockTime"]
 
 
-def test_a_lock_device_start_asks_indigo_to_rebuild_its_state_list(plugin_cls, mock_indigo_base, mock_logger):
-    """The rollout mechanism for locks that already exist: deviceStartComm
-    refreshes the state list, so the new states appear without recreation."""
-    from types import SimpleNamespace
+def test_the_lock_dialog_seeds_blank_for_settings_not_yet_read(plugin_cls, mock_indigo_base, mock_logger):
+    """Indigo's bare 0 must not read as the lock's value."""
+    mock_indigo_base.devices = {9: _lock_dev({"autoRelockTime": 0, "wrongCodeEntryLimit": 0,
+                                              "userCodeTemporaryDisableTime": 0})}
+    stub = _lock_stub(plugin_cls, mock_logger)
+    stub.device_sync.setting_primed.side_effect = lambda dev_id, key: key == "wrongCodeEntryLimit"
+    values, _errors = plugin_cls.getDeviceConfigUiValues(
+        stub, dict(_LOCK_PROPS), "matterLock", 9)
+    assert (values["autoRelockTime"], values["wrongCodeEntryLimit"],
+            values["userCodeTemporaryDisableTime"]) == ("", "0", "")
+
+
+def test_a_lock_holding_a_value_outside_our_range_still_saves_the_dialog(
+        plugin_cls, mock_indigo_base, mock_logger):
+    mock_indigo_base.devices = {9: _lock_dev({"autoRelockTime": 100000, "wrongCodeEntryLimit": 0,
+                                              "userCodeTemporaryDisableTime": 60})}
+    stub = _lock_stub(plugin_cls, mock_logger)
+    result = plugin_cls.validateDeviceConfigUi(
+        stub, {**_LOCK_PROPS, "autoRelockTime": "100000", "wrongCodeEntryLimit": "0",
+               "userCodeTemporaryDisableTime": "60"}, "matterLock", 9)
+    assert result[0] is True
+
+
+def test_dialog_save_to_wire_for_a_lock(plugin_cls, mock_indigo_base, mock_logger):
+    """Real closedDeviceConfigUi -> real _apply_setting -> a recording matter.write."""
+    import asyncio
     from unittest.mock import MagicMock
-    dev = SimpleNamespace(id=9, name="Side Gate", deviceTypeId="matterLock",
-                          pluginProps={**_LOCK_PROPS, "createdTypeId": "matterLock"},
-                          stateListOrDisplayStateIdChanged=MagicMock(), states={})
-    stub = SimpleNamespace(logger=mock_logger, device_sync=MagicMock(), matter=None, runtime=None)
+    mock_indigo_base.devices = {9: _lock_dev()}
+    wire = []
+
+    class _Matter:
+        async def write(self, write, timeout=None):
+            wire.append(write)
+
+        async def read(self, node_id, endpoint, cluster, attribute, timeout=None):
+            return wire[-1].value
+
+    runtime = MagicMock()
+    runtime.submit.side_effect = lambda coro: asyncio.run(coro)
+    stub = _lock_stub(plugin_cls, mock_logger, runtime=runtime, matter=_Matter())
+    plugin_cls.closedDeviceConfigUi(
+        stub, {**_LOCK_PROPS, "autoRelockTime": "30", "wrongCodeEntryLimit": "5",
+               "userCodeTemporaryDisableTime": "90"},
+        False, "matterLock", 9)
+    assert len(wire) == 1
+    write = wire[0]
+    assert (write.node_id, write.endpoint, write.cluster, write.attribute, write.value) == (
+        57, 1, 0x0101, 0x0031, 90)
+    stub.device_sync.apply_states.assert_called_once_with(
+        9, [{"key": "userCodeTemporaryDisableTime", "value": 90}])
+
+
+def test_a_write_whose_read_back_got_no_answer_makes_the_setting_unread(
+        plugin_cls, mock_indigo_base, mock_logger):
+    from unittest.mock import MagicMock
+    dev = _lock_dev()
+    dev.setErrorStateOnServer = MagicMock()
+    mock_indigo_base.devices = {9: dev}
+    stub = _lock_stub(plugin_cls, mock_logger, matter=MagicMock())
+    stub.matter.write = _async_none
+
+    async def silent(*_args, **_kwargs):
+        raise TimeoutError("no answer")
+
+    stub.matter.read = silent
+    import device_settings
+    original = device_settings.apply_setting
+
+    async def no_sleep_apply(*args, **kwargs):
+        return await original(*args, sleep=_async_none, **kwargs)
+
+    device_settings.apply_setting = no_sleep_apply
     try:
-        plugin_cls.deviceStartComm(stub, dev)
-    except Exception:  # pylint: disable=broad-except
-        pass  # the rest of startComm needs a live plugin; only the refresh is under test
-    dev.stateListOrDisplayStateIdChanged.assert_called_once()
+        _run_lock_apply(plugin_cls, stub, _lock_plan())
+    finally:
+        device_settings.apply_setting = original
+    assert mock_logger.error.called
+    dev.setErrorStateOnServer.assert_called_once_with("setting failed")        # kept
+    stub.device_sync.mark_setting_unread.assert_called_once_with(9, "autoRelockTime")
+    stub.device_sync.apply_states.assert_not_called()

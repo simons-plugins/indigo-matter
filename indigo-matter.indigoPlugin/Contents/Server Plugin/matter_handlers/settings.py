@@ -108,7 +108,8 @@ ATTR_START_UP_ON_OFF = 0x4003
 # DoorLock (0x0101) — three of its writable settings (issue #368). Ranges are the
 # pinned @matter/model 0.17.8's own (door-lock-cluster.element.js), not guesses:
 #
-#   AutoRelockTime (0x0023)              uint32, NO constraint; spec text "0=disabled"
+#   AutoRelockTime (0x0023)              uint32, NO constraint; spec text "0=disabled".
+#                                        We cap it at 86400 s (see its declaration)
 #   WrongCodeEntryLimit (0x0030)         uint8,  constraint "1 to 255" (a 0 write is a
 #                                        CONSTRAINT_ERROR per the spec text)
 #   UserCodeTemporaryDisableTime (0x0031) uint8, constraint "1 to 255", seconds
@@ -444,14 +445,16 @@ SETTINGS: tuple = (
         device_types=frozenset({"matterRelay"}),
     ),
     # --- DoorLock settings (issue #368) --------------------------------------
-    # Ranges: see the DoorLock block above. AutoRelockTime has no spec
-    # constraint, so only the uint32 type's own bounds are enforced.
+    # Ranges: see the DoorLock block above.
     DeviceSetting(
         key="autoRelockTime",
         label="Auto-relock time",
         cluster=CLUSTER_DOOR_LOCK,
         attribute=ATTR_AUTO_RELOCK_TIME,
-        bounds=StaticRange(0, 0xFFFFFFFF),
+        # The spec sets no limit (uint32); the one-day cap is OURS. A uint32 does not
+        # fit an Indigo Integer state, and SQL Logger's INT4 column overflows on a
+        # large value and silently stops that device's history.
+        bounds=StaticRange(0, 86400),
         device_types=frozenset({"matterLock"}),
         unit=" seconds",
     ),

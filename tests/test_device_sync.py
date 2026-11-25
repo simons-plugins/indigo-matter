@@ -5982,3 +5982,215 @@ def test_a_lock_whose_attribute_list_arrives_later_gets_its_state_list_rebuilt(d
     before = dev.state_list_rebuilds
     ds.reconcile_all([LOCK_SETTINGS_NODE])
     assert dev.state_list_rebuilds > before
+
+
+# ---------------------------------------------------------------------------
+# Unread settings must not look like real values (review fix pass, PR #388)
+# ---------------------------------------------------------------------------
+
+def test_a_setting_is_primed_once_its_reading_is_written(ds, indigo_env):
+    ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
+    dev_id = ds.lookup(0x39, 1)
+    assert all(ds.setting_primed(dev_id, key) for key in _LOCK_SETTING_STATES)
+
+
+def test_a_setting_never_read_is_not_primed(ds, indigo_env):
+    import copy
+    node = copy.deepcopy(LOCK_SETTINGS_NODE)
+    del node["attributes"]["1/257/49"]            # the lock never reported this one
+    ds.create_from_raw(node, "Side Gate")
+    dev_id = ds.lookup(0x39, 1)
+    assert ds.setting_primed(dev_id, "autoRelockTime") is True
+    assert ds.setting_primed(dev_id, "userCodeTemporaryDisableTime") is False
+
+
+def test_a_reading_dropped_because_its_state_does_not_exist_yet_is_not_primed_and_is_logged(
+        ds, indigo_env, mock_logger):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
+    dev_id = ds.lookup(0x39, 1)
+    dev = devices[dev_id]
+    for key in _LOCK_SETTING_STATES:
+        del dev.states[key]
+    ds._settings_primed.clear()                    # a fresh run
+    mock_logger.debug.reset_mock()
+    ds.reconcile_all([LOCK_SETTINGS_NODE])
+    assert not any(ds.setting_primed(dev_id, key) for key in _LOCK_SETTING_STATES)
+    assert any("autoRelockTime" in str(call) for call in mock_logger.debug.call_args_list)
+
+
+def test_priming_before_the_states_exist_is_repaired_by_a_re_prime_after_the_refresh(
+        ds, indigo_env):
+    """The ordering hole: reconcile primed the lock BEFORE deviceStartComm added
+    the new states, the handler's guard returned {} silently, and nothing re-primed."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
+    dev = devices[ds.lookup(0x39, 1)]
+    for key in _LOCK_SETTING_STATES:
+        del dev.states[key]
+    ds._settings_primed.clear()
+    ds.reconcile_all([LOCK_SETTINGS_NODE])                    # states do not exist: nothing lands
+    assert "autoRelockTime" not in dev.states
+    for key in _LOCK_SETTING_STATES:                         # deviceStartComm's refresh adds them at 0
+        dev.states[key] = 0
+    ds.reprime_settings(dev)
+    assert (dev.states["autoRelockTime"], dev.states["wrongCodeEntryLimit"],
+            dev.states["userCodeTemporaryDisableTime"]) == (30, 5, 60)
+    assert all(ds.setting_primed(dev.id, key) for key in _LOCK_SETTING_STATES)
+
+
+def test_re_priming_with_nothing_cached_is_a_no_op(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
+    dev = devices[ds.lookup(0x39, 1)]
+    ds._setting_readings.clear()
+    ds.reprime_settings(dev)          # must not raise
+
+
+def test_a_device_reported_value_too_big_for_an_indigo_integer_is_not_written_and_logged_once(
+        ds, indigo_env, mock_logger):
+    """Indigo Integer states feed SQL Logger's INT4 column; an overflow silently
+    stops that device's history. uint32 0xFFFFFFFF is legal for AutoRelockTime."""
+    import copy
+    _indigo, devices = indigo_env
+    node = copy.deepcopy(LOCK_SETTINGS_NODE)
+    node["attributes"]["1/257/35"] = 0xFFFFFFFF
+    ds.create_from_raw(node, "Side Gate")
+    ds.reconcile_all([node])
+    dev = devices[ds.lookup(0x39, 1)]
+    assert dev.states["autoRelockTime"] == 0                # untouched
+    assert ds.setting_primed(dev.id, "autoRelockTime") is False
+    big = [c for c in mock_logger.info.call_args_list if "autoRelockTime" in str(c)]
+    assert len(big) == 1
+
+
+def test_unread_setting_states_are_flagged_unknown_and_a_reading_clears_it(ds, indigo_env):
+    import copy
+    _indigo, devices = indigo_env
+    node = copy.deepcopy(LOCK_SETTINGS_NODE)
+    del node["attributes"]["1/257/49"]
+    ds.create_from_raw(node, "Side Gate")
+    dev = devices[ds.lookup(0x39, 1)]
+    ds.flag_unread_settings(dev)
+    assert dev.states["userCodeTemporaryDisableTime.ui"] == "unknown"
+    assert "autoRelockTime.ui" not in dev.states            # a read one is left alone
+    ds.apply_states(dev.id, [{"key": "userCodeTemporaryDisableTime", "value": 60}])
+    assert ds.setting_primed(dev.id, "userCodeTemporaryDisableTime")
+
+
+def test_marking_a_setting_unread_drops_it_back_to_unprimed_and_unknown(ds, indigo_env):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
+    dev = devices[ds.lookup(0x39, 1)]
+    ds.mark_setting_unread(dev.id, "autoRelockTime")
+    assert ds.setting_primed(dev.id, "autoRelockTime") is False
+    assert dev.states["autoRelockTime.ui"] == "unknown"
+    assert dev.states["autoRelockTime"] == 30               # value untouched; only its credibility
+
+
+def test_a_decommissioned_nodes_readings_are_forgotten(ds, indigo_env):
+    ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
+    assert 0x39 in ds._setting_readings
+    ds._forget_node_capabilities(0x39)
+    assert 0x39 not in ds._setting_readings
+
+
+@pytest.fixture
+def plugin_cls(indigo_env):
+    import plugin as plugin_module
+    importlib.reload(plugin_module)
+    return plugin_module.Plugin
+
+
+def _start_comm_stub(plugin_cls, ds, mock_logger):
+    return SimpleNamespace(logger=mock_logger, device_sync=ds)
+
+
+def test_a_lock_primed_before_its_states_exist_holds_the_devices_values_after_device_start_comm(
+        plugin_cls, ds, indigo_env, mock_logger):
+    """Drives the REAL deviceStartComm: the refresh adds the new states (Indigo
+    initialises them to 0), then the cached readings are re-primed into them."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
+    dev = devices[ds.lookup(0x39, 1)]
+    dev.pluginProps["createdTypeId"] = "matterLock"
+    for key in _LOCK_SETTING_STATES:                  # a lock fielded before this release
+        del dev.states[key]
+    ds._settings_primed.clear()
+    ds.reconcile_all([LOCK_SETTINGS_NODE])            # primed too early: nothing lands
+    assert "autoRelockTime" not in dev.states
+
+    def rebuild():                                    # what Indigo's refresh does
+        dev.state_list_rebuilds += 1
+        for key in _LOCK_SETTING_STATES:
+            dev.states.setdefault(key, 0)
+
+    dev.stateListOrDisplayStateIdChanged = rebuild
+    before = dev.state_list_rebuilds
+    plugin_cls.deviceStartComm(_start_comm_stub(plugin_cls, ds, mock_logger), dev)
+    assert dev.state_list_rebuilds == before + 1
+    assert (dev.states["autoRelockTime"], dev.states["wrongCodeEntryLimit"],
+            dev.states["userCodeTemporaryDisableTime"]) == (30, 5, 60)
+    assert all(ds.setting_primed(dev.id, key) for key in _LOCK_SETTING_STATES)
+
+
+def test_device_start_comm_flags_a_never_read_setting_unknown(plugin_cls, ds, indigo_env, mock_logger):
+    _indigo, devices = indigo_env
+    node = copy.deepcopy(LOCK_SETTINGS_NODE)
+    del node["attributes"]["1/257/49"]
+    ds.create_from_raw(node, "Side Gate")
+    dev = devices[ds.lookup(0x39, 1)]
+    dev.pluginProps["createdTypeId"] = "matterLock"
+    plugin_cls.deviceStartComm(_start_comm_stub(plugin_cls, ds, mock_logger), dev)
+    assert dev.states["userCodeTemporaryDisableTime.ui"] == "unknown"
+    assert dev.states["autoRelockTime"] == 30
+
+
+def test_after_a_write_whose_read_back_got_no_answer_the_next_open_is_blank(
+        plugin_cls, ds, indigo_env, mock_logger):
+    import asyncio
+    import device_settings
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
+    dev = devices[ds.lookup(0x39, 1)]
+    dev.setErrorStateOnServer = Mock()
+    dev.pluginProps.update({"nodeId": "57", "endpointId": "1"})
+    props = dict(dev.pluginProps)
+
+    class _Matter:
+        async def write(self, write, timeout=None):
+            return None
+
+        async def read(self, *args, **kwargs):
+            raise TimeoutError("no answer")
+
+    stub = SimpleNamespace(logger=mock_logger, device_sync=ds, matter=_Matter())
+    stub._setting_limits_lookup = lambda p: plugin_cls._setting_limits_lookup(stub, p)
+    stub._setting_attribute_list_lookup = lambda p: plugin_cls._setting_attribute_list_lookup(stub, p)
+    stub._setting_primed_lookup = lambda d: plugin_cls._setting_primed_lookup(stub, d)
+    stub._device_states = lambda d: plugin_cls._device_states(stub, d)
+    stub._has_matter_node = plugin_cls._has_matter_node
+    stub._log_setting_skips = lambda d: plugin_cls._log_setting_skips(stub, d)
+
+    def seeded():
+        values, _ = plugin_cls.getDeviceConfigUiValues(stub, dict(props), "matterLock", dev.id)
+        return values["autoRelockTime"]
+
+    assert seeded() == "30"                                   # read, shown
+    plan = device_settings.PlannedWrite(
+        next(s for s in __import__("matter_handlers.settings", fromlist=["x"]).settings_for_type(
+            "matterLock") if s.key == "autoRelockTime"), 45, 30)
+    original_apply = device_settings.apply_setting
+
+    async def quick(*args, **kwargs):
+        async def no_sleep(_d):
+            return None
+        return await original_apply(*args, sleep=no_sleep, **kwargs)
+
+    device_settings.apply_setting = quick
+    try:
+        asyncio.run(plugin_cls._apply_setting(stub, 57, 1, dev.id, plan))
+    finally:
+        device_settings.apply_setting = original_apply
+    assert seeded() == ""                                     # no longer vouched for
+    dev.setErrorStateOnServer.assert_called_once_with("setting failed")

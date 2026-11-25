@@ -47,7 +47,7 @@ __all__ = [
     "OfferedSetting", "PlannedWrite", "MARKER_YES", "MARKER_NO",
     "offered_settings", "unimplemented_states", "config_ui_values",
     "validate_settings", "planned_writes", "apply_setting",
-    "RemovedStateLog",
+    "RemovedStateLog", "PrimedLookup",
 ]
 
 #: Marker values for the ``hasX`` hidden ConfigUI fields that drive
@@ -60,6 +60,24 @@ MARKER_NO = "no"
 #: A limits lookup: ``(cluster, attribute) -> raw value or None``. Injected so
 #: this module never has to know about device_sync or a node id.
 LimitsLookup = Callable[[int, int], Any]
+
+#: Has this device's reading of the setting ``key`` landed this run? A new Integer
+#: state is initialised by Indigo to 0 (ADR-0003, #190), so until a reading has been
+#: written the state's "0" is Indigo's default and NOT what the device holds. ``None``
+#: (a caller that cannot say) means "treat everything as read" - the old behaviour.
+PrimedLookup = Callable[[str], bool]
+
+
+def _is_primed(primed: Optional[PrimedLookup], setting: DeviceSetting) -> bool:
+    return True if primed is None else bool(primed(setting.key))
+
+
+def _editable_unprimed(setting: DeviceSetting, primed: Optional[PrimedLookup]) -> bool:
+    """May this setting be edited? A NUMERIC one always may (blank = leave alone, any
+    typed value is written and verified); a PICKER cannot be blank, so an unread one
+    is neither shown nor written - Indigo would select its first row and a Save would
+    write that."""
+    return not setting.is_choice or _is_primed(primed, setting)
 
 
 @dataclass(frozen=True)
@@ -184,7 +202,8 @@ def config_ui_values(device_type_id: str, states: dict, limits: LimitsLookup,
                      values: Optional[dict] = None,
                      attribute_list: Optional[Callable] = None,
                      device_known: bool = True,
-                     on_skip: Optional[Callable] = None) -> dict:
+                     on_skip: Optional[Callable] = None,
+                     primed: Optional[PrimedLookup] = None) -> dict:
     """Seed values for the dialog: markers, current values, range hints.
 
     Returns only the keys this module owns, for the caller to merge over the
@@ -195,19 +214,23 @@ def config_ui_values(device_type_id: str, states: dict, limits: LimitsLookup,
     out = dict(values or {})
     offered = offered_settings(device_type_id, limits, attribute_list,
                                device_known, on_skip)
-    by_key = {o.setting.key: o for o in offered}
+    # An unread picker is withheld entirely (see _editable_unprimed).
+    shown = [o for o in offered if _editable_unprimed(o.setting, primed)]
+    by_key = {o.setting.key: o for o in shown}
 
     for setting in settings_for_type(device_type_id):
         out[_marker_field(setting)] = MARKER_YES if setting.key in by_key else MARKER_NO
-    out["hasAnySetting"] = MARKER_YES if offered else MARKER_NO
+    out["hasAnySetting"] = MARKER_YES if shown else MARKER_NO
 
-    for offer in offered:
+    for offer in shown:
         setting = offer.setting
         current = states.get(setting.key)
         # A menu's value must be a string to match its option ids; a text field
         # is a string either way. An unknown current value leaves the field
-        # blank rather than inventing a plausible one.
-        out[setting.key] = _seed_value(current)
+        # blank rather than inventing a plausible one - and so does a setting
+        # whose device reading has not landed yet: the state then holds Indigo's
+        # default (0), which looks exactly like a real value.
+        out[setting.key] = _seed_value(current) if _is_primed(primed, setting) else ""
         if not setting.is_choice:
             out[f"{setting.key}Range"] = setting.describe_range(offer.bounds)
     return out
@@ -263,18 +286,27 @@ def _is_editing(setting, values: dict) -> bool:
 
 def validate_settings(device_type_id: str, values: dict, limits: LimitsLookup,
                       attribute_list: Optional[Callable] = None,
-                      device_known: bool = True) -> dict:
+                      device_known: bool = True, *,
+                      states: Optional[dict] = None,
+                      primed: Optional[PrimedLookup] = None) -> dict:
     """Bounds-check every offered setting. Returns ``{field_id: message}``.
 
     Synchronous and cheap by design: it runs when the user clicks Save, on the
     Indigo UI thread, and touches nothing but the cached bounds. The actual
     write — which can take seconds against a sleepy device — is deliberately not
     done here; see :func:`apply_setting`.
+
+    A field equal to the value the dialog was seeded with (the device's own, read
+    value) is "leave alone", not an edit, and is never rejected: a lock holding a
+    value outside our range must not block a Save that changes something else.
     """
     errors: dict = {}
     for offer in offered_settings(device_type_id, limits, attribute_list, device_known):
         setting = offer.setting
-        if not _is_editing(setting, values):
+        if not _is_editing(setting, values) or not _editable_unprimed(setting, primed):
+            continue
+        if (states is not None and _is_primed(primed, setting)
+                and str(values.get(setting.key, "")).strip() == _seed_value(states.get(setting.key))):
             continue
         value, reason = coerce_value(setting, values.get(setting.key), offer.bounds)
         if value is None:
@@ -285,7 +317,8 @@ def validate_settings(device_type_id: str, values: dict, limits: LimitsLookup,
 def planned_writes(device_type_id: str, values: dict, states: dict,
                    limits: LimitsLookup,
                    attribute_list: Optional[Callable] = None,
-                   device_known: bool = True) -> list[PlannedWrite]:
+                   device_known: bool = True,
+                   primed: Optional[PrimedLookup] = None) -> list[PlannedWrite]:
     """The settings whose value the user actually CHANGED.
 
     Only changed settings are written. Re-sending an unchanged value on every
@@ -296,12 +329,14 @@ def planned_writes(device_type_id: str, values: dict, states: dict,
     planned: list[PlannedWrite] = []
     for offer in offered_settings(device_type_id, limits, attribute_list, device_known):
         setting = offer.setting
-        if not _is_editing(setting, values):
+        if not _is_editing(setting, values) or not _editable_unprimed(setting, primed):
             continue
         value, _reason = coerce_value(setting, values.get(setting.key), offer.bounds)
         if value is None:
             continue  # validate_settings already refused this; never send it
-        previous = _as_int(states.get(setting.key))
+        # An unread setting's state is Indigo's default, so "previous" is UNKNOWN:
+        # any entered value - 0 included - is written and verified.
+        previous = _as_int(states.get(setting.key)) if _is_primed(primed, setting) else None
         if previous is not None and previous == value:
             continue
         planned.append(PlannedWrite(setting, value, previous))

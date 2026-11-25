@@ -477,6 +477,20 @@ class DeviceSync:
         # their bounds from the spec rather than from a device attribute, so
         # "are the limits readable?" cannot stand in for "does it have this?".
         self._attribute_lists: dict[tuple[int, int, int], Any] = {}
+        # Which (Indigo device id, setting key) pairs have had a REAL device reading
+        # written this run. Indigo initialises a new Integer state to 0, so before
+        # a reading lands a setting's state holds a default that looks like a value
+        # (ADR-0003, #190) - the Edit Device dialog must not show or trust it.
+        # In memory on purpose: it asks "has this run heard from the device?".
+        self._settings_primed: set[tuple[int, str]] = set()
+        # The last reported value of every SETTING attribute, per node, so a device
+        # whose state list was rebuilt AFTER the reconcile that read it (the
+        # deviceStartComm ordering hole) can be re-primed without a round trip. Same
+        # lifecycle as _setting_limits: rebuilt per informative pass, dropped on
+        # decommission.
+        self._setting_readings: dict[int, dict[tuple[int, int, int], Any]] = {}
+        # (device id, setting key) pairs already told about an unstorable value.
+        self._unstorable_logged: set[tuple[int, str]] = set()
         # Every node id matter-server has told us about this session, whether or
         # not it produced any Indigo device. `_index` cannot serve this purpose:
         # it is keyed by endpoints that HAVE an Indigo device (however the entry
@@ -3001,6 +3015,7 @@ class DeviceSync:
                 self.logger.warning("prime %s attr %s/%s failed: %s", dev_id, cluster, attribute, exc)
         if kv:
             self.apply_states(dev_id, kv)
+        self._log_unwritable_setting_readings(node, dev, endpoint_id)
 
     # ------------------------------------------------------------------
     # Writable-setting limits cache (issues #85, #186)
@@ -3048,10 +3063,14 @@ class DeviceSync:
             if attribute is not None:
                 wanted.add((setting.cluster, int(attribute)))
         clusters = {s.cluster for s in SETTINGS}
+        setting_pairs = {(s.cluster, s.attribute) for s in SETTINGS}
         node_id = int(node.node_id)
         limits: dict[tuple[int, int, int, int], Any] = {}
         attribute_lists: dict[tuple[int, int, int], Any] = {}
+        readings: dict[tuple[int, int, int], Any] = {}
         for (ep, cluster, attribute), value in node.attributes.items():
+            if (cluster, attribute) in setting_pairs:
+                readings[(int(ep), int(cluster), int(attribute))] = value
             if (cluster, attribute) in wanted:
                 limits[(node_id, int(ep), int(cluster), int(attribute))] = value
             elif attribute == ATTR_ATTRIBUTE_LIST and cluster in clusters:
@@ -3068,6 +3087,7 @@ class DeviceSync:
             self._attribute_lists = {
                 **{k: v for k, v in self._attribute_lists.items() if k[0] != node_id},
                 **attribute_lists}
+            self._setting_readings = {**self._setting_readings, node_id: readings}
         # Compared by CONTENT, not by wire order: matter-server gives no ordering
         # guarantee for an AttributeList, and a device re-reporting the same ids
         # in a different order is not a capability change. Treating it as one
@@ -3227,6 +3247,8 @@ class DeviceSync:
                                     if k[0] != target}
             self._attribute_lists = {k: v for k, v in self._attribute_lists.items()
                                      if k[0] != target}
+            self._setting_readings = {k: v for k, v in self._setting_readings.items()
+                                      if k != target}
             self._forward_links = {k: v for k, v in self._forward_links.items()
                                    if k[0] != target}
             self._reverse_links = {k: v for k, v in self._reverse_links.items()
@@ -4199,10 +4221,123 @@ class DeviceSync:
                 dev_id, len(kvlist),
             )
             return
+        kvlist = self._drop_unstorable_settings(dev, kvlist)
+        if not kvlist:
+            return
         dev.updateStatesOnServer(kvlist)
+        self._note_settings_primed(dev, kvlist)
         # a fresh value means the device is reachable — clear any stale error
         if getattr(dev, "errorState", ""):
             dev.setErrorStateOnServer("")
+
+    # ------------------------------------------------------------------
+    # Has a setting's state been READ? (review fix pass, PR #388)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _setting_keys(dev: Any) -> set:
+        return {s.key for s in settings_for_type(getattr(dev, "deviceTypeId", "") or "")}
+
+    def _drop_unstorable_settings(self, dev: Any, kvlist: list) -> list:
+        """Remove a setting reading an Indigo Integer state cannot hold.
+
+        Indigo Integer states land in SQL Logger's INT4 column; one value past
+        2**31-1 overflows it and silently stops that device's history. The device may
+        legitimately report one (AutoRelockTime is a uint32), so it is skipped - never
+        clamped, since a clamped number is a value the device does not hold - and said
+        once at INFO per device and setting.
+        """
+        keys = self._setting_keys(dev)
+        if not keys:
+            return kvlist
+        kept = []
+        for kv in kvlist:
+            value = kv.get("value")
+            if (kv.get("key") in keys and isinstance(value, int) and not isinstance(value, bool)
+                    and not -0x80000000 <= value <= 0x7FFFFFFF):
+                marker = (int(dev.id), kv["key"])
+                with self._lock:
+                    first = marker not in self._unstorable_logged
+                    self._unstorable_logged.add(marker)
+                if first:
+                    self.logger.info(
+                        'device "%s": the device reports %s = %s, which is too large to hold in '
+                        "an Indigo state, so the state is left unset", dev.name, kv["key"], value)
+                continue
+            kept.append(kv)
+        return kept
+
+    def _note_settings_primed(self, dev: Any, kvlist: list) -> None:
+        keys = self._setting_keys(dev)
+        written = {(int(dev.id), kv["key"]) for kv in kvlist if kv.get("key") in keys}
+        if written:
+            with self._lock:
+                self._settings_primed |= written
+
+    def setting_primed(self, dev_id: Any, key: str) -> bool:
+        """Has a real device reading of this setting been written this run?"""
+        with self._lock:
+            return (int(dev_id), key) in self._settings_primed
+
+    def mark_setting_unread(self, dev_id: Any, key: str) -> None:
+        """Make a setting not-primed again and flag its display as unknown.
+
+        For a write whose read-back got no answer: the state still holds the old
+        value, which must not read as confirmed.
+        """
+        with self._lock:
+            self._settings_primed.discard((int(dev_id), key))
+        try:
+            dev = indigo.devices[int(dev_id)]
+        except KeyError:
+            return
+        self._flag_unknown(dev, [key])
+
+    def flag_unread_settings(self, dev: Any) -> None:
+        """Give every not-yet-read setting state of *dev* ``uiValue="unknown"``.
+
+        The ADR-0007 convention (display only; triggers still see the number). Applies
+        only to states the device actually has.
+        """
+        wanted = [key for key in sorted(self._setting_keys(dev))
+                  if key in getattr(dev, "states", {}) and not self.setting_primed(dev.id, key)]
+        self._flag_unknown(dev, wanted)
+
+    def _flag_unknown(self, dev: Any, keys: list) -> None:
+        current = getattr(dev, "states", {})
+        kv = [{"key": key, "value": current.get(key, 0), "uiValue": "unknown"}
+              for key in keys if key in current]
+        if kv:
+            dev.updateStatesOnServer(kv)
+
+    def reprime_settings(self, dev: Any) -> None:
+        """Write this device's cached setting readings into its states again.
+
+        For the ordering hole: a reconcile can prime a device BEFORE ``deviceStartComm``
+        has added the states a release introduced, and the handler's "state exists?"
+        guard then drops the reading with nothing to bring it back. Reuses
+        :meth:`_prime_states` over a node carrying only the cached setting readings.
+        """
+        props = dev.pluginProps
+        if not (self._prop_present(props.get("nodeId")) and self._prop_present(props.get("endpointId"))):
+            return
+        node_id, endpoint_id = int(props["nodeId"]), int(props["endpointId"])
+        with self._lock:
+            readings = dict(self._setting_readings.get(node_id, {}))
+        own = {k: v for k, v in readings.items() if k[0] == endpoint_id}
+        if not own:
+            return
+        self._prime_states(NodeInfo(node_id=node_id, attributes=own), dev.id, endpoint_id,
+                           getattr(dev, "deviceTypeId", "") or "")
+
+    def _log_unwritable_setting_readings(self, node: NodeInfo, dev: Any, endpoint_id: int) -> None:
+        """Debug-log a setting reading that could not land because its state is not
+        on the device yet (so a missing value is explainable, not just absent)."""
+        for setting in settings_for_type(getattr(dev, "deviceTypeId", "") or ""):
+            reading = node.attributes.get((endpoint_id, setting.cluster, setting.attribute))
+            if reading is not None and setting.key not in getattr(dev, "states", {}):
+                self.logger.debug(
+                    "device %s: not priming %s - the device has no such state yet "
+                    "(its state list has not been rebuilt)", dev.id, setting.key)
 
     # ------------------------------------------------------------------
     # Indigo action → Matter command (B1 path)

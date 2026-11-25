@@ -318,6 +318,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             self.matter, self.device_sync.create_from_raw, self.logger,
             schedule=self.runtime.submit,
             knows_node=self.device_sync.knows_node,
+            managed=lambda: self.server_process is not None,
         )
         self.http = HttpApi(
             self.jobs, self.logger,
@@ -1220,7 +1221,9 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         setting_errors = device_settings.validate_settings(
             typeId, valuesDict, self._setting_limits_lookup(valuesDict),
             self._setting_attribute_list_lookup(valuesDict),
-            self._has_matter_node(valuesDict))
+            self._has_matter_node(valuesDict),
+            states=self._device_states(devId),
+            primed=self._setting_primed_lookup(devId))
         if setting_errors:
             errors = indigo.Dict()
             for field, message in setting_errors.items():
@@ -1231,6 +1234,22 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
     # ------------------------------------------------------------------
     # Writable device settings — the Edit Device dialog (issue #186)
     # ------------------------------------------------------------------
+
+    def _setting_primed_lookup(self, dev_id):
+        """``key -> has this device's reading of that setting landed this run?``
+
+        Fails SAFE: if the answer cannot be had, a setting reads as not-yet-read
+        (blank field, nothing assumed), never as a trusted value.
+        """
+        def primed(key) -> bool:
+            try:
+                return bool(self.device_sync.setting_primed(dev_id, key))
+            except Exception as exc:  # pylint: disable=broad-except
+                # not-read is the safe answer: a blank field, not a wrong number
+                self.logger.debug("could not tell whether %s of device %s was read: %s",
+                                  key, dev_id, exc)
+                return False
+        return primed
 
     @staticmethod
     def _has_matter_node(props) -> bool:
@@ -1490,7 +1509,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 typeId, states, self._setting_limits_lookup(values),
                 attribute_list=self._setting_attribute_list_lookup(values),
                 device_known=self._has_matter_node(values),
-                on_skip=self._log_setting_skips(devId)))
+                on_skip=self._log_setting_skips(devId),
+                primed=self._setting_primed_lookup(devId)))
             if typeId == "matterNode":
                 # Display-only summary of settings_report's SurveyLog for THIS
                 # node (issue #204): the store stays in pluginPrefs (see
@@ -1591,7 +1611,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 typeId, valuesDict, self._device_states(devId),
                 self._setting_limits_lookup(valuesDict),
                 self._setting_attribute_list_lookup(valuesDict),
-                self._has_matter_node(valuesDict))
+                self._has_matter_node(valuesDict),
+                primed=self._setting_primed_lookup(devId))
         except Exception as exc:  # pylint: disable=broad-except
             # Absorbing: anything planned_writes() raises while working out what the
             # dialog changed. Safe because it aborts having submitted NOTHING, which is
@@ -1685,6 +1706,10 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             if actual is not None:
                 self.device_sync.apply_states(
                     dev_id, [{"key": plan.setting.key, "value": actual}])
+            elif not observed:
+                # The read-back got NO answer, so the state still holds the old
+                # value and nothing confirms it: not-read again (blank next open).
+                self.device_sync.mark_setting_unread(dev_id, plan.setting.key)
         except KeyError:
             # The device was deleted between the dialog closing and this
             # running on the loop — routine, and there is nothing left to
@@ -1731,6 +1756,18 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             )
         self.device_sync.note_device(dev)
         self.device_sync.set_active(dev.id, True)
+        # The state list was refreshed above, so any setting state a release
+        # introduced exists now - but a reconcile may already have tried to prime it
+        # and been dropped by the handler's "state exists?" guard. Re-prime from the
+        # cached readings, then show "unknown" for whatever is still unread (Indigo's
+        # bare 0 would look like a value; ADR-0007's uiValue convention). A cosmetic,
+        # self-healing step: it must never stop a device starting.
+        try:
+            self.device_sync.reprime_settings(dev)
+            self.device_sync.flag_unread_settings(dev)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning(
+                "could not settle the setting states of device %s (%s)", dev.id, exc)
         if dev.deviceTypeId == "matterRelay":
             self._prime_retired_on_time_state(dev)
         if dev.deviceTypeId == "matterNode":

@@ -64,7 +64,9 @@ def test_a_lock_with_all_three_is_offered_all_three_with_their_ranges():
     offered = offered_settings(LOCK, _no_limits, _lists(FULL_LIST))
     assert sorted(o.setting.key for o in offered) == sorted(KEYS)
     bounds = {o.setting.key: o.bounds for o in offered}
-    assert bounds["autoRelockTime"] == Bounds(0, 4294967295)       # uint32, no constraint
+    # uint32 with no spec constraint; the 86400 cap is OURS (one day) so the value
+    # always fits an Indigo Integer state (INT4 in SQL Logger).
+    assert bounds["autoRelockTime"] == Bounds(0, 86400)
     assert bounds["wrongCodeEntryLimit"] == Bounds(1, 255)         # "1 to 255"
     assert bounds["userCodeTemporaryDisableTime"] == Bounds(1, 255)
 
@@ -154,7 +156,8 @@ def test_the_section_hides_when_the_lock_has_none():
     ("userCodeTemporaryDisableTime", "0"),
     ("userCodeTemporaryDisableTime", "256"),
     ("autoRelockTime", "-1"),
-    ("autoRelockTime", "4294967296"),                  # one past uint32
+    ("autoRelockTime", "86401"),                       # one past our one-day cap
+    ("autoRelockTime", "4294967295"),                  # legal uint32, not storable in an Indigo state
     ("autoRelockTime", "abc"),
     ("wrongCodeEntryLimit", "3.5"),
 ])
@@ -164,7 +167,7 @@ def test_out_of_range_and_non_numeric_input_is_a_field_error(key, bad):
 
 
 @pytest.mark.parametrize("key,good", [
-    ("autoRelockTime", "0"), ("autoRelockTime", "4294967295"),
+    ("autoRelockTime", "0"), ("autoRelockTime", "86400"),
     ("wrongCodeEntryLimit", "1"), ("wrongCodeEntryLimit", "255"),
     ("userCodeTemporaryDisableTime", "1"), ("userCodeTemporaryDisableTime", "255"),
 ])
@@ -283,3 +286,117 @@ def test_the_handler_subscribes_to_the_setting_attributes():
     wanted = DoorLockHandler().attributes_to_subscribe()
     assert {0x0000, 0x0023, 0x0030, 0x0031} <= set(wanted)
     assert 0x0033 not in wanted and 0x0025 not in wanted
+
+
+# ===========================================================================
+# Unread settings must not look like real values (review fix pass, PR #388)
+#
+# Indigo initialises a new Integer state to 0 (ADR-0003, #190), and the dialog
+# seeds from state. Before a lock's values have been READ, "0" is Indigo's default,
+# not the lock's value. `primed(key)` is the injected "has this device's reading
+# of this setting landed this run?".
+# ===========================================================================
+
+def _primed(*keys):
+    return lambda key: key in keys
+
+
+ALL_KEYS = tuple(KEYS)
+UNPRIMED = _primed()
+#: Indigo's bare default for all three, i.e. what an unread lock's states hold.
+DEFAULTS = {k: 0 for k in KEYS}
+
+
+def _seed(states, primed):
+    return config_ui_values(LOCK, states, _no_limits, attribute_list=_lists(FULL_LIST), primed=primed)
+
+
+def test_an_unprimed_lock_shows_all_three_fields_blank():
+    values = _seed(DEFAULTS, UNPRIMED)
+    assert [values[k] for k in KEYS] == ["", "", ""]
+    assert all(values["has" + k[0].upper() + k[1:]] == "yes" for k in KEYS)   # still offered
+
+
+def test_an_untouched_save_of_an_unprimed_lock_validates_and_plans_nothing():
+    values = _seed(DEFAULTS, UNPRIMED)
+    assert validate_settings(LOCK, values, _no_limits, _lists(FULL_LIST),
+                             states=DEFAULTS, primed=UNPRIMED) == {}
+    assert planned_writes(LOCK, values, DEFAULTS, _no_limits, _lists(FULL_LIST),
+                          primed=UNPRIMED) == []
+
+
+def test_entering_zero_for_auto_relock_on_an_unprimed_lock_is_written_and_verified_on_the_wire():
+    """0 == the unread default 0, so the old `previous == value` shortcut skipped
+    it silently: the user asked to turn auto-relock off and nothing happened."""
+    values = {"autoRelockTime": "0"}
+    plans = planned_writes(LOCK, values, DEFAULTS, _no_limits, _lists(FULL_LIST), primed=UNPRIMED)
+    assert [(p.setting.key, p.value, p.previous) for p in plans] == [("autoRelockTime", 0, None)]
+    client = _Client(reads=0)
+    ok, _message = asyncio.run(apply_setting(client, 77, 1, plans[0], sleep=_no_sleep))
+    assert ok is True
+    write = client.writes[0]
+    assert (write.endpoint, write.cluster, write.attribute, write.value) == (1, 0x0101, 0x0023, 0)
+
+
+def test_a_primed_zero_is_shown_as_zero_and_not_rewritten():
+    primed = _primed("autoRelockTime")
+    values = _seed({"autoRelockTime": 0}, primed)
+    assert values["autoRelockTime"] == "0"
+    assert planned_writes(LOCK, values, {"autoRelockTime": 0}, _no_limits, _lists(FULL_LIST),
+                          primed=primed) == []
+
+
+def test_a_primed_lock_holding_zero_attempts_saves_untouched_and_only_the_change_is_written():
+    """The spec says writing 0 to WrongCodeEntryLimit is a CONSTRAINT_ERROR, but a
+    lock may HOLD one: a value we did not change must never block the dialog."""
+    states = {"autoRelockTime": 60, "wrongCodeEntryLimit": 0, "userCodeTemporaryDisableTime": 60}
+    primed = _primed(*ALL_KEYS)
+    values = _seed(states, primed)
+    assert values["wrongCodeEntryLimit"] == "0"
+    assert validate_settings(LOCK, values, _no_limits, _lists(FULL_LIST),
+                             states=states, primed=primed) == {}
+    values["autoRelockTime"] = "90"
+    assert validate_settings(LOCK, values, _no_limits, _lists(FULL_LIST),
+                             states=states, primed=primed) == {}
+    plans = planned_writes(LOCK, values, states, _no_limits, _lists(FULL_LIST), primed=primed)
+    assert [(p.setting.key, p.value) for p in plans] == [("autoRelockTime", 90)]
+
+
+def test_a_lock_holding_more_than_our_one_day_cap_does_not_block_the_dialog():
+    states = {"autoRelockTime": 100000}
+    primed = _primed("autoRelockTime")
+    values = _seed(states, primed)
+    assert values["autoRelockTime"] == "100000"
+    assert validate_settings(LOCK, values, _no_limits, _lists(FULL_LIST),
+                             states=states, primed=primed) == {}
+    # ...but TYPING an out-of-range value is still refused.
+    errors = validate_settings(LOCK, {"autoRelockTime": "100001"}, _no_limits, _lists(FULL_LIST),
+                               states=states, primed=primed)
+    assert "autoRelockTime" in errors
+    assert "0 and 86400" in errors["autoRelockTime"]
+
+
+def test_the_auto_relock_range_hint_states_the_cap_and_unit():
+    values = _seed(DEFAULTS, UNPRIMED)
+    assert values["autoRelockTimeRange"] == "0-86400 seconds"
+
+
+def test_a_picker_setting_is_hidden_until_primed_and_never_written_unprimed():
+    """A menu cannot be blank: Indigo would pick its first row and a Save would
+    write it. So an unread picker is not shown, and not planned, until read."""
+    relay_list = lambda cluster: [0, 0x4003, 65531] if cluster == 0x0006 else None   # noqa: E731
+    values = config_ui_values("matterRelay", {"startUpOnOff": 0}, _no_limits,
+                              attribute_list=relay_list, primed=UNPRIMED)
+    assert values["hasStartUpOnOff"] == "no"
+    assert values["hasAnySetting"] == "no"
+    assert planned_writes("matterRelay", {"startUpOnOff": "2"}, {"startUpOnOff": 0}, _no_limits,
+                          relay_list, primed=UNPRIMED) == []
+    shown = config_ui_values("matterRelay", {"startUpOnOff": 1}, _no_limits,
+                             attribute_list=relay_list, primed=_primed("startUpOnOff"))
+    assert shown["hasStartUpOnOff"] == "yes" and shown["startUpOnOff"] == "1"
+
+
+def test_callers_that_pass_no_primed_lookup_keep_the_old_behaviour():
+    values = config_ui_values(LOCK, {"autoRelockTime": 30}, _no_limits,
+                              attribute_list=_lists(FULL_LIST))
+    assert values["autoRelockTime"] == "30"
