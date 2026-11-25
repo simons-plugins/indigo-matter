@@ -3,6 +3,21 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.35.2 — Toggle follows what Indigo shows, not what the bulb believes
+
+- Fix (issue #367): Indigo's Toggle on a light (relay, dimmer or colour dimmer)
+  was sent to the device as Matter's own `Toggle`, which flips the device's idea
+  of its state. When that differs from what Indigo shows (IKEA KAJPLATS bulbs keep
+  reporting "on" while dark after a power cut) you got the opposite of what the
+  screen promised. Toggle now sends `Off` if Indigo shows the light on and `On` if
+  it shows it off, the same way the plugin's locks, valves and thermostats already
+  behave. It falls back to Matter `Toggle` only when Indigo has no usable on/off
+  state for the device. Dimmers are judged by their on/off state, not brightness.
+- User-visible consequence: if Indigo shows a light as off while it is actually
+  lit, Toggle sends `On` and nothing visible happens; a second Toggle then turns
+  it off. Two Toggles pressed before the device has reported back both read the
+  same shown state, so both send the same command.
+
 ## 2026.34.1 — Stopping the bridge node on purpose is no longer reported as a failure
 
 - Fix (issue #366): an un-export that had completed was repeated on every plugin
