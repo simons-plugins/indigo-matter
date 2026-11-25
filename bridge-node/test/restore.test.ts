@@ -29,7 +29,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, describe, it, mock } from "node:test";
 
-import { type Endpoint, Environment, Logger, Seconds, ServerNode } from "@matter/main";
+import { type Endpoint, Environment, Logger, Seconds, ServerNode, Time } from "@matter/main";
+import { AdministratorCommissioning } from "@matter/main/clusters/administrator-commissioning";
 import { DeviceCommissioner } from "@matter/main/protocol";
 import { OnOffServer } from "@matter/main/behaviors/on-off";
 
@@ -113,12 +114,12 @@ interface Session {
 }
 
 /** Start a real node + protocol server on `storagePath` and connect to it. */
-async function boot(storagePath: string, options: { commissionedAt?: string; refusal?: string } = {}):
+async function boot(storagePath: string, options: { commissionedAt?: string; refusal?: string; commissionableCheckMs?: number } = {}):
     Promise<Session> {
     const logged: string[] = [];
     const bridge = new BridgeNode(
         // Ephemeral on both ports, so a parallel run cannot collide.
-        { storagePath, matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
+        { storagePath, matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK, commissionableCheckMs: options.commissionableCheckMs },
         options.commissionedAt === undefined
             ? { ...IDENTITY }
             : { ...IDENTITY, commissionedAt: options.commissionedAt },
@@ -1976,6 +1977,148 @@ describe("the commissioning window's timeout agrees with matter.js 0.18's own ti
     });
 });
 
+
+describe("an uncommissioned bridge stays pairable (matter.js 0.18's 48-hour window timer)", () => {
+    const NOT_OPEN = AdministratorCommissioning.CommissioningWindowStatus.WindowNotOpen;
+    type Timer = { name: string; duration: unknown; cb: () => unknown };
+
+    /** Record every "Commissioning timeout" timer matter.js builds, so a test can fire it instead of waiting 48 h. */
+    function captureWindowTimers(): { timers: Timer[]; restore: () => void } {
+        const timers: Timer[] = [];
+        const original = Time.getTimer.bind(Time);
+        (Time as unknown as { getTimer: unknown }).getTimer = (name: string, duration: number, cb: () => unknown) => {
+            if (name === "Commissioning timeout") {
+                timers.push({ name, duration, cb });
+            }
+            return original(name, duration as never, cb as never);
+        };
+        return { timers, restore: () => ((Time as unknown as { getTimer: unknown }).getTimer = original) };
+    }
+
+    const statusOf = (session: Session): unknown => session.bridge.server.env.get(DeviceCommissioner).windowStatus;
+    const settle = (ms = 200): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
+    it("matter.js really does close the node's own window at 48 h, and getPairing then says so", async () => {
+        const capture = captureWindowTimers();
+        const session = await boot(storage());
+        try {
+            const before = session.bridge.getPairing();
+            assert.equal(before.windowOpen, true);
+            assert.ok(before.manualPairingCode !== null);
+            const own = capture.timers.at(-1);
+            assert.ok(own !== undefined, "matter.js built the window timer");
+            assert.equal(Number(own.duration), 48 * 3600 * 1000, "an uncommissioned node's window is 48 h (0.17.8 never started it)");
+            await own.cb(); // 48 h pass
+            await settle();
+            assert.equal(statusOf(session), NOT_OPEN, "precondition: matter.js stopped advertising");
+            const gap = session.bridge.getPairing();
+            assert.equal(gap.commissioned, false);
+            assert.equal(gap.windowOpen, false, "getPairing must not claim an advertising window that is closed");
+            assert.equal(gap.manualPairingCode, null);
+        } finally {
+            capture.restore();
+            await session.close();
+        }
+    });
+
+    it("re-enters commissionable mode with the SAME codes, and says so once", async () => {
+        const capture = captureWindowTimers();
+        const session = await boot(storage());
+        try {
+            const before = session.bridge.getPairing();
+            await capture.timers.at(-1)!.cb();
+            await settle();
+            assert.equal(await session.bridge.ensureCommissionable(), true);
+            assert.notEqual(statusOf(session), NOT_OPEN);
+            const after = session.bridge.getPairing();
+            assert.equal(after.windowOpen, true);
+            assert.equal(after.manualPairingCode, before.manualPairingCode);
+            assert.equal(after.qrPairingCode, before.qrPairingCode);
+            assert.equal(session.logged.filter(line => /re-entering commissionable mode/i.test(line)).length, 1);
+            assert.equal(await session.bridge.ensureCommissionable(), false, "already open: nothing to do");
+        } finally {
+            capture.restore();
+            await session.close();
+        }
+    });
+
+    it("the periodic check reopens it with no request at all", async () => {
+        const capture = captureWindowTimers();
+        const session = await boot(storage(), { commissionableCheckMs: 50 });
+        try {
+            await capture.timers.at(-1)!.cb();
+            await waitUntil(() => statusOf(session) !== NOT_OPEN, 5000);
+            assert.equal(session.bridge.getPairing().windowOpen, true);
+        } finally {
+            capture.restore();
+            await session.close();
+        }
+    });
+
+    it("a pairing request on a closed window reopens it rather than claiming it is open", async () => {
+        const capture = captureWindowTimers();
+        const session = await boot(storage());
+        try {
+            const before = session.bridge.getPairing();
+            await capture.timers.at(-1)!.cb();
+            await settle();
+            const report = await session.bridge.getPairingSettled();
+            assert.equal(report.windowOpen, true);
+            assert.equal(report.manualPairingCode, before.manualPairingCode);
+        } finally {
+            capture.restore();
+            await session.close();
+        }
+    });
+
+    it("after a factory reset the new window is covered too", async () => {
+        const capture = captureWindowTimers();
+        const session = await boot(storage());
+        try {
+            await session.bridge.factoryReset(false);
+            await settle(500);
+            const own = capture.timers.at(-1)!;
+            const codes = session.bridge.getPairing();
+            assert.equal(codes.windowOpen, true, "matter.js re-enters commissionable mode after the erase");
+            await own.cb();
+            await settle();
+            assert.equal(session.bridge.getPairing().windowOpen, false);
+            assert.equal(await session.bridge.ensureCommissionable(), true);
+            assert.equal(session.bridge.getPairing().manualPairingCode, codes.manualPairingCode);
+        } finally {
+            capture.restore();
+            await session.close();
+        }
+    });
+
+    it("a COMMISSIONED node is left alone: no window reopens on its own, and getPairing says closed", async () => {
+        const capture = captureWindowTimers();
+        const session = await boot(storage());
+        try {
+            await capture.timers.at(-1)!.cb();
+            await settle();
+            Object.defineProperty(session.bridge.server.lifecycle, "isCommissioned", { get: () => true });
+            assert.equal(await session.bridge.ensureCommissionable(), false);
+            assert.equal(statusOf(session), NOT_OPEN);
+            const report = await session.bridge.getPairingSettled();
+            assert.equal(report.windowOpen, false);
+            assert.equal(statusOf(session), NOT_OPEN, "and asking did not open one");
+        } finally {
+            capture.restore();
+            await session.close();
+        }
+    });
+});
+
+async function waitUntil(check: () => boolean, capMs: number): Promise<void> {
+    const until = Date.now() + capMs;
+    while (!check()) {
+        if (Date.now() > until) {
+            throw new Error("condition not reached");
+        }
+        await new Promise(resolve => setTimeout(resolve, 25));
+    }
+}
 
 describe("device-type validation is pinned", () => {
     it("the node sets endpoint.validation to 'warn' itself, whatever the environment says", async () => {

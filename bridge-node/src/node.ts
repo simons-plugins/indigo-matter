@@ -23,6 +23,7 @@
 import { join } from "node:path";
 
 import {
+    CommissioningServer,
     Endpoint,
     Environment,
     Seconds,
@@ -32,6 +33,7 @@ import {
     version as matterJsVersion,
 } from "@matter/main";
 import { BasicInformationServer } from "@matter/main/behaviors/basic-information";
+import { AdministratorCommissioning } from "@matter/main/clusters/administrator-commissioning";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
 import { Crypto } from "@matter/main";
 import {
@@ -243,6 +245,11 @@ export async function settlePairingRead(
 
 export { matterJsVersion };
 
+/** `AdministratorCommissioning.CommissioningWindowStatus.WindowNotOpen`. */
+const WINDOW_NOT_OPEN = AdministratorCommissioning.CommissioningWindowStatus.WindowNotOpen;
+/** How often an uncommissioned node checks it is still advertising (see {@link BridgeNode.ensureCommissionable}). */
+const COMMISSIONABLE_CHECK_MS = 60_000;
+
 export class BridgeNode implements BridgeFacade {
     #server?: ServerNode;
     #registry?: EndpointRegistry;
@@ -254,6 +261,8 @@ export class BridgeNode implements BridgeFacade {
     /** Last observed fabric count — what turns a change into a §5 transition. */
     #fabricCount = 0;
     readonly #window: CommissioningWindow;
+    #reopening = false;
+    #commissionableCheck?: NodeJS.Timeout;
     readonly #endpointMap: EndpointMapStore;
     /** The identity, rebound by {@link markCommissioned}/{@link clearCommissioned}. */
     #identity: BridgeIdentity;
@@ -512,6 +521,12 @@ export class BridgeNode implements BridgeFacade {
         await this.restoreEndpoints();
 
         await server.start();
+
+        this.#commissionableCheck = setInterval(
+            () => void this.ensureCommissionable(),
+            this.config.commissionableCheckMs ?? COMMISSIONABLE_CHECK_MS,
+        );
+        this.#commissionableCheck.unref?.();
 
         // After `start()`: SessionManager is only in the environment once the
         // node is online, and a detector wired before it would be born broken.
@@ -1661,6 +1676,45 @@ export class BridgeNode implements BridgeFacade {
         return this.getStatus();
     }
 
+    /**
+     * Keep an UNCOMMISSIONED bridge pairable. matter.js 0.18 actually starts the timer on the basic
+     * window a node opens itself (0.17.8 built it and never started it), and for a node with no
+     * fabric that timer is `MAXIMUM_COMMISSIONING_TIMEOUT`, 48 hours: after that it stops advertising
+     * and nothing reopens it, so a bridge left unpaired for two days (or two days after a factory
+     * reset or the last fabric leaving) cannot be found by an ecosystem. `enterCommissionableMode()`
+     * restarts the window; the passcode and discriminator come from persisted commissioning state, so the
+     * QR/manual codes do not change.
+     *
+     * Does nothing for a commissioned node (its window is deliberately closed), while offline (mid
+     * erase), or while a window is open. Returns whether it reopened one. Never throws.
+     */
+    async ensureCommissionable(): Promise<boolean> {
+        const server = this.#server;
+        if (server === undefined || this.#reopening) {
+            return false;
+        }
+        this.#reopening = true;
+        try {
+            if (!server.lifecycle.isOnline || server.lifecycle.isCommissioned || this.#window.isOpen) {
+                return false;
+            }
+            if (server.env.get(DeviceCommissioner).windowStatus !== WINDOW_NOT_OPEN) {
+                return false;
+            }
+            await server.act(agent => agent.get(CommissioningServer).enterCommissionableMode());
+            this.log(
+                "The uncommissioned bridge's commissioning window had closed (matter.js ends it after 48 hours); " +
+                    "re-entering commissionable mode with the same pairing codes so an ecosystem can still pair",
+            );
+            return true;
+        } catch (error) {
+            this.log(`Could not re-enter commissionable mode: ${describeError(error)}`);
+            return false;
+        } finally {
+            this.#reopening = false;
+        }
+    }
+
     /** #203 — see {@link BridgeFacade.afterAttach}. */
     async afterAttach(): Promise<void> {
         await this.registry.sweepCountdowns();
@@ -2074,15 +2128,17 @@ export class BridgeNode implements BridgeFacade {
         }
 
         if (!commissioned) {
-            // The never-commissioned initial state: the basic window is open and
-            // its codes are the persisted originals (§3.7).
+            // The never-commissioned state: the node's own basic window, with the persisted
+            // original codes (§3.7). Whether it is OPEN is read, not assumed: matter.js 0.18 closes it
+            // after 48 hours, and {@link ensureCommissionable} reopens it within a minute.
+            const open = this.server.env.get(DeviceCommissioner).windowStatus !== WINDOW_NOT_OPEN;
             const codes = this.server.state.commissioning.pairingCodes;
             return {
                 commissioned: false,
-                windowOpen: true,
+                windowOpen: open,
                 windowExpiresAt: null,
-                manualPairingCode: codes.manualPairingCode,
-                qrPairingCode: codes.qrPairingCode,
+                manualPairingCode: open ? codes.manualPairingCode : null,
+                qrPairingCode: open ? codes.qrPairingCode : null,
                 fabrics: this.fabrics(),
             };
         }
@@ -2108,6 +2164,9 @@ export class BridgeNode implements BridgeFacade {
      * already up and the race cannot occur.
      */
     async getPairingSettled(): Promise<PairingReport> {
+        // Belt and braces: a pairing request that finds an uncommissioned node with its window closed
+        // reopens it rather than reporting (or claiming) a window that is not there.
+        await this.ensureCommissionable();
         return settlePairingRead(() => this.getPairing());
     }
 
@@ -2196,6 +2255,7 @@ export class BridgeNode implements BridgeFacade {
     }
 
     async close(): Promise<void> {
+        clearInterval(this.#commissionableCheck);
         this.#window.clear();
         const server = this.#server;
         this.#server = undefined;

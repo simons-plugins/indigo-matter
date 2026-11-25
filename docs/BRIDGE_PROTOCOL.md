@@ -507,9 +507,15 @@ Result:
  "fabrics": [ <FabricInfo>, … ]}
 ```
 
-`manualPairingCode`/`qrPairingCode` are non-null only while a window is open
-(always true for the never-commissioned initial state, whose codes are the
-persisted originals).
+`manualPairingCode`/`qrPairingCode` are non-null only while a window is open.
+For the never-commissioned initial state the window is the node's own, and its
+codes are the persisted originals. Whether it is open is READ from matter.js,
+never assumed: matter.js 0.18 closes an uncommissioned node's window after 48
+hours (0.17.8 never did), so the node re-enters commissionable mode itself — on
+a 60 s check, and on any `get_pairing` that finds it closed — with the same
+passcode and discriminator, hence the same codes. Between the close and the
+reopen `windowOpen` is `false` and the codes are `null`. A commissioned node's
+window is never reopened by the node.
 
 ### 3.8 `open_commissioning_window`
 

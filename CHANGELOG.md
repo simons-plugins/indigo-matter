@@ -20,6 +20,12 @@ check moves.
   countdown (`OnWithTimedOff`) was running could fail with a transaction conflict,
   leaving Indigo showing off and the ecosystem showing on. The bridge now waits for the
   countdown's lock instead of failing. The same wait protects pushing a device on.
+- Fix (first pairing, found in review): matter.js 0.18 now really ends the window an unpaired
+  bridge advertises on after 48 hours (0.17.8 never did), so a bridge left unpaired for two days —
+  or two days after a factory reset or after its last ecosystem was removed — stopped being
+  discoverable while the pairing menu still said it was advertising. The bridge now reports the real
+  window state and re-enters commissionable mode itself (same pairing codes) within a minute, or at
+  once when you ask for the pairing codes. A paired bridge is unaffected.
 - Fix (issue #203): restarting the bridge node mid-countdown left the device on for
   good, because the countdown timer lived only in memory. The bridge now records each
   timed-on countdown it starts (its end time, kept with the endpoint's record in
