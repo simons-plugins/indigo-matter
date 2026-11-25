@@ -894,7 +894,16 @@ export class EndpointRegistry {
                 // here, then let the failure propagate so the reconcile
                 // reports it instead of leaving stale state unmentioned.
                 await this.noteConfigurationChange();
-                throw error;
+                // The endpoint IS live (added, watched, counted) — only the
+                // state it was exported with did not land, so a controller may
+                // be reading a stale value from it. Say exactly that: a bare
+                // matter.js error names neither the device nor that the
+                // accessory exists (#355).
+                throw new ProtocolError(
+                    ErrorCode.internal,
+                    `device ${spec.indigoDeviceId} (${spec.role}): the endpoint is live, but its exported state could not be ` +
+                        `applied and it may show stale state until the plugin pushes it again: ${describeError(error)}`,
+                );
             }
         }
         return endpoint;

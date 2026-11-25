@@ -41,6 +41,7 @@ import { EndpointMapStore, ENDPOINT_MAP_FILE } from "../src/endpoint-map.js";
 import {
     applyStates,
     endpointIdFor,
+    IndigoOnOffServer,
     MIREDS_MAX,
     MIREDS_MIN,
     percentToBatteryRemaining,
@@ -3806,6 +3807,32 @@ describe("a countdown across a node restart (issue #203)", () => {
             );
         } finally {
             await second.close();
+        }
+    });
+});
+
+describe("a create-time applyStates failure (issue #355)", () => {
+    it("names the device and role, says the endpoint is live but its state was not applied, and leaves it live", async () => {
+        const h = await harness();
+        const proto = IndigoOnOffServer.prototype;
+        const original = proto.applyIndigoOnOff;
+        try {
+            proto.applyIndigoOnOff = function (): Promise<void> {
+                return Promise.reject(new Error("storage refused the write"));
+            };
+            const error = await rejects(
+                () => h.registry.upsert(spec(7, Role.onOffLight, { states: { onOff: true } })),
+                ErrorCode.internal,
+            );
+            assert.match(error.message, /device 7/);
+            assert.match(error.message, /onOffLight/);
+            assert.match(error.message, /live/);
+            assert.match(error.message, /could not be applied/);
+            assert.match(error.message, /storage refused the write/);
+            assert.equal(h.registry.size, 1, "the endpoint stays live — the message must not claim otherwise");
+        } finally {
+            proto.applyIndigoOnOff = original;
+            await h.close();
         }
     });
 });
