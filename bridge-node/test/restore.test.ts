@@ -467,11 +467,7 @@ describe("issue #353: currentLevel retention over a REAL node restart", () => {
         // `registry.test.ts`'s create-path restart test drives (a fresh
         // `Registry` against old storage, which always takes the CREATE
         // branch regardless of what is on disk — see that test's own comment,
-        // and issue #355 for the narrower gap it leaves: `create` never calls
-        // `applyStates` at all, so that path survives only because persisted
-        // nonvolatile values take precedence over construction values —
-        // matter.js's own restore is applied AFTER the construction patch,
-        // deterministically, not by winning a race against it).
+        // and issue #355, fixed since: `create` now runs `applyStates` too).
         const storagePath = storage();
         const LANDING = 223456792;
         const landingSpec = {
@@ -1604,6 +1600,62 @@ describe("issue #274 at node level: remove_endpoint destroys, so a later upsert 
             );
         } finally {
             await session.close();
+        }
+    });
+});
+
+describe("issue #355: un-export, restart, re-export", () => {
+    it("the states sent with the re-export win over what matter.js persisted for that id", async () => {
+        // ADR-0016 deletes the removed endpoint's map record, so the next boot
+        // restores nothing for it — but `closeOne` only `close()`s the
+        // endpoint, so matter.js still holds its persisted attributes. The
+        // re-export is then a CREATE (not the update branch a restored
+        // endpoint takes), and before #355 `create()` never applied
+        // `spec.states`: the accessory came back with the OLD onOff.
+        const storagePath = storage();
+
+        const first = await boot(storagePath);
+        try {
+            await attach(first.client, "a1", [LOUNGE_SPEC]);
+            first.client.send({
+                message_id: "s1",
+                command: "set_state",
+                args: { indigoDeviceId: LOUNGE, states: { onOff: false } },
+            });
+            for (;;) {
+                const frame = await first.client.next(10_000);
+                if (frame.message_id === "s1") {
+                    assert.equal(frame.error_code, undefined, JSON.stringify(frame));
+                    break;
+                }
+            }
+            assert.equal(onOffOf(first.bridge.server, LOUNGE), false, "fixture setup: persisted state is off");
+            await removeOne(first.client, "r1", LOUNGE);
+        } finally {
+            await first.close();
+        }
+
+        const second = await boot(storagePath);
+        try {
+            assert.equal(
+                childOf(second.bridge.server, LOUNGE),
+                undefined,
+                "the un-exported device is not restored (ADR-0016)",
+            );
+            const { events } = await attach(second.client, "a2", [LOUNGE_SPEC]);
+            assert.equal(
+                onOffOf(second.bridge.server, LOUNGE),
+                true,
+                "#355: the re-exported accessory must show the state it was exported with, not the persisted one",
+            );
+            assert.equal(currentLevelOf(second.bridge.server, LOUNGE), 152, "level 60% from the export");
+            assert.deepEqual(
+                events.filter(frame => frame.event === "command"),
+                [],
+                "applying initial states must not emit command events to the plugin",
+            );
+        } finally {
+            await second.close();
         }
     });
 });

@@ -658,6 +658,30 @@ export class EndpointRegistry {
             endpoint, role: spec.role, label: spec.label, battery: spec.battery, publishedAs: spec.publishedAs, unwatch,
         });
         this.#log(`Endpoint ${spec.indigoDeviceId} (${spec.role}) added as number ${Number(endpoint.number)}`);
+        // #355: the states sent with the export must land. matter.js keeps the
+        // persisted attributes of an endpoint id that was merely closed
+        // (ADR-0016 deletes our map record, not matter.js's storage), so after
+        // un-export -> node restart -> re-export the construction values lose
+        // to stale persisted ones, and the plugin has already recorded these
+        // states as pushed — nothing would ever correct the accessory.
+        // `restore()` passes `{}`, so a restored endpoint is untouched. Goes
+        // through `applyStates` like `update()` does: the same locked onOff
+        // write (#338), ADR-0017's level retention, and no command events
+        // (the push is the plugin telling the node, not an ecosystem write).
+        if (Object.keys(spec.states).length > 0) {
+            try {
+                await applyStates(endpoint, spec.role, spec.states, spec.battery, spec.indigoDeviceId);
+            } catch (error) {
+                // The endpoint is in the tree and stays registered (the next
+                // `update()` retries these states), so the bridged-node set
+                // HAS changed even though this call throws — and callers'
+                // `mutated`/post-create bump only run on success. Announce it
+                // here, then let the failure propagate so the reconcile
+                // reports it instead of leaving stale state unmentioned.
+                await this.noteConfigurationChange();
+                throw error;
+            }
+        }
         return endpoint;
     }
 

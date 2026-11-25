@@ -1437,7 +1437,7 @@ describe("currentLevel retention while off (#353)", () => {
         }
     });
 
-    it("(create-path persistence, issue #355) a fresh Registry against old storage still shows the persisted currentLevel, though applyStates never runs here", async () => {
+    it("(create-path persistence, issue #355) a fresh Registry against old storage keeps the persisted currentLevel under a level:0 create (ADR-0017 holds through create-time applyStates)", async () => {
         // NOT the normal bridge-node restart. That path is `restore.test.ts`'s
         // "issue #353: currentLevel retention over a REAL node restart" test:
         // a real `BridgeNode` restart runs `restoreEndpoints()` (issue #141)
@@ -1453,12 +1453,13 @@ describe("currentLevel retention while off (#353)", () => {
         // Production reaches this specific shape only for an endpoint
         // `restoreEndpoints()` did not rebuild while matter.js itself still
         // holds persisted state for it — a narrower, unverified-end-to-end
-        // gap tracked separately as issue #355, because `createEndpoint`'s
-        // construction patch carries `currentLevel: 1` and `applyStates`
-        // never runs at all on this path. What survives here is entirely
-        // matter.js's own restore beating that construction patch — #353's
-        // fix is not exercised, and does not need to be, for this test to
-        // pass.
+        // gap tracked separately as issue #355. Since #355's fix `create()`
+        // runs `applyStates` on this path, so `retainLevelWhileOff` (#353 /
+        // ADR-0017) IS exercised here: `createEndpoint`'s construction patch
+        // carries `currentLevel: 1`, matter.js's own restore beats it, and
+        // the create-time `level: 0` push must then leave that restored
+        // value alone. (Before #355's fix this test passed on matter.js's
+        // restore alone.)
         const storagePath = mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-353-restart-"));
         scratchRoots.push(storagePath);
 
@@ -3484,6 +3485,121 @@ describe("a countdown across a node restart (issue #203)", () => {
             );
         } finally {
             await second.close();
+        }
+    });
+});
+
+describe("re-export after un-export and a node restart (#355)", () => {
+    /**
+     * Export, push a state, un-export (ADR-0016 deletes the map record but
+     * `closeOne`'s `close()` keeps matter.js's persisted attributes for that
+     * `Endpoint.id`), restart on the same storage. The returned path is the
+     * storage the second boot must reuse.
+     */
+    async function exportPushUnexportRestart(): Promise<string> {
+        const storagePath = mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-355-"));
+        scratchRoots.push(storagePath);
+        const first = await harness({ storagePath });
+        try {
+            await first.registry.reconcile(
+                [spec(1, Role.dimmableLight, { states: { onOff: true, level: 20 } })],
+                false,
+            );
+            await first.registry.setState(1, { onOff: false, level: 0 });
+            await first.registry.setState(1, { onOff: true, level: 20 });
+            await first.registry.setState(1, { onOff: false });
+            assert.equal(
+                (only(first).stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                percentToCurrentLevel(20),
+                "precondition: the level this endpoint persisted",
+            );
+            await first.registry.remove(1);
+        } finally {
+            await first.close();
+        }
+        return storagePath;
+    }
+
+    it("REPRODUCTION: upsert after the restart applies the states sent with the export", async () => {
+        const storagePath = await exportPushUnexportRestart();
+        const second = await harness({ storagePath });
+        try {
+            await second.registry.upsert(
+                spec(1, Role.dimmableLight, { states: { onOff: true, level: 60 } }),
+            );
+            const endpoint = only(second);
+            assert.equal((endpoint.stateOf("onOff") as Record<string, unknown>).onOff, true);
+            assert.equal(
+                (endpoint.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                percentToCurrentLevel(60),
+                "#355: the accessory came back with its PERSISTED level instead of the exported one",
+            );
+            assert.deepEqual(
+                second.commands,
+                [],
+                "applying initial states is the plugin telling the node the truth, never an ecosystem command",
+            );
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("an attach reconcile after the restart applies them too", async () => {
+        const storagePath = await exportPushUnexportRestart();
+        const second = await harness({ storagePath });
+        try {
+            await second.registry.reconcile(
+                [spec(1, Role.dimmableLight, { states: { onOff: true, level: 60 } })],
+                false,
+            );
+            const endpoint = only(second);
+            assert.equal((endpoint.stateOf("onOff") as Record<string, unknown>).onOff, true);
+            assert.equal(
+                (endpoint.stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                percentToCurrentLevel(60),
+            );
+            assert.deepEqual(second.commands, []);
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("a failing initial-state write propagates, and the next reconcile heals it", async () => {
+        const h = await harness();
+        const proto = Endpoint.prototype as unknown as { set: (...args: unknown[]) => Promise<void> };
+        const originalSet = proto.set;
+        try {
+            let armed = true;
+            proto.set = function (this: Endpoint, ...args: unknown[]): Promise<void> {
+                if (armed) {
+                    armed = false;
+                    return Promise.reject(new Error("initial state write refused"));
+                }
+                return originalSet.apply(this, args);
+            };
+            await assert.rejects(
+                () =>
+                    h.registry.reconcile(
+                        [spec(1, Role.dimmableLight, { states: { onOff: true, level: 60 } })],
+                        false,
+                    ),
+                /initial state write refused/,
+                "an endpoint must not go live with stale state and nobody told",
+            );
+        } finally {
+            proto.set = originalSet;
+        }
+        try {
+            await h.registry.reconcile(
+                [spec(1, Role.dimmableLight, { states: { onOff: true, level: 60 } })],
+                false,
+            );
+            assert.equal(
+                (only(h).stateOf("levelControl") as Record<string, unknown>).currentLevel,
+                percentToCurrentLevel(60),
+            );
+        } finally {
+            await h.close();
         }
     });
 });
