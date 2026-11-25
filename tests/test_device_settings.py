@@ -834,18 +834,97 @@ def test_an_unchanged_dimmer_setting_writes_nothing(type_id):
                           lambda c, a: None, lists) == []
 
 
-@pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
-def test_a_dimmer_with_a_null_or_unreported_value_round_trips_without_a_write(type_id):
-    """The relay path cannot write null (EnumValues has no null member), so a
-    dimmer cannot either. What it must do is never turn an untouched dialog on a
-    device holding null into a write: blank means 'leave this alone'."""
-    lists = _attr_lists({0x0006: ONOFF_WITH_LIGHTING})
-    values = config_ui_values(type_id, {"startUpOnOff": None}, lambda c, a: None,
-                              attribute_list=lists)
-    assert values["startUpOnOff"] == ""
-    assert validate_settings(type_id, values, lambda c, a: None, lists) == {}
-    assert planned_writes(type_id, values, {"startUpOnOff": None},
-                          lambda c, a: None, lists) == []
+# --- null ("restore the previous state") is a REAL value the plugin records ---
+#
+# A null StartUpOnOff reading is stored as state 255 (the wire encoding of a
+# null enum8), never dropped: Indigo's Integer default of 0 is a valid value
+# ("Off") and used to be shown for every null-reporting device. 255 is never
+# sent to the device — it is not in the enum's allowed set.
+
+NULL_ROW = ("255", "Previous state (device default; cannot be chosen from Indigo)")
+_LIGHTING_LISTS = _attr_lists({0x0006: ONOFF_WITH_LIGHTING})
+
+
+def _startup(type_id):
+    return next(s for s in settings_for_type(type_id) if s.key == "startUpOnOff")
+
+
+@pytest.mark.parametrize("type_id", _LIGHTING_TYPES)
+def test_the_null_row_is_offered_only_while_the_device_holds_null(type_id):
+    setting = _startup(type_id)
+    bounds = setting.resolve_bounds(lambda c, a: None)
+    assert setting.option_rows(bounds, 255)[0] == NULL_ROW
+    assert [v for v, _ in setting.option_rows(bounds, 255)] == ["255", "0", "1", "2"]
+    for current in (0, 1, 2, None, "junk"):
+        assert [v for v, _ in setting.option_rows(bounds, current)] == ["0", "1", "2"], current
+
+
+@pytest.mark.parametrize("type_id", _LIGHTING_TYPES)
+def test_a_null_holding_dialog_seeds_the_null_row_and_an_untouched_save_does_nothing(type_id):
+    values = config_ui_values(type_id, {"startUpOnOff": 255}, lambda c, a: None,
+                              attribute_list=_LIGHTING_LISTS)
+    assert values["startUpOnOff"] == "255"
+    assert validate_settings(type_id, values, lambda c, a: None, _LIGHTING_LISTS) == {}
+    assert planned_writes(type_id, values, {"startUpOnOff": 255},
+                          lambda c, a: None, _LIGHTING_LISTS) == []
+
+
+@pytest.mark.parametrize("type_id", _LIGHTING_TYPES)
+@pytest.mark.parametrize("choice", [0, 1, 2])
+def test_choosing_a_real_value_from_the_null_row_is_a_change_even_to_off(type_id, choice):
+    """0 == the Indigo default, so the old code could not tell 'Off' from 'unknown'."""
+    plans = planned_writes(type_id, {"startUpOnOff": str(choice)}, {"startUpOnOff": 255},
+                           lambda c, a: None, _LIGHTING_LISTS)
+    assert [(p.value, p.previous) for p in plans] == [(choice, 255)]
+
+
+@pytest.mark.parametrize("type_id", _LIGHTING_TYPES)
+def test_the_null_value_is_never_a_writable_value(type_id):
+    """Selecting it leaves the setting alone; it is never validated into a write."""
+    for state in (0, 1, 2, 255):
+        assert planned_writes(type_id, {"startUpOnOff": "255"}, {"startUpOnOff": state},
+                              lambda c, a: None, _LIGHTING_LISTS) == [], state
+    setting = _startup(type_id)
+    bounds = setting.resolve_bounds(lambda c, a: None)
+    value, _reason = coerce_value(setting, "255", bounds)
+    assert value is None
+
+
+class _NoNullClient(_Client):
+    """Raises if asked to write the null encoding (255) or None."""
+
+    async def write(self, write, timeout=None):
+        assert write.value not in (255, None), f"null written to the device: {write!r}"
+        return await super().write(write, timeout)
+
+
+@pytest.mark.parametrize("type_id", _LIGHTING_TYPES)
+def test_picking_off_from_the_null_row_writes_zero_and_never_the_null(type_id):
+    plans = planned_writes(type_id, {"startUpOnOff": "0"}, {"startUpOnOff": 255},
+                           lambda c, a: None, _LIGHTING_LISTS)
+    client = _NoNullClient(reads=0)
+    ok, message = _run(apply_setting(client, 6, 1, plans[0], sleep=_no_sleep))
+    assert ok is True
+    assert [(w.cluster, w.attribute, w.value) for w in client.writes] == [(0x0006, 0x4003, 0)]
+    assert message == "After a power cut is now Off."
+
+
+@pytest.mark.parametrize("type_id", _LIGHTING_TYPES)
+def test_a_failed_write_whose_readback_is_null_reports_the_observed_null(type_id):
+    observed = []
+    ok, message = _run(apply_setting(_Client(reads=None), 6, 1,
+                                     PlannedWrite(_startup(type_id), 1, 255),
+                                     sleep=_no_sleep, on_observed=observed.append))
+    assert ok is False and "NOT applied" in message
+    assert "asked for On" in message, "names the option, not the raw number"
+    assert observed == [None]
+
+
+def test_option_labels_name_the_choice_in_the_logs():
+    setting = _startup(RELAY)
+    assert setting.value_text(2) == "Toggle (opposite of before)"
+    assert setting.value_text(255) == "previous state"
+    assert _setting("holdTime").value_text(30) == "30 seconds"
 
 
 @pytest.mark.parametrize("type_id", [DIMMER, COLOR_DIMMER])
