@@ -354,7 +354,7 @@ class _ThreadFakeMatter:
         self.read_calls.append(node_id)
         if node_id in self._forbidden_nodes:
             # "Make it fatal" (root CLAUDE.md): if a future edit ever calls
-            # read() here — with liveReadSleepy off, or on a router — this
+            # read() here — with liveReadNodes off, or on a router — this
             # raises instead of quietly succeeding.
             raise AssertionError(f"read() must never touch node 0x{node_id:X}")
         if node_id in self._timeout_nodes:
@@ -439,10 +439,10 @@ def test_menu_returns_immediately_leaving_the_survey_running_in_the_background(m
     obj.runtime = Mock()
     obj.runtime.submit.side_effect = lambda coro: (captured.__setitem__("coro", coro), pending)[1]
 
-    ok, values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    ok, values = obj.menuReportThreadMesh({"liveReadNodes": False})[:2]
 
     assert ok is True
-    assert values == {"liveReadSleepy": False}
+    assert values == {"liveReadNodes": False}
     assert not pending.done(), "the menu must not have waited for a result"
     assert not obj.logger.warning.called
     started = [str(c) for c in obj.logger.info.call_args_list]
@@ -481,7 +481,7 @@ def test_the_total_budget_is_enforced_by_the_coroutine_itself(mixin, monkeypatch
     obj.runtime = Mock()
     obj.runtime.submit.side_effect = fake_submit
 
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": True})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": True})[:2]
     assert ok is True
 
     with pytest.raises(asyncio.TimeoutError):
@@ -491,7 +491,7 @@ def test_the_total_budget_is_enforced_by_the_coroutine_itself(mixin, monkeypatch
 def test_the_report_prints_the_fixtures_health_flags(mixin):
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
     _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": False})[:2]
     assert ok
     body = _log_body(obj)
     # 0x34 (router_id 62) has exactly one neighbour; 0x27 is 3+ hops from the
@@ -509,7 +509,7 @@ def test_the_report_ends_with_the_visual_map_url(mixin):
     that the report asks for the "thread" page and prints what it gets back."""
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
     _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": False})[:2]
     assert ok
     obj._iws_page_url.assert_called_with("thread")  # pylint: disable=protected-access
     body = _log_body(obj)
@@ -522,7 +522,7 @@ def test_no_url_footer_when_page_url_is_none(mixin):
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
     _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
     obj._iws_page_url = Mock(return_value=None)  # pylint: disable=protected-access
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": False})[:2]
     assert ok
     assert "Visual map" not in _log_body(obj)
 
@@ -535,7 +535,7 @@ def test_a_broken_page_url_resolution_does_not_cost_the_whole_report(mixin):
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
     _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
     obj._iws_page_url = Mock(side_effect=RuntimeError("getWebServerURL blew up"))  # pylint: disable=protected-access
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": False})[:2]
     assert ok
     body = _log_body(obj)
     assert "single_neighbour:" in body, "the mesh report itself must still print"
@@ -557,7 +557,7 @@ def test_node_names_and_page_url_are_resolved_eagerly_before_the_coroutine_runs(
     obj.runtime = Mock()
     obj.runtime.submit.side_effect = lambda coro: (captured.__setitem__("coro", coro), pending)[1]
 
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": False})[:2]
 
     assert ok is True
     assert not pending.done(), "the coroutine has not run yet"
@@ -576,7 +576,7 @@ def test_a_timed_out_live_read_is_reported_to_the_event_log_AND_the_node_still_a
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
     matter = _ThreadFakeMatter(nodes, timeout_nodes={0x2E})
     _module, obj = _thread_mesh_mixin(mixin, matter)
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": True})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": True})[:2]
     assert ok, "the dialog itself is long gone by the time this is known"
     warn_body = _warn_body(obj)
     assert "1 node(s) could not be live-read" in warn_body
@@ -588,7 +588,7 @@ def test_a_timed_out_live_read_is_reported_to_the_event_log_AND_the_node_still_a
 @pytest.mark.parametrize("off_value", [False, "false", "False", 0])
 def test_live_read_sleepy_off_performs_no_read_calls(mixin, off_value):
     """"Make it fatal" (root CLAUDE.md): every node id is in the forbidden set,
-    so any read() call — a broken liveReadSleepy guard — fails loudly.
+    so any read() call — a broken liveReadNodes guard — fails loudly.
 
     #334 post-review, B3.1: Indigo delivers a checkbox as the STRING
     "true"/"false" — ``bool("false")`` is ``True``, so before the ``_truthy``
@@ -598,7 +598,7 @@ def test_live_read_sleepy_off_performs_no_read_calls(mixin, off_value):
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
     matter = _ThreadFakeMatter(nodes, forbidden_nodes=THREAD_ROUTER_IDS | THREAD_NON_ROUTER_IDS)
     _module, obj = _thread_mesh_mixin(mixin, matter)
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": off_value})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": off_value})[:2]
     assert ok
     assert matter.read_calls == []
 
@@ -607,7 +607,7 @@ def test_routers_are_never_live_read(mixin):
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
     matter = _ThreadFakeMatter(nodes, forbidden_nodes=THREAD_ROUTER_IDS)
     _module, obj = _thread_mesh_mixin(mixin, matter)
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": True})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": True})[:2]
     assert ok
     assert set(matter.read_calls) == THREAD_NON_ROUTER_IDS
     assert not (set(matter.read_calls) & THREAD_ROUTER_IDS)
@@ -619,7 +619,7 @@ def test_wifi_only_fabric_is_a_friendly_success_not_an_error(mixin):
     # of them is a Thread node) — the friendly answer, not an error.
     wifi_only = [{"node_id": 1, "available": True, "attributes": {"0/40/1": "Vendor"}}]
     _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(wifi_only))
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": True})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": True})[:2]
     assert ok
     assert "no Thread devices" in _log_body(obj)
     assert not obj.logger.warning.called
@@ -632,7 +632,7 @@ def test_zero_raw_nodes_is_an_error_not_a_friendly_empty_mesh(mixin):
     # this is now a WARNING on the Event Log, not a dialog error — the
     # dialog closed the moment the survey was submitted.
     _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter([]))
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": True})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": True})[:2]
     assert ok
     assert "no commissioned nodes at all" in _warn_body(obj)
 
@@ -643,7 +643,7 @@ def test_raw_nodes_all_unaddressable_is_an_error_listing_the_skip_reasons(mixin)
     # not even address, which is a real failure, not an empty mesh.
     unaddressable = [{"attributes": {"0/53/1": 5}}]  # no node_id at all
     _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(unaddressable))
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": True})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": True})[:2]
     assert ok
     warn_body = _warn_body(obj)
     assert "could not be read" in warn_body
@@ -655,7 +655,7 @@ def test_matter_server_unavailable_is_reported_not_printed_as_an_empty_mesh(mixi
     degradation-path convention) — must not read as "no Thread devices"."""
     matter = _ThreadFakeMatter([], get_nodes_error=ConnectionError("matter-server down"))
     _module, obj = _thread_mesh_mixin(mixin, matter)
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": False})[:2]
     assert ok
     assert "could not read the Thread mesh" in _warn_body(obj)
     assert "no Thread devices" not in _log_body(obj)
@@ -669,8 +669,8 @@ def test_matter_server_unavailable_is_reported_not_printed_as_an_empty_mesh(mixi
 def test_the_report_refuses_before_the_connection_is_up(mixin):
     _module, obj = mixin
     obj.matter = None
-    ok, _values, errors = obj.menuReportThreadMesh({"liveReadSleepy": True})
-    assert not ok and "not connected" in errors["liveReadSleepy"]
+    ok, _values, errors = obj.menuReportThreadMesh({"liveReadNodes": True})
+    assert not ok and "not connected" in errors["liveReadNodes"]
 
 
 def test_the_report_refuses_when_matter_is_not_connected(mixin):
@@ -679,8 +679,8 @@ def test_the_report_refuses_when_matter_is_not_connected(mixin):
     # actually talking to matter-server yet.
     _module, obj = mixin
     obj.matter = Mock(connected=False)
-    ok, _values, errors = obj.menuReportThreadMesh({"liveReadSleepy": True})
-    assert not ok and "not connected to matter-server" in errors["liveReadSleepy"]
+    ok, _values, errors = obj.menuReportThreadMesh({"liveReadNodes": True})
+    assert not ok and "not connected to matter-server" in errors["liveReadNodes"]
 
 
 def test_menu_passes_the_shared_node_names_to_the_survey(mixin):
@@ -690,7 +690,7 @@ def test_menu_passes_the_shared_node_names_to_the_survey(mixin):
     _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
     obj.device_sync.list_nodes.return_value = [(0x34, ["Grillplats socket"])]
     obj.device_sync.lookup.return_value = None  # no matterNode device yet — falls back
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": False})[:2]
     assert ok
     assert "Grillplats socket" in _log_body(obj)
 
@@ -711,7 +711,7 @@ def test_menu_forwards_event_stamps_to_survey_thread_nodes(mixin, monkeypatch):
         return await real_survey_thread_nodes(matter, **kwargs)
 
     monkeypatch.setattr(module.thread_survey, "survey_thread_nodes", _capture)
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": False})[:2]
     assert ok
     assert captured["event_stamps"] == {0x34: 123.0}
 
@@ -741,7 +741,7 @@ def test_a_timeout_logs_to_the_event_log_once_the_backgrounded_survey_gives_up(m
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
     matter = _ThreadFakeMatter(nodes, get_nodes_error=asyncio.TimeoutError())
     _module, obj = _thread_mesh_mixin(mixin, matter)
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": True})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": True})[:2]
     assert ok
     warn_body = _warn_body(obj)
     assert "timed out" in warn_body
@@ -794,7 +794,7 @@ def test_a_real_loop_cancellation_is_logged_info_not_warning(mixin):
     obj.matter = _HangingMatter()
 
     try:
-        ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+        ok, _values = obj.menuReportThreadMesh({"liveReadNodes": False})[:2]
         assert ok is True
         assert started.wait(timeout=2), "the survey coroutine never started running"
     finally:
@@ -828,12 +828,12 @@ def test_a_second_click_is_refused_while_one_is_pending(mixin):
     # nuisance, not a real leak here, but there is no reason to leave one.
     obj.runtime.submit.side_effect = lambda coro: (captured.__setitem__("coro", coro), pending)[1]
 
-    ok1, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    ok1, _values = obj.menuReportThreadMesh({"liveReadNodes": False})[:2]
     assert ok1 is True
 
-    ok2, _values2, errors2 = obj.menuReportThreadMesh({"liveReadSleepy": False})
+    ok2, _values2, errors2 = obj.menuReportThreadMesh({"liveReadNodes": False})
     assert ok2 is False
-    assert "already running" in errors2["liveReadSleepy"]
+    assert "already running" in errors2["liveReadNodes"]
     assert obj.runtime.submit.call_count == 1, "a refused click must not start a second survey"
 
     captured["coro"].close()
@@ -845,22 +845,22 @@ def test_allowed_again_once_the_survey_completes(mixin):
     # coroutine to completion synchronously, so the flag is already cleared
     # by the time menuReportThreadMesh returns.
     _module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
-    ok1, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    ok1, _values = obj.menuReportThreadMesh({"liveReadNodes": False})[:2]
     assert ok1 is True
     assert obj._thread_mesh_survey_pending is None  # pylint: disable=protected-access
 
-    ok2, _values2 = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    ok2, _values2 = obj.menuReportThreadMesh({"liveReadNodes": False})[:2]
     assert ok2 is True, "a second survey must be allowed once the first has completed"
 
 
 def test_allowed_again_once_the_survey_fails(mixin):
     matter = _ThreadFakeMatter([], get_nodes_error=ConnectionError("matter-server down"))
     _module, obj = _thread_mesh_mixin(mixin, matter)
-    ok1, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    ok1, _values = obj.menuReportThreadMesh({"liveReadNodes": False})[:2]
     assert ok1 is True
     assert obj._thread_mesh_survey_pending is None  # pylint: disable=protected-access
 
-    ok2, _values2 = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    ok2, _values2 = obj.menuReportThreadMesh({"liveReadNodes": False})[:2]
     assert ok2 is True, "a second survey must be allowed once the first has failed"
 
 
@@ -881,10 +881,10 @@ def test_a_stopped_runtime_is_a_dialog_error_not_an_unhandled_exception(mixin):
     obj.runtime = Mock()
     obj.runtime.submit.side_effect = RuntimeError("asyncio runtime is not running")
 
-    ok, _values, errors = obj.menuReportThreadMesh({"liveReadSleepy": False})
+    ok, _values, errors = obj.menuReportThreadMesh({"liveReadNodes": False})
 
     assert ok is False
-    assert "not connected" in errors["liveReadSleepy"]
+    assert "not connected" in errors["liveReadNodes"]
     assert obj._thread_mesh_survey_pending is None, (  # pylint: disable=protected-access
         "a submit() that never produced a future must not leave the guard set")
 
@@ -905,7 +905,7 @@ def test_a_done_callback_that_somehow_raises_is_logged_not_lost(mixin, monkeypat
     module, obj = _thread_mesh_mixin(mixin, _ThreadFakeMatter(nodes))
     boom = RuntimeError("build_mesh exploded")
     monkeypatch.setattr(module.thread_mesh, "build_mesh", Mock(side_effect=boom))
-    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": False})[:2]
+    ok, _values = obj.menuReportThreadMesh({"liveReadNodes": False})[:2]
     assert ok
     assert not obj.logger.warning.called, "an unknown bug must not be logged as a routine warning"
     exc_msgs = [str(c) for c in obj.logger.exception.call_args_list]

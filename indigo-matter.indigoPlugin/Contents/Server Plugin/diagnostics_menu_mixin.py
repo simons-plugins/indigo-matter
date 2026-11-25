@@ -14,7 +14,7 @@ touching it:
 * **Report Thread mesh…** — roles, neighbour/route links (RSSI/LQI/frame-error),
   the leader, foreign routers and health flags for every Thread node, parsed by
   :mod:`thread_mesh` from matter-server's ThreadNetworkDiagnostics cache and
-  optionally live-refreshed first for the sleepy devices via the shared
+  optionally live-refreshed first for every node (#348: routers too) via the shared
   :func:`thread_survey.survey_thread_nodes` (the same coroutine the IWS Thread
   page's :func:`thread_survey.run_survey` uses, so the live-read policy lives
   in one place). **Runs in the background** (#339): a live-read survey can
@@ -380,9 +380,9 @@ class DiagnosticsMenuMixin:
 
         Used to run :func:`thread_survey.run_survey` synchronously and block
         the dialog on it. A real dialog timeout was field-reported against
-        v2026.30.0 on 2026-09-01: with ``liveReadSleepy`` on, the survey can
+        v2026.30.0 on 2026-09-01: with ``liveReadNodes`` on, the survey can
         legitimately take up to ``ATTRIBUTE_TIMEOUT + SURVEY_READ_TIMEOUT``
-        (~50 s, one ``per_node_timeout`` budget for the slowest sleepy node
+        (~50 s, one ``per_node_timeout`` budget for the slowest node
         plus the ``get_nodes()``/marshalling margin) — and an Indigo menu
         dialog must not block anywhere near that long. The fix moves the wait
         off the calling (Indigo) thread entirely: the survey coroutine is
@@ -416,7 +416,7 @@ class DiagnosticsMenuMixin:
         ``indigo.server.*`` RPC (``getWebServerURL``, inside
         ``_iws_page_url``) off the loop thread; and it means the done-callback
         touches nothing but ``self.logger`` and its own two captured,
-        already-resolved values (``live_sleepy``/``page_url`` — see
+        already-resolved values (``live_read``/``page_url`` — see
         :meth:`_on_thread_mesh_survey_done`) — ``node_names``/``event_stamps``
         flow into the SURVEY coroutine instead, never the done-callback.
         """
@@ -426,7 +426,7 @@ class DiagnosticsMenuMixin:
         # check and could hang against a runtime that exists but is not
         # actually talking to matter-server yet.
         if self.runtime is None or self.matter is None or not self.matter.connected:
-            errors["liveReadSleepy"] = "The plugin is not connected to matter-server yet."
+            errors["liveReadNodes"] = "The plugin is not connected to matter-server yet."
             return (False, valuesDict, errors)
 
         # R5 (#339 review): refuse a second concurrent survey politely rather
@@ -435,14 +435,17 @@ class DiagnosticsMenuMixin:
         # lines. Cleared in _on_thread_mesh_survey_done's outer `finally`, so
         # completion, failure, AND cancellation all release it.
         if self._thread_mesh_survey_pending is not None:
-            errors["liveReadSleepy"] = ("A Thread mesh survey is already running — its "
+            errors["liveReadNodes"] = ("A Thread mesh survey is already running — its "
                                         "report will appear in the Event Log shortly.")
             return (False, valuesDict, errors)
 
         # #334 post-review, B3.1: Indigo delivers a checkbox as the STRING
         # "true"/"false", and bool("false") is True — this used to always
         # live-read regardless of the checkbox, silently ignoring "off".
-        live_sleepy = _truthy(valuesDict.get("liveReadSleepy", True))
+        # The checkbox was "liveReadSleepy" until it started live-reading routers
+        # too (#348); an old saved dialog/script that still sends the old id must
+        # keep meaning "live-read", not silently fall back to the default.
+        live_read = _truthy(valuesDict.get("liveReadNodes", valuesDict.get("liveReadSleepy", True)))
         total_timeout = ATTRIBUTE_TIMEOUT + SURVEY_READ_TIMEOUT
 
         # R8 — eager, Indigo-thread resolution (see docstring above).
@@ -469,7 +472,7 @@ class DiagnosticsMenuMixin:
             # instead, via asyncio.wait_for (#339).
             return await asyncio.wait_for(
                 thread_survey.survey_thread_nodes(
-                    self.matter, live_sleepy=live_sleepy, node_names=node_names,
+                    self.matter, live_read=live_read, node_names=node_names,
                     event_stamps=event_stamps,
                 ),
                 timeout=total_timeout,
@@ -485,7 +488,7 @@ class DiagnosticsMenuMixin:
             # menu machinery instead of the dialog-error family every other
             # "not connected yet" path uses.
             coro.close()  # avoid a "coroutine was never awaited" warning
-            errors["liveReadSleepy"] = "The plugin is not connected to matter-server yet."
+            errors["liveReadNodes"] = "The plugin is not connected to matter-server yet."
             return (False, valuesDict, errors)
 
         # Set BEFORE add_done_callback: an already-done future (as every test
@@ -495,14 +498,14 @@ class DiagnosticsMenuMixin:
         # `finally` to have something to clear.
         self._thread_mesh_survey_pending = future
         future.add_done_callback(
-            functools.partial(self._on_thread_mesh_survey_done, live_sleepy, page_url))
+            functools.partial(self._on_thread_mesh_survey_done, live_read, page_url))
 
         self.logger.info(
             "Matter: Thread mesh survey started (live-read sleepy: %s) — the report will "
-            "follow in the Event Log within about a minute.", "yes" if live_sleepy else "no")
+            "follow in the Event Log within about a minute.", "yes" if live_read else "no")
         return (True, valuesDict)
 
-    def _on_thread_mesh_survey_done(self, live_sleepy: bool, page_url: Optional[str],
+    def _on_thread_mesh_survey_done(self, live_read: bool, page_url: Optional[str],
                                      future) -> None:
         """Done-callback for the backgrounded Thread mesh survey (#339).
 
@@ -519,7 +522,7 @@ class DiagnosticsMenuMixin:
 
         That uncertainty is exactly why the body below, and
         :meth:`_log_thread_mesh_survey_result`, touch nothing but
-        ``self.logger`` and the two values captured here — ``live_sleepy`` and
+        ``self.logger`` and the two values captured here — ``live_read`` and
         ``page_url``, both resolved eagerly on the Indigo thread by the caller
         (R8) — plus pure computation over ``future.result()``. No Indigo
         device writes, and no fresh Indigo RPCs, belong here: there is no
@@ -538,7 +541,7 @@ class DiagnosticsMenuMixin:
         synchronous already-done path above; see R1-CORRECTION).
         """
         try:
-            self._log_thread_mesh_survey_result(live_sleepy, page_url, future)
+            self._log_thread_mesh_survey_result(live_read, page_url, future)
         except (Exception, asyncio.CancelledError) as exc:  # pylint: disable=broad-except
             # Absorbing: anything the reporting logic below could raise — see
             # this method's docstring for why nothing may escape a
@@ -552,7 +555,7 @@ class DiagnosticsMenuMixin:
             # survey — completion, failure, AND cancellation alike.
             self._thread_mesh_survey_pending = None
 
-    def _log_thread_mesh_survey_result(self, live_sleepy: bool, page_url: Optional[str],
+    def _log_thread_mesh_survey_result(self, live_read: bool, page_url: Optional[str],
                                         future) -> None:
         """The post-survey handling ``menuReportThreadMesh`` used to do
         synchronously and report as a dialog error (#334) — now run from
@@ -600,7 +603,7 @@ class DiagnosticsMenuMixin:
             # report to simply never show up.
             self.logger.warning(
                 "Matter: Thread mesh survey timed out after %.0f s (live=%s)",
-                ATTRIBUTE_TIMEOUT + SURVEY_READ_TIMEOUT, live_sleepy)
+                ATTRIBUTE_TIMEOUT + SURVEY_READ_TIMEOUT, live_read)
             return
         except Exception as exc:  # pylint: disable=broad-except
             # get_nodes() failing outright is a failed call, not an empty mesh

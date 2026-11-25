@@ -1261,7 +1261,7 @@ def render_thread_page(mesh, diags: list, *, generated_at: str, live: bool,  # p
                 f'<p class="msg">Some of this data is matter-server\'s cache — oldest node baseline '
                 f'{_escape(humanise_age(oldest_age))} ago. Baselines are a lower bound: a value may be '
                 f'staler than its interview.{unknown_sentence} Use <a href="{live_url}">Refresh (live)</a> '
-                f'to re-read sleepy devices.</p>'
+                f'to re-read every node.</p>'
             )
 
     header = f"""

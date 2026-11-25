@@ -83,7 +83,7 @@ def _run(coro):
 
 def test_without_live_read_every_fixture_node_is_returned_from_cache():
     matter = FakeMatter(forbidden_nodes=ROUTER_IDS | NON_ROUTER_IDS)  # any read() call fails the test
-    survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+    survey = _run(survey_thread_nodes(matter, live_read=False))
     assert {d.node_id for d in survey.diags} == ROUTER_IDS | NON_ROUTER_IDS
     assert all(d.source == "cache" for d in survey.diags)
     assert matter.read_calls == [], "liveSleepy=False must never call read()"
@@ -95,7 +95,7 @@ def test_without_live_read_every_fixture_node_is_returned_from_cache():
 
 def test_live_read_only_ever_touches_non_router_nodes():
     matter = FakeMatter(forbidden_nodes=ROUTER_IDS)
-    survey = _run(survey_thread_nodes(matter, live_sleepy=True))
+    survey = _run(survey_thread_nodes(matter, live_read=True))
     assert set(matter.read_calls) <= NON_ROUTER_IDS
     assert set(matter.read_calls) == NON_ROUTER_IDS, "every non-router should have been live-read"
     routers = {d.node_id: d for d in survey.diags if d.node_id in ROUTER_IDS}
@@ -104,7 +104,7 @@ def test_live_read_only_ever_touches_non_router_nodes():
 
 def test_a_successful_live_read_flips_the_diag_to_live_and_keeps_its_data():
     matter = FakeMatter()
-    survey = _run(survey_thread_nodes(matter, live_sleepy=True))
+    survey = _run(survey_thread_nodes(matter, live_read=True))
     by_id = {d.node_id: d for d in survey.diags}
     live = by_id[0x2E]  # BILRESA scroll wheel — SED, gets live-read
     assert live.source == "live"
@@ -121,7 +121,7 @@ def test_route_table_is_now_live_read_for_non_routers():
     # read as everything else, not a stale cached RouteTable paired with a
     # fresh LeaderRouterId.
     matter = FakeMatter()
-    survey = _run(survey_thread_nodes(matter, live_sleepy=True))
+    survey = _run(survey_thread_nodes(matter, live_read=True))
     live = next(d for d in survey.diags if d.node_id == 0x2E)
     assert live.source == "live"
     assert len(live.routes) == 1
@@ -135,7 +135,7 @@ def _direct_parse(node_id: int):
 
 def test_a_timed_out_live_read_keeps_the_cached_diag_and_names_the_reason():
     matter = FakeMatter(timeout_nodes={0x2E})
-    survey = _run(survey_thread_nodes(matter, live_sleepy=True, per_node_timeout=5.0))
+    survey = _run(survey_thread_nodes(matter, live_read=True, per_node_timeout=5.0))
     by_id = {d.node_id: d for d in survey.diags}
     timed_out = by_id[0x2E]
     assert timed_out.source == "cache", "a failed live read must not discard the cached data"
@@ -148,7 +148,7 @@ def test_a_timed_out_live_read_keeps_the_cached_diag_and_names_the_reason():
 
 def test_an_erroring_live_read_keeps_the_cached_diag_and_names_the_reason():
     matter = FakeMatter(error_nodes={0x38: ConnectionError("socket closed")})
-    survey = _run(survey_thread_nodes(matter, live_sleepy=True))
+    survey = _run(survey_thread_nodes(matter, live_read=True))
     diag = next(d for d in survey.diags if d.node_id == 0x38)
     assert diag.source == "cache"
     assert diag.read_error is not None and "socket closed" in diag.read_error
@@ -158,7 +158,7 @@ def test_one_nodes_live_read_failure_never_drops_it_from_the_result():
     """A degraded node is still reported, per the module contract — never
     silently thinned out (root CLAUDE.md degradation-path convention)."""
     matter = FakeMatter(timeout_nodes={0x2E, 0x2F, 0x38, 0x40})
-    survey = _run(survey_thread_nodes(matter, live_sleepy=True, per_node_timeout=5.0))
+    survey = _run(survey_thread_nodes(matter, live_read=True, per_node_timeout=5.0))
     assert {d.node_id for d in survey.diags} == ROUTER_IDS | NON_ROUTER_IDS
     assert all(d.read_error for d in survey.diags if d.node_id in NON_ROUTER_IDS)
 
@@ -179,7 +179,7 @@ def test_live_read_returning_none_for_neighbor_table_keeps_the_cached_diag():
         return await orig_read(node_id, endpoint, cluster, attribute)
 
     matter.read = _read
-    survey = _run(survey_thread_nodes(matter, live_sleepy=True))
+    survey = _run(survey_thread_nodes(matter, live_read=True))
     diag = next(d for d in survey.diags if d.node_id == 0x2E)
     # Adversarial: "when could this return live/0-neighbours/ok and be wrong?"
     # — exactly here, if the None answer were treated as "no neighbours".
@@ -200,7 +200,7 @@ def test_live_read_returning_a_non_list_for_neighbor_table_keeps_the_cached_diag
         return await orig_read(node_id, endpoint, cluster, attribute)
 
     matter.read = _read
-    survey = _run(survey_thread_nodes(matter, live_sleepy=True))
+    survey = _run(survey_thread_nodes(matter, live_read=True))
     diag = next(d for d in survey.diags if d.node_id == 0x2E)
     assert diag.source == "cache"
     assert diag.read_error == "live read returned no NeighborTable"
@@ -233,7 +233,7 @@ def test_a_bug_in_the_merge_reparse_step_is_stamped_not_swallowed(monkeypatch):
 
     monkeypatch.setattr(thread_survey, "parse_node_diag", _fatal_on_second_call_for_0x2e)
     matter = FakeMatter()
-    survey = _run(survey_thread_nodes(matter, live_sleepy=True))
+    survey = _run(survey_thread_nodes(matter, live_read=True))
     diag = next(d for d in survey.diags if d.node_id == 0x2E)
     assert diag.source == "cache", "a merge/re-parse failure must not corrupt the cached diag"
     assert diag.read_error is not None
@@ -251,7 +251,7 @@ def test_a_bug_in_the_merge_reparse_step_is_stamped_not_swallowed(monkeypatch):
 def test_a_get_nodes_failure_raises_rather_than_returning_an_empty_list():
     matter = FakeMatter(get_nodes_error=RuntimeError("matter-server unreachable"))
     with pytest.raises(RuntimeError, match="matter-server unreachable"):
-        _run(survey_thread_nodes(matter, live_sleepy=False))
+        _run(survey_thread_nodes(matter, live_read=False))
 
 
 # ---------------------------------------------------------------------------
@@ -261,21 +261,21 @@ def test_a_get_nodes_failure_raises_rather_than_returning_an_empty_list():
 class TestSurveyRawCountAndSkipped:
     def test_raw_count_matches_the_fixture(self):
         matter = FakeMatter()
-        survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+        survey = _run(survey_thread_nodes(matter, live_read=False))
         assert isinstance(survey, Survey)
         assert survey.raw_count == 7
         assert survey.skipped == []
 
     def test_zero_raw_nodes(self):
         matter = FakeMatter(nodes=[])
-        survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+        survey = _run(survey_thread_nodes(matter, live_read=False))
         assert survey.raw_count == 0
         assert survey.diags == []
         assert survey.skipped == []
 
     def test_non_mapping_raw_node_is_skipped_with_a_reason(self):
         matter = FakeMatter(nodes=["not-a-mapping", {"node_id": 1, "attributes": {"0/53/1": 5}}])
-        survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+        survey = _run(survey_thread_nodes(matter, live_read=False))
         assert survey.raw_count == 2
         assert len(survey.skipped) == 1
         assert "not a mapping" in survey.skipped[0]
@@ -283,7 +283,7 @@ class TestSurveyRawCountAndSkipped:
 
     def test_raw_node_without_node_id_is_skipped_with_a_reason(self):
         matter = FakeMatter(nodes=[{"attributes": {"0/53/1": 5}}])
-        survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+        survey = _run(survey_thread_nodes(matter, live_read=False))
         assert survey.raw_count == 1
         assert survey.diags == []
         assert len(survey.skipped) == 1
@@ -295,7 +295,7 @@ class TestSurveyRawCountAndSkipped:
         # Thread node (no cluster-0x35 key) must NOT land in `skipped` — that
         # would misreport a healthy Wi-Fi-only fabric as a parse failure.
         matter = FakeMatter(nodes=[{"node_id": 5, "attributes": {"0/40/1": "Vendor"}}])
-        survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+        survey = _run(survey_thread_nodes(matter, live_read=False))
         assert survey.raw_count == 1
         assert survey.diags == []
         assert survey.skipped == []
@@ -316,7 +316,7 @@ def test_live_partition_id_differing_from_cache_wins_and_is_labelled_live():
         return await orig_read(node_id, endpoint, cluster, attribute)
 
     matter.read = _read
-    survey = _run(survey_thread_nodes(matter, live_sleepy=True))
+    survey = _run(survey_thread_nodes(matter, live_read=True))
     live_2e = next(d for d in survey.diags if d.node_id == 0x2E)
     assert live_2e.source == "live"
     assert live_2e.partition_id == 999999
@@ -334,7 +334,7 @@ def test_live_partition_id_differing_from_cache_wins_and_is_labelled_live():
 
 def test_node_names_override_wins_when_given():
     matter = FakeMatter()
-    survey = _run(survey_thread_nodes(matter, live_sleepy=False, node_names={0x34: "Grillplats socket"}))
+    survey = _run(survey_thread_nodes(matter, live_read=False, node_names={0x34: "Grillplats socket"}))
     by_id = {d.node_id: d for d in survey.diags}
     assert by_id[0x34].name == "Grillplats socket"
     assert by_id[0x3F].name != "Grillplats socket"  # untouched — falls back normally
@@ -342,7 +342,7 @@ def test_node_names_override_wins_when_given():
 
 def test_name_falls_back_to_vendor_and_product_from_basic_information():
     matter = FakeMatter()
-    survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+    survey = _run(survey_thread_nodes(matter, live_read=False))
     by_id = {d.node_id: d for d in survey.diags}
     assert by_id[0x34].name == "IKEA of Sweden GRILLPLATS Plug"
     assert by_id[0x38].name == "Aqara Presence Multi-Sensor FP300"
@@ -355,7 +355,7 @@ def test_name_falls_back_to_the_hex_node_id_with_no_basic_information():
         "attributes": {"0/53/1": 3},  # RoutingRole only — no BasicInformation at all
     }
     matter = FakeMatter(nodes=[bare_node])
-    survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+    survey = _run(survey_thread_nodes(matter, live_read=False))
     assert survey.diags[0].name == "node 0x99"
 
 
@@ -369,7 +369,7 @@ def test_name_with_an_empty_string_falls_through_to_the_vendor_product_fallback(
         "attributes": {"0/53/1": 5, "0/40/1": "IKEA of Sweden", "0/40/3": "GRILLPLATS Plug"},
     }
     matter = FakeMatter(nodes=[node])
-    survey = _run(survey_thread_nodes(matter, live_sleepy=False, node_names={0x34: ""}))
+    survey = _run(survey_thread_nodes(matter, live_read=False, node_names={0x34: ""}))
     assert survey.diags[0].name == "IKEA of Sweden GRILLPLATS Plug"
 
 
@@ -395,7 +395,7 @@ class _RecordingRuntime:
 def test_run_survey_bridges_the_coroutine_through_a_concurrent_future():
     runtime = _RecordingRuntime()
     matter = FakeMatter(forbidden_nodes=ROUTER_IDS | NON_ROUTER_IDS)
-    survey = run_survey(runtime, matter, live_sleepy=False)
+    survey = run_survey(runtime, matter, live_read=False)
     assert isinstance(survey, Survey)
     assert {d.node_id for d in survey.diags} == ROUTER_IDS | NON_ROUTER_IDS
 
@@ -404,7 +404,7 @@ def test_run_survey_propagates_a_get_nodes_failure():
     runtime = _RecordingRuntime()
     matter = FakeMatter(get_nodes_error=RuntimeError("down"))
     with pytest.raises(RuntimeError, match="down"):
-        run_survey(runtime, matter, live_sleepy=False)
+        run_survey(runtime, matter, live_read=False)
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +441,7 @@ def test_run_survey_cancels_the_underlying_future_on_timeout(monkeypatch):
     runtime = _NeverCompletingRuntime()
     matter = FakeMatter()
     with pytest.raises(FuturesTimeoutError):
-        run_survey(runtime, matter, live_sleepy=False, per_node_timeout=0.0)
+        run_survey(runtime, matter, live_read=False, per_node_timeout=0.0)
     assert runtime.future.cancelled is True
 
 
@@ -508,7 +508,7 @@ class TestCacheAgeFields:
         # boring case, proven by running it through completely unchanged.
         # #344 review, A1: absence must ALSO stay silent — no parse_warning.
         matter = FakeMatter()
-        survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+        survey = _run(survey_thread_nodes(matter, live_read=False))
         assert survey.diags  # sanity: the fixture actually parsed
         for diag in survey.diags:
             assert diag.date_commissioned is None
@@ -525,7 +525,7 @@ class TestCacheAgeFields:
             if raw["node_id"] == 0x34:
                 raw["last_interview"] = "garbage"
         matter = FakeMatter(nodes=nodes)
-        survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+        survey = _run(survey_thread_nodes(matter, live_read=False))
         diag = next(d for d in survey.diags if d.node_id == 0x34)
         assert diag.last_interview is None
         assert any("last_interview unparseable: 'garbage'" in w for w in diag.parse_warnings)
@@ -542,7 +542,7 @@ class TestCacheAgeFields:
             if raw["node_id"] == 0x34:
                 raw["date_commissioned"] = {"not": "a timestamp"}
         matter = FakeMatter(nodes=nodes)
-        survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+        survey = _run(survey_thread_nodes(matter, live_read=False))
         diag = next(d for d in survey.diags if d.node_id == 0x34)
         assert diag.date_commissioned is None
         assert any("date_commissioned unparseable" in w for w in diag.parse_warnings)
@@ -554,7 +554,7 @@ class TestCacheAgeFields:
                 raw["date_commissioned"] = "2026-08-01T00:00:00Z"
                 raw["last_interview"] = 1_800_000_000
         matter = FakeMatter(nodes=nodes)
-        survey = _run(survey_thread_nodes(matter, live_sleepy=False))
+        survey = _run(survey_thread_nodes(matter, live_read=False))
         diag = next(d for d in survey.diags if d.node_id == 0x34)
         assert diag.date_commissioned is not None and diag.date_commissioned.year == 2026
         assert diag.last_interview is not None
@@ -564,7 +564,7 @@ class TestCacheAgeFields:
 
     def test_event_stamps_mapping_is_applied_missing_node_id_is_none(self):
         matter = FakeMatter()
-        survey = _run(survey_thread_nodes(matter, live_sleepy=False, event_stamps={0x27: 123.0}))
+        survey = _run(survey_thread_nodes(matter, live_read=False, event_stamps={0x27: 123.0}))
         by_id = {d.node_id: d for d in survey.diags}
         assert by_id[0x27].last_event_seen == 123.0
         assert by_id[0x2E].last_event_seen is None
@@ -572,7 +572,7 @@ class TestCacheAgeFields:
     def test_run_survey_forwards_event_stamps(self):
         runtime = _RecordingRuntime()
         matter = FakeMatter()
-        survey = run_survey(runtime, matter, live_sleepy=False, event_stamps={0x27: 42.0})
+        survey = run_survey(runtime, matter, live_read=False, event_stamps={0x27: 42.0})
         by_id = {d.node_id: d for d in survey.diags}
         assert by_id[0x27].last_event_seen == 42.0
 
@@ -591,7 +591,7 @@ def test_live_refresh_success_does_not_wipe_the_interview_and_event_stamps():
             raw["last_interview"] = "2026-08-27T10:00:00Z"
     matter = FakeMatter(nodes=nodes)
     survey = _run(survey_thread_nodes(
-        matter, live_sleepy=True, event_stamps={0x2E: 1_800_000_000.0}))
+        matter, live_read=True, event_stamps={0x2E: 1_800_000_000.0}))
     diag = next(d for d in survey.diags if d.node_id == 0x2E)
     assert diag.source == "live", "sanity: the live refresh must actually have succeeded"
     assert diag.last_interview is not None and diag.last_interview.year == 2026

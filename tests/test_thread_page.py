@@ -6,7 +6,7 @@ Two halves, mirroring ``test_pairing_menu.py``'s split for the pairing page:
   (``tests/fixtures/thread_mesh/nodes.json``, the same 7 nodes
   ``test_thread_mesh.py``/``test_thread_survey.py`` use).
 * ``http_thread_page`` — the IWS glue in :mod:`http_api_mixin`: GET-only,
-  ``?live=1`` reaching ``thread_survey.run_survey`` with ``live_sleepy=True``,
+  ``?live=1`` reaching ``thread_survey.run_survey`` with ``live_read=True``,
   and a matter-server failure rendering as the page's own banner rather than a
   500 or a silently empty map.
 """
@@ -233,7 +233,7 @@ def test_only_GET_is_served(plug):
     assert reply["headers"]["Cache-Control"] == "no-store"
 
 
-def test_live_1_calls_run_survey_with_live_sleepy_true(plug, monkeypatch):
+def test_live_1_calls_run_survey_with_live_read_true(plug, monkeypatch):
     # #334 post-review, B3.11: the fake used to return [] — which meant this
     # test could never actually catch a broken ?live=1 rendering path (the
     # page would just show "no Thread devices" either way). Real diags make
@@ -241,8 +241,8 @@ def test_live_1_calls_run_survey_with_live_sleepy_true(plug, monkeypatch):
     calls = []
     diags = _fixture_diags()
 
-    def _fake_run_survey(runtime, matter, *, live_sleepy, node_names=None, **kwargs):
-        calls.append(live_sleepy)
+    def _fake_run_survey(runtime, matter, *, live_read, node_names=None, **kwargs):
+        calls.append(live_read)
         return Survey(diags=diags, raw_count=len(diags), skipped=[])
 
     monkeypatch.setattr("http_api_mixin.thread_survey.run_survey", _fake_run_survey)
@@ -253,12 +253,12 @@ def test_live_1_calls_run_survey_with_live_sleepy_true(plug, monkeypatch):
     assert "GRILLPLATS Plug" in reply["content"]
 
 
-def test_no_live_query_calls_run_survey_with_live_sleepy_false(plug, monkeypatch):
+def test_no_live_query_calls_run_survey_with_live_read_false(plug, monkeypatch):
     calls = []
     diags = _fixture_diags()
 
-    def _fake_run_survey(runtime, matter, *, live_sleepy, node_names=None, **kwargs):
-        calls.append(live_sleepy)
+    def _fake_run_survey(runtime, matter, *, live_read, node_names=None, **kwargs):
+        calls.append(live_read)
         return Survey(diags=diags, raw_count=len(diags), skipped=[])
 
     monkeypatch.setattr("http_api_mixin.thread_survey.run_survey", _fake_run_survey)
@@ -658,7 +658,7 @@ def test_indigo_device_names_reach_the_page(plug, monkeypatch):
     plug.device_sync.lookup.return_value = None  # no matterNode device — falls back to the join
     captured_names = {}
 
-    def _fake_run_survey(runtime, matter, *, live_sleepy, node_names=None, **kwargs):
+    def _fake_run_survey(runtime, matter, *, live_read, node_names=None, **kwargs):
         captured_names.update(node_names or {})
         return Survey(diags=diags, raw_count=len(diags), skipped=[])
 
@@ -708,9 +708,9 @@ def test_live_timeout_falls_back_to_cache_and_says_so(plug, monkeypatch):
     diags = _fixture_diags()
     calls = []
 
-    def _fake_run_survey(runtime, matter, *, live_sleepy, node_names=None, **kwargs):
-        calls.append(live_sleepy)
-        if live_sleepy:
+    def _fake_run_survey(runtime, matter, *, live_read, node_names=None, **kwargs):
+        calls.append(live_read)
+        if live_read:
             from concurrent.futures import TimeoutError as FuturesTimeoutError  # pylint: disable=import-outside-toplevel
             raise FuturesTimeoutError()
         return Survey(diags=diags, raw_count=len(diags), skipped=[])
@@ -733,7 +733,7 @@ def test_live_timeout_falls_back_to_cache_and_says_so(plug, monkeypatch):
 def test_live_timeout_then_cache_failure_falls_back_to_the_bare_banner(plug, monkeypatch):
     from concurrent.futures import TimeoutError as FuturesTimeoutError  # pylint: disable=import-outside-toplevel
 
-    def _fake_run_survey(runtime, matter, *, live_sleepy, node_names=None, **kwargs):
+    def _fake_run_survey(runtime, matter, *, live_read, node_names=None, **kwargs):
         raise FuturesTimeoutError()
 
     monkeypatch.setattr("http_api_mixin.thread_survey.run_survey", _fake_run_survey)
@@ -750,8 +750,8 @@ def test_a_plain_cached_request_timing_out_does_not_retry(plug, monkeypatch):
     from concurrent.futures import TimeoutError as FuturesTimeoutError  # pylint: disable=import-outside-toplevel
     calls = []
 
-    def _fake_run_survey(runtime, matter, *, live_sleepy, node_names=None, **kwargs):
-        calls.append(live_sleepy)
+    def _fake_run_survey(runtime, matter, *, live_read, node_names=None, **kwargs):
+        calls.append(live_read)
         raise FuturesTimeoutError()
 
     monkeypatch.setattr("http_api_mixin.thread_survey.run_survey", _fake_run_survey)
@@ -772,7 +772,7 @@ def test_live_path_uses_the_pages_own_per_node_timeout(plug, monkeypatch):
     import http_api_mixin  # pylint: disable=import-outside-toplevel
     captured = {}
 
-    def _fake_run_survey(runtime, matter, *, live_sleepy, per_node_timeout=None, node_names=None, **kwargs):
+    def _fake_run_survey(runtime, matter, *, live_read, per_node_timeout=None, node_names=None, **kwargs):
         captured["per_node_timeout"] = per_node_timeout
         return Survey(diags=[], raw_count=0, skipped=[])
 
@@ -791,7 +791,7 @@ def test_event_stamps_are_forwarded_to_run_survey(plug, monkeypatch):
     plug.device_sync.thread_event_stamps.return_value = {0x34: 555.0}
     captured = {}
 
-    def _fake_run_survey(runtime, matter, *, live_sleepy, event_stamps=None, node_names=None, **kwargs):
+    def _fake_run_survey(runtime, matter, *, live_read, event_stamps=None, node_names=None, **kwargs):
         captured["event_stamps"] = event_stamps
         return Survey(diags=[], raw_count=0, skipped=[])
 

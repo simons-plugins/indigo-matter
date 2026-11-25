@@ -121,7 +121,7 @@ class Survey:
 async def survey_thread_nodes(  # pylint: disable=too-many-locals
     matter: Any,
     *,
-    live_sleepy: bool,
+    live_read: bool,
     per_node_timeout: float = ATTRIBUTE_TIMEOUT,
     node_names: Optional[Mapping[int, str]] = None,
     event_stamps: Optional[Mapping[int, float]] = None,
@@ -136,7 +136,7 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
     fine but has no cluster-0x35 key at all (not a Thread node) is simply excluded
     — that is not a skip, it is a correct "not mine".
 
-    When ``live_sleepy`` is true, every parsed diag that is NOT a router
+    When ``live_read`` is true, every parsed diag that is NOT a router
     (:attr:`~thread_mesh.NodeDiag.is_router`) is live-read concurrently, each
     bounded by its own ``per_node_timeout``. Routers are never touched: a router is
     mains-powered and polled continuously already, so its cache is not the stale
@@ -201,7 +201,7 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
         )
         raw_stamp_values_by_node[node_id] = (raw_date_commissioned, raw_last_interview)
 
-    if live_sleepy:
+    if live_read:
         targets = [diag for diag in diags if not diag.is_router]
         if targets:
             results = await asyncio.gather(
@@ -323,7 +323,7 @@ def run_survey(
     runtime: Any,
     matter: Any,
     *,
-    live_sleepy: bool,
+    live_read: bool,
     per_node_timeout: float = ATTRIBUTE_TIMEOUT,
     node_names: Optional[Mapping[int, str]] = None,
     event_stamps: Optional[Mapping[int, float]] = None,
@@ -344,7 +344,7 @@ def run_survey(
     nobody is waiting for any more.
     """
     future = runtime.submit(
-        survey_thread_nodes(matter, live_sleepy=live_sleepy, per_node_timeout=per_node_timeout,
+        survey_thread_nodes(matter, live_read=live_read, per_node_timeout=per_node_timeout,
                             node_names=node_names, event_stamps=event_stamps)
     )
     try:
