@@ -28,8 +28,8 @@ check moves.
   once when you ask for the pairing codes. A paired bridge is unaffected.
 - Fix (issue #203): restarting the bridge node mid-countdown left the device on for
   good, because the countdown timer lived only in memory. The bridge now records each
-  timed-on countdown it starts (its end time, kept with the endpoint's record in
-  `endpoint-map.json`) and clears that record when the countdown ends, when the device
+  timed-on countdown it starts (its end time, in a small `countdowns.json` beside
+  `endpoint-map.json`, which countdown activity never rewrites) and clears that record when the countdown ends, when the device
   goes off by any route, and when the endpoint is removed or freshly exported. After the
   next attach it turns off, in Indigo, a device that reads on with a recorded countdown
   and no timer running: at once if the end time has passed, otherwise when it does. It
@@ -37,9 +37,11 @@ check moves.
   the On-time attribute, or a device you re-export while its old countdown was
   pending, is left alone. The off is sent only after the attach has completed, carries a
   reason, and is logged in the Indigo log (`turning "<name>" off — its timed-on countdown
-  was lost when the bridge node restarted`). It is not considered done until Indigo
-  confirms the device is off, so an off that was never executed is sent again at the next
-  attach; a recovery that fails is reported in the Indigo log. A countdown that is still
+  was lost when the bridge node restarted`). The recovery never marks itself done: Indigo's confirmation that
+  the device is off does, so an off that was never executed is sent again at the next attach
+  (a countdown that ends naturally while the plugin is detached is the one case where the off is
+  dropped and the device stays on, as before); a recovery that fails is reported in the Indigo log. A controller changing the On-time
+  of a running countdown moves or cancels the record with it. A countdown that is still
   running (a plugin-only reconnect) and a device Indigo reports off are left alone.
   **Known limitations:** countdowns started under bridge 0.17.x have no recorded end time
   and are not recovered; and if you turn the device off and on again in Indigo while the

@@ -47,6 +47,11 @@ import { type LiveComposition, planReconcile } from "./reconcile.js";
  */
 export const REMOVAL_PACING_MS = 100;
 
+/** A countdown cannot exceed 0xFFFE tenths of a second (OnWithTimedOff's `OnTime`). */
+const MAX_COUNTDOWN_MS = 0xfffe * 100;
+/** How far a tick-by-tick `onTime` may sit from the recorded deadline before it is a real change. */
+const TICK_TOLERANCE_MS = 500;
+
 interface LiveEndpoint {
     endpoint: Endpoint;
     role: RoleValue;
@@ -155,6 +160,8 @@ export class EndpointRegistry {
     readonly #now: () => number;
     /** #203 — one plain timer per published identity whose lost countdown ends in the future. */
     readonly #pendingOffs = new Map<string, NodeJS.Timeout>();
+    /** Identities whose off was sent this process and is not yet confirmed — a second send is a retry. */
+    readonly #sentOffs = new Set<string>();
     /** Tail of the mutation chain — see {@link serialize}. */
     #queue: Promise<void> = Promise.resolve();
     /**
@@ -365,8 +372,10 @@ export class EndpointRegistry {
      * * deadline passed: send the off now;
      * * deadline ahead: send it when it comes (a plain timer; matter.js's own
      *   countdown is deliberately not restarted);
-     * * nothing is zeroed and no marker is cleared here. Both clear only when
-     *   Indigo CONFIRMS the off (`applyIndigoOnOff(false)` → `super.off()`), so
+     * * nothing is zeroed and no marker is cleared by the sweep itself. They clear when Indigo
+     *   CONFIRMS the off (`applyIndigoOnOff(false)` → `super.off()`) — or, as before, when the
+     *   countdown ends naturally or an ecosystem turns it off (`off()`), which with the plugin
+     *   detached drops that off and leaves the device on (fails toward on) — so
      *   an off the plugin never executed stays stranded and goes out again at
      *   the next attach.
      *
@@ -396,7 +405,17 @@ export class EndpointRegistry {
             if (reading === undefined) {
                 return;
             }
-            const deadline = this.#markers.countdownDeadline(live.publishedAs);
+            let deadline = this.#markers.countdownDeadline(live.publishedAs);
+            if (deadline !== undefined && (!Number.isFinite(deadline) || deadline - this.#now() > MAX_COUNTDOWN_MS)) {
+                // No countdown lasts this long, so the file or the clock that wrote it is wrong. Acting on it
+                // would overflow setTimeout (~24.8 days) into an immediate off, so it is discarded instead.
+                this.#log(
+                    `Endpoint ${indigoDeviceId}: a recorded countdown deadline ${deadline} is implausible (more than ` +
+                        `${MAX_COUNTDOWN_MS / 1000}s ahead) — discarded, nothing is turned off (#203)`,
+                );
+                this.clearMarker(live.publishedAs);
+                deadline = undefined;
+            }
             if (!reading.onOff) {
                 if (reading.timerRunning) {
                     return; // an ecosystem countdown Indigo has not confirmed yet: leave it alone
@@ -421,10 +440,12 @@ export class EndpointRegistry {
                     );
                 } else {
                     this.cancelPendingOff(live.publishedAs);
+                    const retry = this.#sentOffs.has(live.publishedAs);
+                    this.#sentOffs.add(live.publishedAs);
                     this.#log(
-                        `Endpoint ${indigoDeviceId}: a timed-on countdown was lost across a restart — telling ` +
-                            "Indigo to turn the device off (#203); it stays stranded, and is re-sent at the next " +
-                            "attach, until Indigo confirms",
+                        `Endpoint ${indigoDeviceId}: a timed-on countdown was lost across a restart — ` +
+                            `${retry ? "retrying the off Indigo has not confirmed" : "telling Indigo to turn the device off"} ` +
+                            "(#203); it stays stranded, and is re-sent at the next attach, until Indigo confirms",
                     );
                     this.options.emit({
                         indigoDeviceId,
@@ -468,6 +489,7 @@ export class EndpointRegistry {
     }
 
     private clearMarker(publishedAs: string): void {
+        this.#sentOffs.delete(publishedAs);
         this.#markers.clearCountdown(publishedAs);
         this.cancelPendingOff(publishedAs);
     }
@@ -484,6 +506,21 @@ export class EndpointRegistry {
                 }
             },
             clear: () => this.clearMarker(publishedAs),
+            sync: remainingMs => {
+                const current = this.#markers.countdownDeadline(publishedAs);
+                if (current === undefined) {
+                    return; // only follows a marker that exists; starting one is `mark`'s job
+                }
+                if (remainingMs === undefined) {
+                    this.clearMarker(publishedAs);
+                    return;
+                }
+                const target = this.#now() + remainingMs;
+                if (Math.abs(target - current) > TICK_TOLERANCE_MS) {
+                    this.#markers.setCountdown(publishedAs, target);
+                    this.cancelPendingOff(publishedAs);
+                }
+            },
         };
     }
 

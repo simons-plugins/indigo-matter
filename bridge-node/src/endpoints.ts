@@ -607,6 +607,12 @@ export interface CountdownHooks {
     mark(remainingMs: number): void;
     /** The countdown is over (expired, cancelled, or the endpoint went off). */
     clear(): void;
+    /**
+     * `onTime` changed. `remainingMs` is what a countdown that is really running now has left, or
+     * `undefined` when no timer is running (a controller wrote 0 or 0xFFFF). Only ever moves or drops a marker
+     * that exists; ordinary ticks, which agree with it, cost nothing.
+     */
+    sync(remainingMs: number | undefined): void;
 }
 
 /** The hooks for the endpoint a behaviour is running on, if one is registered. */
@@ -852,8 +858,9 @@ export class IndigoOnOffServer extends OnOffServer.with("Lighting") {
                         "onOff coupling writing ahead of Indigo) but is not the only one left.",
                 );
             }
-            if (!value) {
-                // Already off and nothing counting: no countdown can be pending (#203).
+            if (!value && !internal?.timedOnTimer?.isRunning) {
+                // Already off and nothing counting: no countdown can be pending (#203). With a timer running
+                // this is the replayed push above, and the marker of that real countdown stays.
                 countdownHooksFor(this.endpoint.id)?.clear();
             }
             return;
@@ -866,6 +873,32 @@ export class IndigoOnOffServer extends OnOffServer.with("Lighting") {
             countdownHooksFor(this.endpoint.id)?.clear();
         }
         return value ? super.on() : super.off();
+    }
+
+    override initialize(): MaybePromise {
+        // After the base class's own `#stopHeldTimer` reaction (registered in `super.initialize()`), so by
+        // the time this runs the timer reflects a controller's OnTime write.
+        const result = super.initialize();
+        this.reactTo(this.events.onTime$Changed, this.#onTimeChanged);
+        return result;
+    }
+
+    /**
+     * #203 — `onTime` changed. Tick decrements agree with the marker and are free; a controller's write
+     * of 0xFFFF or 0 stops the timer (the marker goes), and any other value re-targets the running one (the
+     * marker moves with it). Without this a later plugin reattach acts on a deadline that is no longer true.
+     */
+    #onTimeChanged(): void {
+        const hooks = countdownHooksFor(this.endpoint.id);
+        if (hooks === undefined) {
+            return;
+        }
+        const { onTime } = this.state;
+        if (this.timerRunning() && typeof onTime === "number" && onTime > 0 && onTime !== 0xffff) {
+            hooks.sync(onTime * 100);
+        } else if (!this.timerRunning()) {
+            hooks.sync(undefined);
+        }
     }
 
     /**

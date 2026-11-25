@@ -1278,10 +1278,11 @@ itself rather than relaying an ecosystem may carry `args.reason`. The only value
 the node stopped, matter.js's timer died with it, and the device is still on. A client that ignores
 `reason` simply turns the device off, which is the whole of the required behaviour; the plugin
 additionally logs one INFO line naming the device. The node records each countdown it starts as a
-wall-clock deadline (`countdownDeadline` on that endpoint's `endpoint-map.json` record) and acts only
+wall-clock deadline (in `countdowns.json` beside `endpoint-map.json`, keyed by `publishedAs`; deliberately not in the
+map, which is the identity witness) and acts only
 when that marker is present, the endpoint reads on, and no timer is running — an `OnTime` attribute
 write never starts a timer and so never creates a marker. It does **not** consider the off done:
-the marker and `onTime` clear only when the plugin's `set_state {onOff: false}` confirms it, so an
+the sweep itself never clears the marker or zeroes `onTime`: the plugin's `set_state {onOff: false}` does, so an
 off the plugin never executed is sent again at the next attach. A deadline still in the future is
 honoured with a plain timer. A recovery that fails is reported through `StatusReport.warnings`
 (§4.3). Golden frame: `command_on_off_countdown_lost`.

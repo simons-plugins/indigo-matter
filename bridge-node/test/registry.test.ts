@@ -3677,6 +3677,123 @@ describe("a countdown across a node restart (issue #203)", () => {
         }
     });
 
+    describe("a controller writing OnTime mid-countdown (I1)", () => {
+        // A write stops matter.js's timer for 0 and 0xFFFF (`#stopHeldTimer`) and re-targets a running one
+        // for any other value. Either way the marker must follow, or a later reattach/restart acts on a
+        // deadline that is no longer true. The reattach case needs no restart at all.
+        const cases: { name: string; onTime: number; marker: (h: Harness) => number | undefined }[] = [
+            { name: "0xFFFF (hold on)", onTime: 0xffff, marker: () => undefined },
+            { name: "0 (cancel, stay on)", onTime: 0, marker: () => undefined },
+            { name: "a larger value", onTime: 1200, marker: h => h.clock.now + 120_000 },
+            { name: "a smaller value", onTime: 300, marker: h => h.clock.now + 30_000 },
+        ];
+        for (const { name, onTime, marker } of cases) {
+            it(`${name}: the marker follows, so a plain reattach sends nothing`, async () => {
+                const h = await harness();
+                try {
+                    await h.registry.reconcile([on(1)], false);
+                    h.recordIdentities();
+                    await h.registry.setState(1, { onOff: true });
+                    await startCountdown(part(h, 1), 600);
+                    assert.equal(markerOf(h, 1), h.clock.now + 60_000);
+                    h.commands.length = 0;
+                    await part(h, 1).set({ onOff: { onTime } } as never);
+                    await waitFor(() => markerOf(h, 1) === marker(h), 2000);
+                    h.clock.now += 3_600_000; // far past every deadline involved
+                    await h.registry.reconcile([on(1)], false);
+                    await h.registry.sweepCountdowns();
+                    assert.deepEqual(h.commands, [], "no unprompted off at the old deadline");
+                } finally {
+                    await h.close();
+                }
+            });
+
+            it(`${name}: the marker follows, so a restart acts on the new deadline`, async () => {
+                const storagePath = mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-203-"));
+                scratchRoots.push(storagePath);
+                const first = await harness({ storagePath });
+                try {
+                    await first.registry.reconcile([on(1)], false);
+                    first.recordIdentities();
+                    await first.registry.setState(1, { onOff: true });
+                    await startCountdown(part(first, 1), 600); // old deadline t0 + 60 s
+                    await part(first, 1).set({ onOff: { onTime } } as never);
+                    await waitFor(() => markerOf(first, 1) === marker(first), 2000);
+                } finally {
+                    await first.close();
+                }
+                const second = await reboot(storagePath, [on(1)]);
+                try {
+                    if (onTime === 300) {
+                        second.clock.now += 45_000; // past the NEW 30 s deadline, before the old 60 s one
+                        await second.registry.sweepCountdowns();
+                        assert.deepEqual(second.commands, [OFF_WITH_REASON(1)], "the shorter countdown really ended");
+                    } else if (onTime === 1200) {
+                        second.clock.now += 90_000; // past the OLD deadline, before the new 120 s one
+                        await second.registry.sweepCountdowns();
+                        assert.deepEqual(second.commands, [], "the extended countdown has not ended");
+                    } else {
+                        second.clock.now += 3_600_000;
+                        await second.registry.sweepCountdowns();
+                        assert.deepEqual(second.commands, [], "a cancelled / held countdown is never ended");
+                    }
+                } finally {
+                    await second.close();
+                }
+            });
+        }
+    });
+
+    it("an Indigo push does not clear a marker while the countdown it is replaying is genuinely running (S1)", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([off(1)], false);
+            h.recordIdentities();
+            // An ecosystem OnWithTimedOff: attribute still off (Indigo has not confirmed), timer running, marker set.
+            await startCountdown(part(h, 1), 600);
+            const marked = markerOf(h, 1);
+            assert.ok(marked !== undefined);
+            await h.registry.setState(1, { onOff: false }); // the replayed off, equal to the attribute
+            assert.equal(markerOf(h, 1), marked, "a replayed off must not drop the marker of a running countdown");
+            await h.registry.setState(1, { onOff: true }); // Indigo confirms the ON
+            assert.equal(markerOf(h, 1), marked, "confirming ON leaves it alone");
+            await h.registry.setState(1, { onOff: false }); // Indigo off ends it
+            assert.equal(markerOf(h, 1), undefined);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("a deadline further out than a countdown can last is discarded with a warning, never turned into an off (S2)", async () => {
+        const storagePath = await restartMidCountdown();
+        const second = await reboot(storagePath, [on(1)]);
+        try {
+            second.countdowns.setCountdown(uniqueIdFor(1), second.clock.now + 40 * 24 * 3600 * 1000);
+            await second.registry.sweepCountdowns();
+            await new Promise(resolve => setTimeout(resolve, 200));
+            assert.deepEqual(second.commands, [], "an overflowing setTimeout would have fired an off after 1 ms");
+            assert.equal(markerOf(second, 1), undefined, "discarded");
+            assert.ok(second.logs.some(line => /^Endpoint 1:/.test(line) && /implausible/.test(line)));
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("a re-sent off says it is retrying (S4)", async () => {
+        const storagePath = await restartMidCountdown();
+        const second = await reboot(storagePath, [on(1)]);
+        try {
+            second.clock.now += 5000;
+            await second.registry.sweepCountdowns();
+            assert.ok(!second.logs.some(line => /retrying/.test(line)), "the first send is not a retry");
+            await second.registry.reconcile([on(1)], false);
+            await second.registry.sweepCountdowns();
+            assert.ok(second.logs.some(line => /^Endpoint 1:/.test(line) && /retrying/.test(line)));
+        } finally {
+            await second.close();
+        }
+    });
+
     it("a deadline still in the future at restart sends nothing until it passes, then one off", async () => {
         const storagePath = await restartMidCountdown([1], 10); // marker = t0 + 1000ms
         const second = await reboot(storagePath, [on(1)]);
