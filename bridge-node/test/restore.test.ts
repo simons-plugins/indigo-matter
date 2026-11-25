@@ -23,9 +23,10 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { after, describe, it, mock } from "node:test";
 
 import { type Endpoint, Logger, Seconds, ServerNode } from "@matter/main";
@@ -1975,6 +1976,44 @@ describe("the commissioning window's timeout agrees with matter.js 0.18's own ti
     });
 });
 
+
+describe("upgrade: a 0.17.x storage directory", () => {
+    // Written by bridge 0.17.5 on matter.js 0.17.8 — see the README beside it for how.
+    const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "test", "fixtures", "bridge-0.17.5-storage");
+
+    it("boots on a copy, restores the same endpoint numbers, and keeps a persisted attribute", async () => {
+        const storagePath = storage();
+        cpSync(FIXTURE, storagePath, { recursive: true });
+        rmSync(join(storagePath, "README.md"));
+        rmSync(join(storagePath, "generate.mjs"));
+        const written = readMap(storagePath);
+        const session = await boot(storagePath);
+        try {
+            const lamp = childOf(session.bridge.server, 111);
+            const dimmer = childOf(session.bridge.server, 222);
+            assert.ok(lamp !== undefined && dimmer !== undefined, "both accessories restored before any attach");
+            assert.equal(Number(lamp.number), written.endpoints[uniqueIdFor(111)]!.number);
+            assert.equal(Number(dimmer.number), written.endpoints[uniqueIdFor(222)]!.number);
+            assert.equal(
+                (dimmer.stateOf("levelControl") as { currentLevel?: number }).currentLevel,
+                51,
+                "the level 0.17.8 persisted (20%) is still there",
+            );
+            const { status } = await attach(session.client, "a1", [
+                { indigoDeviceId: 111, role: "onOffLight", label: "Fixture Lamp", reachable: true, states: { onOff: false }, options: {} },
+                { indigoDeviceId: 222, role: "dimmableLight", label: "Fixture Dimmer", reachable: true, states: { onOff: true, level: 20 }, options: {} },
+            ]);
+            assert.equal(status.error_code, undefined, JSON.stringify(status));
+            assert.deepEqual(
+                (status.result as { drift: unknown[] }).drift,
+                [],
+                "no endpoint-number drift: nothing a paired ecosystem knows has moved",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+});
 
 describe("restore binds to the DRIVING device, and never to a retired identity (issue #240)", () => {
     it("restores an accessory bound to the map's deviceId, not to its key", async () => {
