@@ -3,6 +3,30 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.36.0 — The Thread mesh report reads routers live and stops calling an unreachable device "detached"
+
+- Fix (issue #348): **Report Thread mesh…** with the live-read option on (and the
+  Thread page's **Refresh (live)**) now reads every node, routers included. Before,
+  routers were skipped on the assumption that a mains-powered node's cache is fresh,
+  but a router's neighbour and route tables are never refreshed by matter-server's
+  subscription, so they could be hours out of date. The checkbox is now **Live-read
+  every node first**; `?live=1` is unchanged. Reads still run at the same time, so a
+  live report takes at most about 50 s however many routers you have.
+- Fix (issue #348): a child a router's cache listed but its live table no longer does
+  is not drawn on the map any more; the node's block says so ("child 0x5C04 ...
+  departed, not drawn"). If the router's live read fails, its cached children are
+  left exactly as they were.
+- Fix (issue #348): a router whose live read fails or times out is listed under
+  **Unreadable** and now carries the `stale` note ("cached - the live read failed ..."),
+  instead of its cached tables passing as current.
+- Fix (issue #369): the Flags section no longer says `detached` for a node the controller
+  merely reports as unavailable. `detached` now means the node's Thread role is
+  Unassigned, and nothing else. A device Indigo cannot reach gets a new `unreachable`
+  flag that says the controller has no working session to it (not that it left the
+  Thread network) and that the Thread data shown for it is cached. It is still BAD, so
+  the `threadHealth` state a trigger might watch does not change. A node that is both
+  Unassigned and unavailable gets both flags.
+
 ## 2026.34.1 — Stopping the bridge node on purpose is no longer reported as a failure
 
 - Fix (issue #366): an un-export that had completed was repeated on every plugin
