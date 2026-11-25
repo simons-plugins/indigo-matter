@@ -331,6 +331,14 @@ export interface RemoveResult {
     removed: boolean;
 }
 
+/**
+ * #203 — the `reason` the node puts in the `args` of an `onOff` command it
+ * raises ITSELF (not an ecosystem), to end a timed-on countdown a node restart
+ * lost. Additive and ignorable: a plugin that does not read it just turns the
+ * device off. BRIDGE_PROTOCOL §5.
+ */
+export const COUNTDOWN_LOST_REASON = "countdown_lost_on_restart";
+
 /** §5 `command` — the `data` of an ecosystem-originated action. */
 export interface CommandEventData extends Record<string, unknown> {
     indigoDeviceId: number;
@@ -575,6 +583,14 @@ export interface BridgeFacade {
      * knows the live set.
      */
     reconcile(endpoints: readonly EndpointSpec[], replaceAll: boolean): Promise<StatusReport>;
+    /**
+     * #203 — the step that follows a SUCCESSFUL `attach` once its response is on
+     * the wire: end any timed-on countdown a node restart lost. Separate from
+     * {@link reconcile} so the commands it raises reach a plugin that has
+     * finished attaching (see `EndpointRegistry.sweepCountdowns`). Never throws
+     * into the connection; failures are reported through `warnings`.
+     */
+    afterAttach(): Promise<void>;
     /** §3.2 — create-or-update. Rejects a role change with `role_change` (§4.1). */
     upsertEndpoint(spec: EndpointSpec): Promise<UpsertResult>;
     /**

@@ -37,7 +37,7 @@ import {
     type EndpointMapFile,
     type EndpointMapFileV1,
 } from "../src/endpoint-map.js";
-import { uniqueIdFor } from "../src/endpoints.js";
+import { IndigoOnOffServer, uniqueIdFor } from "../src/endpoints.js";
 import { BridgeNode, ENDPOINT_COUNT_ADVISORY, ENDPOINT_COUNT_WARNING, matterJsVersion } from "../src/node.js";
 import { ErrorCode, PROTOCOL_VERSION, RefuseReason } from "../src/protocol.js";
 import { BridgeWsServer } from "../src/ws-server.js";
@@ -1661,8 +1661,9 @@ describe("issue #355: un-export, restart, re-export", () => {
 });
 
 describe("issue #203: a countdown lost across a real node restart", () => {
-    const commandsIn = (events: Record<string, unknown>[]): unknown[] =>
-        events.filter(frame => frame.event === "command").map(frame => frame.data);
+    const REASON_OFF = { indigoDeviceId: KITCHEN, command: "onOff", args: { value: false, reason: "countdown_lost_on_restart" } };
+    const commandsIn = (frames: Record<string, unknown>[]): unknown[] =>
+        frames.filter(frame => frame.event === "command").map(frame => frame.data);
 
     async function setStateOne(client: TestClient, messageId: string, states: Record<string, unknown>): Promise<void> {
         client.send({
@@ -1679,7 +1680,21 @@ describe("issue #203: a countdown lost across a real node restart", () => {
         }
     }
 
-    /** Export the kitchen lamp ON (persisted), start a 3s ecosystem countdown, then stop the node. */
+    /** Frames that arrive within `ms` of now — "nothing more came" is only meaningful with a wait. */
+    async function framesWithin(client: TestClient, ms: number): Promise<Record<string, unknown>[]> {
+        const frames: Record<string, unknown>[] = [];
+        const until = Date.now() + ms;
+        while (Date.now() < until) {
+            try {
+                frames.push(await client.next(Math.max(until - Date.now(), 1)));
+            } catch {
+                break;
+            }
+        }
+        return frames;
+    }
+
+    /** Export the kitchen lamp ON (persisted), start an ecosystem countdown, then stop the node. */
     async function restartMidCountdown(storagePath: string): Promise<void> {
         const first = await boot(storagePath);
         try {
@@ -1694,26 +1709,52 @@ describe("issue #203: a countdown lost across a real node restart", () => {
                     offWaitTime: 0,
                 }),
             );
+            assert.ok(
+                readMap(storagePath).endpoints[uniqueIdFor(KITCHEN)]?.countdownDeadline !== undefined,
+                "the countdown must be recorded on disk",
+            );
         } finally {
             await first.close();
         }
     }
 
-    it("the attach after the restart (endpoint restored from the map) turns the device off once, and a second restart does not", async () => {
+    /** Move the recorded deadline, or drop it, so the restart's clock position is not at the mercy of boot time. */
+    function setDeadline(storagePath: string, deadline: number | undefined): void {
+        const map = readMap(storagePath);
+        const record = map.endpoints[uniqueIdFor(KITCHEN)]!;
+        if (deadline === undefined) {
+            delete record.countdownDeadline;
+        } else {
+            record.countdownDeadline = deadline;
+        }
+        writeFileSync(join(storagePath, ENDPOINT_MAP_FILE), JSON.stringify(map));
+    }
+
+    it("sends the off only AFTER the attach response, once, with its reason; a confirmed off ends it for good", async () => {
         const storagePath = storage();
         await restartMidCountdown(storagePath);
+        setDeadline(storagePath, Date.now() - 1000);
 
         const second = await boot(storagePath);
         try {
             assert.ok(childOf(second.bridge.server, KITCHEN) !== undefined, "restored from the map before attach");
-            const { events } = await attach(second.client, "a2", [{ ...KITCHEN_SPEC, states: { onOff: true } }]);
-            assert.deepEqual(
-                commandsIn(events),
-                [{ indigoDeviceId: KITCHEN, command: "onOff", args: { value: false } }],
-                "after attach, so the frame is delivered rather than dropped",
-            );
-            // The plugin's confirmation of the off it just performed.
+            const { status, events } = await attach(second.client, "a2", [{ ...KITCHEN_SPEC, states: { onOff: true } }]);
+            assert.equal(status.error_code, undefined, JSON.stringify(status));
+            assert.deepEqual(events, [], "NOTHING may precede the attach response — the plugin is not attached yet");
+            const after = await framesWithin(second.client, 1500);
+            assert.deepEqual(commandsIn(after), [REASON_OFF], "exactly one off, after the response, with its reason");
+            assert.equal(after.length, 1);
+
+            // Never confirmed: the next attach on the same node sends it again.
+            const again = await attach(second.client, "a2b", [{ ...KITCHEN_SPEC, states: { onOff: true } }]);
+            assert.deepEqual(again.events, []);
+            assert.deepEqual(commandsIn(await framesWithin(second.client, 1000)), [REASON_OFF], "retried");
+
+            // The plugin's confirmation of the off it performed.
             await setStateOne(second.client, "s2", { onOff: false });
+            const confirmed = await attach(second.client, "a2c", [{ ...KITCHEN_SPEC, states: { onOff: false } }]);
+            assert.deepEqual(confirmed.events, []);
+            assert.deepEqual(await framesWithin(second.client, 500), [], "confirmed: nothing more");
         } finally {
             await second.close();
         }
@@ -1721,23 +1762,68 @@ describe("issue #203: a countdown lost across a real node restart", () => {
         const third = await boot(storagePath);
         try {
             const { events } = await attach(third.client, "a3", [{ ...KITCHEN_SPEC, states: { onOff: false } }]);
-            assert.deepEqual(commandsIn(events), [], "nothing left to recover on the next restart");
+            assert.deepEqual(events, []);
+            assert.deepEqual(await framesWithin(third.client, 500), [], "nothing left to recover on the next restart");
         } finally {
             await third.close();
         }
     });
 
-    it("an attach that says the device is off emits nothing", async () => {
+    it("an attach that says the device is off sends nothing", async () => {
         const storagePath = storage();
         await restartMidCountdown(storagePath);
+        setDeadline(storagePath, Date.now() - 1000);
 
         const second = await boot(storagePath);
         try {
             const { events } = await attach(second.client, "a2", [{ ...KITCHEN_SPEC, states: { onOff: false } }]);
-            assert.deepEqual(commandsIn(events), []);
+            assert.deepEqual(events, []);
+            assert.deepEqual(await framesWithin(second.client, 800), []);
             const kitchen = childOf(second.bridge.server, KITCHEN);
             assert.equal((kitchen?.stateOf("onOff") as { onTime?: number } | undefined)?.onTime, 0);
+            assert.equal(readMap(storagePath).endpoints[uniqueIdFor(KITCHEN)]?.countdownDeadline, undefined);
         } finally {
+            await second.close();
+        }
+    });
+
+    it("storage with no marker (written before the marker existed) sends nothing", async () => {
+        const storagePath = storage();
+        await restartMidCountdown(storagePath);
+        setDeadline(storagePath, undefined);
+
+        const second = await boot(storagePath);
+        try {
+            const { events } = await attach(second.client, "a2", [{ ...KITCHEN_SPEC, states: { onOff: true } }]);
+            assert.deepEqual(events, []);
+            assert.deepEqual(await framesWithin(second.client, 800), []);
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("a sweep failure reaches the §4.3 warnings, not just the node log", async () => {
+        const storagePath = storage();
+        await restartMidCountdown(storagePath);
+        setDeadline(storagePath, Date.now() - 1000);
+
+        const second = await boot(storagePath);
+        const proto = IndigoOnOffServer.prototype;
+        const originalRunning = proto.timerRunning;
+        try {
+            // Only the sweep asks the behaviour whether its timer runs (the attach's own push reads `internal` directly).
+            proto.timerRunning = function (): boolean {
+                throw new Error("storage refused the read");
+            };
+            await attach(second.client, "a2", [{ ...KITCHEN_SPEC, states: { onOff: true } }]);
+            await framesWithin(second.client, 500);
+            const warnings = second.bridge.getStatus().warnings;
+            assert.ok(
+                warnings.some(warning => /device 223456789/.test(warning) && /storage refused the read/.test(warning)),
+                JSON.stringify(warnings),
+            );
+        } finally {
+            proto.timerRunning = originalRunning;
             await second.close();
         }
     });

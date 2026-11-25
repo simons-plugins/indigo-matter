@@ -50,6 +50,12 @@ export interface BridgeWsServerOptions {
 }
 
 interface ClientState {
+    /**
+     * #203 — work to run once the response to the request being handled is on
+     * the wire. Set by a handler, taken by {@link BridgeWsServer.onMessage}
+     * after a successful send. Only `attach` uses it.
+     */
+    afterResponse?: () => void;
     attached: boolean;
     unattachedTimer?: NodeJS.Timeout;
     /**
@@ -325,8 +331,18 @@ export class BridgeWsServer {
         }
 
         try {
+            state.afterResponse = undefined;
             const result = await handler(commandArgs, socket, state);
-            if (!this.send(socket, { message_id: messageId, result })) {
+            const afterResponse = state.afterResponse as (() => void) | undefined;
+            state.afterResponse = undefined;
+            if (this.send(socket, { message_id: messageId, result })) {
+                // The response is written; only now may the handler's follow-up
+                // raise frames of its own (#203). Not awaited — the frame chain
+                // must not stall behind it — but it enqueues on the registry's
+                // job queue synchronously, so it still runs ahead of any later
+                // frame's work.
+                afterResponse?.();
+            } else {
                 // §1 promises exactly one response per request. A result we
                 // could not put on the wire — a value that will not stringify,
                 // a socket that failed mid-write — still owes the plugin an
@@ -395,7 +411,20 @@ export class BridgeWsServer {
         // guard lives behind the facade because only it knows the live set; a
         // refusal leaves this client attached but the endpoint set untouched,
         // which is what lets the plugin retry with an explicit intent.
-        return this.options.bridge.reconcile(endpoints, replaceAll);
+        const status = await this.options.bridge.reconcile(endpoints, replaceAll);
+        // #203: AFTER the response, so the plugin is attached when the
+        // commands it provokes come back and Indigo's confirming push is not
+        // dropped as "not attached yet". Skipped if this socket was superseded
+        // or closed meanwhile.
+        state.afterResponse = () => {
+            if (this.#attached !== socket) {
+                return;
+            }
+            this.options.bridge
+                .afterAttach()
+                .catch(error => this.#log(`Post-attach step failed: ${describeErrorWithStack(error)}`));
+        };
+        return status;
     }
 
     private async handleSetState(args: Record<string, unknown>): Promise<unknown> {

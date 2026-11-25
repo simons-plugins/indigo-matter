@@ -465,6 +465,16 @@ export class BridgeNode implements BridgeFacade {
             bridgeIdentity: this.bridgedIdentity,
             log: message => this.log(message),
             emit: data => this.#command?.(data),
+            // #203 — the marker rides the endpoint's own map record (ADR-0016's
+            // witness file), and a failed recovery goes out through `warnings`.
+            countdowns: this.#endpointMap,
+            warn: (key, message) => {
+                if (message === undefined) {
+                    this.#warnings.delete(key);
+                } else {
+                    this.#warnings.set(key, message);
+                }
+            },
             onConfigurationChange: () => this.bumpConfigurationVersion(),
         });
 
@@ -1642,6 +1652,11 @@ export class BridgeNode implements BridgeFacade {
         }
         this.warnOnEndpointCount();
         return this.getStatus();
+    }
+
+    /** #203 — see {@link BridgeFacade.afterAttach}. */
+    async afterAttach(): Promise<void> {
+        await this.registry.sweepCountdowns();
     }
 
     /**

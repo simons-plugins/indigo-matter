@@ -247,6 +247,23 @@ export interface EndpointRecord {
      * has already processed a removal for.
      */
     supersededBy?: string;
+    /**
+     * Set when an ecosystem's `OnWithTimedOff` starts a countdown on this
+     * identity (issue #203): the WALL-CLOCK deadline, in epoch milliseconds,
+     * at which that countdown ends. Present only while a countdown that has
+     * not yet ended is known to exist, which is what lets the node tell "a
+     * restart lost a countdown" from "something wrote `OnTime` and nothing was
+     * ever counting" — `onTime > 0` alone cannot (a controller may write the
+     * attribute, and a write never starts a timer).
+     *
+     * **Replace-on-change, cleared on every route that ends the countdown**
+     * ({@link EndpointMapStore.clearCountdown}); it lives on the record so it
+     * dies with it — {@link EndpointMapStore.destroy} drops the record, and
+     * with it the marker. Absent on every ordinary entry and every pre-#203
+     * file (an old build ignores the extra key; a new build reads a missing
+     * one as "no countdown", which is why the schema stays 2).
+     */
+    countdownDeadline?: number;
 }
 
 /** The on-disk shape (v2). */
@@ -406,6 +423,15 @@ function readRecord(value: unknown, uniqueId: string, notes: string[]): Endpoint
                 "would resurrect an old-role accessory under a retired number — check it before " +
                 "the bridge next restarts.",
         );
+    }
+    // Tolerant like the rest: anything but a finite positive number is simply
+    // "no countdown marker" — which only ever errs towards doing nothing.
+    if (
+        typeof candidate.countdownDeadline === "number" &&
+        Number.isFinite(candidate.countdownDeadline) &&
+        candidate.countdownDeadline > 0
+    ) {
+        record.countdownDeadline = candidate.countdownDeadline;
     }
     return record;
 }
@@ -968,6 +994,45 @@ export class EndpointMapStore {
             );
         }
         return removed;
+    }
+
+    /**
+     * #203 — the recorded countdown deadline (epoch ms) for `uniqueId`, if a
+     * countdown is known to be pending on it.
+     */
+    countdownDeadline(uniqueId: string): number | undefined {
+        return this.#endpoints.get(uniqueId)?.countdownDeadline;
+    }
+
+    /**
+     * #203 — record that a countdown ending at `deadlineMs` (epoch ms) is
+     * running on `uniqueId`. Returns false, writing nothing, when there is no
+     * record to hang it on (an endpoint a drift check has not yet recorded):
+     * the caller says so, because a countdown with no marker is one a restart
+     * cannot recover. A write that fails is on the §4.3 channel like any other
+     * map write ({@link persist}) and still reports true — the in-memory
+     * marker is set and the failure is already being surfaced.
+     */
+    setCountdown(uniqueId: string, deadlineMs: number): boolean {
+        const record = this.#endpoints.get(uniqueId);
+        if (record === undefined) {
+            return false;
+        }
+        if (record.countdownDeadline !== deadlineMs) {
+            record.countdownDeadline = deadlineMs;
+            this.persist(`recorded a timed-on countdown ending at ${new Date(deadlineMs).toISOString()} for ${uniqueId}`);
+        }
+        return true;
+    }
+
+    /** #203 — drop the countdown marker. No write when there is none. */
+    clearCountdown(uniqueId: string): void {
+        const record = this.#endpoints.get(uniqueId);
+        if (record === undefined || record.countdownDeadline === undefined) {
+            return;
+        }
+        delete record.countdownDeadline;
+        this.persist(`cleared the timed-on countdown marker for ${uniqueId}`);
     }
 
     /**

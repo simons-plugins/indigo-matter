@@ -14,15 +14,18 @@ import {
     applyLabel,
     applyReachable,
     applyStates,
-    clearCountdown,
-    inspectCountdown,
+    clearLeftoverCountdown,
     type BridgedIdentity,
     createEndpoint,
     isSupportedRole,
+    readCountdown,
     UNSUPPORTED_ROLE_DETAILS,
     watchCommands,
+    zeroStaleOnTime,
+    type CountdownHooks,
 } from "./endpoints.js";
 import {
+    COUNTDOWN_LOST_REASON,
     type CommandEventData,
     describeError,
     describeErrorWithStack,
@@ -83,7 +86,45 @@ export interface EndpointIdentity {
     publishedAs: string;
 }
 
+/**
+ * #203 — where the registry keeps each endpoint's timed-on countdown marker,
+ * keyed on the published identity. {@link EndpointMapStore} is the real one (the
+ * marker rides the endpoint's `endpoint-map.json` record, so it is written
+ * atomically in the map's own style and dies with the record); the registry
+ * falls back to an in-memory one when none is given.
+ */
+export interface CountdownMarkers {
+    countdownDeadline(uniqueId: string): number | undefined;
+    /** False when there is nowhere to record it (no map record yet). */
+    setCountdown(uniqueId: string, deadlineMs: number): boolean;
+    clearCountdown(uniqueId: string): void;
+}
+
+class MemoryCountdownMarkers implements CountdownMarkers {
+    readonly #deadlines = new Map<string, number>();
+    countdownDeadline(uniqueId: string): number | undefined {
+        return this.#deadlines.get(uniqueId);
+    }
+    setCountdown(uniqueId: string, deadlineMs: number): boolean {
+        this.#deadlines.set(uniqueId, deadlineMs);
+        return true;
+    }
+    clearCountdown(uniqueId: string): void {
+        this.#deadlines.delete(uniqueId);
+    }
+}
+
 export interface EndpointRegistryOptions {
+    /** #203 — durable countdown markers. Defaults to an in-memory set (tests). */
+    countdowns?: CountdownMarkers;
+    /** #203 — wall clock, injectable for tests. Defaults to `Date.now`. */
+    now?: () => number;
+    /**
+     * #203 — raise (`message`) or withdraw (`undefined`) a §4.3 warning, keyed.
+     * The node's own log is stdout under launchd, so a recovery that failed has
+     * to reach the plugin through the `warnings` channel to be seen at all.
+     */
+    warn?: (key: string, message: string | undefined) => void;
     /** The aggregator every bridged child is added to. */
     aggregator: Endpoint;
     /** Sink for §5 `command` events. */
@@ -109,6 +150,10 @@ export class EndpointRegistry {
     readonly #live = new Map<number, LiveEndpoint>();
     readonly #log: (message: string) => void;
     readonly #pacingMs: number;
+    readonly #markers: CountdownMarkers;
+    readonly #now: () => number;
+    /** #203 — one plain timer per published identity whose lost countdown ends in the future. */
+    readonly #pendingOffs = new Map<string, NodeJS.Timeout>();
     /** Tail of the mutation chain — see {@link serialize}. */
     #queue: Promise<void> = Promise.resolve();
     /**
@@ -122,6 +167,8 @@ export class EndpointRegistry {
     constructor(private readonly options: EndpointRegistryOptions) {
         this.#log = options.log ?? (() => {});
         this.#pacingMs = options.removalPacingMs ?? REMOVAL_PACING_MS;
+        this.#markers = options.countdowns ?? new MemoryCountdownMarkers();
+        this.#now = options.now ?? Date.now;
     }
 
     /**
@@ -229,7 +276,9 @@ export class EndpointRegistry {
             let restored = 0;
             for (const spec of specs) {
                 try {
-                    await this.create(spec);
+                    // `restoring`: this is the SAME endpoint coming back, so a
+                    // countdown marker it carries must survive (#203).
+                    await this.create(spec, true);
                     restored += 1;
                 } catch (error) {
                     this.#log(
@@ -292,57 +341,149 @@ export class EndpointRegistry {
      * than assume either set.
      */
     async reconcile(desired: readonly EndpointSpec[], replaceAll: boolean): Promise<void> {
-        return this.serialize("reconcile", async () => {
-            await this.reconcileNow(desired, replaceAll);
-            await this.recoverStrandedCountdowns();
-        });
+        return this.serialize("reconcile", () => this.reconcileNow(desired, replaceAll));
     }
 
     /**
-     * #203 — after the attach reconcile (never before: a command emitted with
-     * nobody attached is dropped), end every countdown a node restart
-     * stranded. matter.js persists `onTime` on each tick but its timer is
-     * in-memory, so after a restart the device reads on with a countdown that
-     * nothing will ever finish: tell Indigo to turn it off, THEN zero `onTime`
-     * so the next restart does not fire again. In that order on purpose — an
-     * off that never reached Indigo must stay recoverable at the next attach.
+     * #203 — end every countdown a node restart lost. Called by the attach
+     * handler AFTER the attach response is on the wire (never inside
+     * {@link reconcile}), for two reasons: a command emitted with nobody
+     * attached is dropped, and one emitted during the attach request reaches
+     * a plugin that has not finished attaching, so Indigo's confirming state
+     * push would be discarded. Still serialised with every other mutation.
      *
-     * By now the attach's own state push has run, so "Indigo says off" has
-     * already zeroed `onTime` via `super.off()` and nothing is found here; and
-     * a countdown whose timer is still running (a plugin-only reattach) is
-     * skipped by the timer check.
+     * **Stranded means a countdown was started AND lost — read from a marker,
+     * not inferred.** matter.js persists `onTime` on every tick but its timer
+     * is in-memory, so after a restart the lamp reads on with a countdown
+     * nothing will finish. `onTime > 0` alone is NOT evidence of that: a
+     * controller may write the attribute, and a write never starts a timer.
+     * So the sweep acts only on an endpoint that has a countdown marker (a
+     * wall-clock deadline written when an `OnWithTimedOff` really started the
+     * timer), reads on, and has no timer running:
      *
-     * **Known limitation, accepted:** `onTime` records remaining time, not a
-     * wall-clock deadline. If the user turned the device off and on again in
-     * Indigo while the node was down, the attach reads "on" and this turns off
-     * something deliberately turned on; the two cases cannot be told apart
-     * without persisting a deadline next to the map record.
+     * * deadline passed: send the off now;
+     * * deadline ahead: send it when it comes (a plain timer; matter.js's own
+     *   countdown is deliberately not restarted);
+     * * nothing is zeroed and no marker is cleared here. Both clear only when
+     *   Indigo CONFIRMS the off (`applyIndigoOnOff(false)` → `super.off()`), so
+     *   an off the plugin never executed stays stranded and goes out again at
+     *   the next attach.
      *
-     * Best-effort per endpoint: a failure is logged and the sweep moves on, and
-     * does not fail the attach — the next attach retries whatever is left.
+     * A plugin-only reattach while the timer still runs is skipped by the
+     * timer check; an attach that says "off" has already ended the countdown.
+     *
+     * **Known limitation, accepted:** if the user turned the device off and on
+     * again in Indigo while the node was down, the attach reads "on" with the
+     * marker still set, and the off is sent to a lamp deliberately turned on.
+     *
+     * Best-effort per endpoint: a failure goes on the §4.3 warnings channel and
+     * the node log, the sweep moves on, and the next attach retries.
      */
-    private async recoverStrandedCountdowns(): Promise<void> {
-        for (const [indigoDeviceId, live] of [...this.#live]) {
-            try {
-                const found = await inspectCountdown(live.endpoint);
-                if (found === undefined) {
-                    continue;
-                }
-                if (found.kind === "stranded") {
-                    this.#log(
-                        `Endpoint ${indigoDeviceId}: a timed-on countdown (${found.onTime / 10}s remaining when ` +
-                            "the node stopped) was lost across a restart — turning the device off (#203)",
-                    );
-                    this.options.emit({ indigoDeviceId, command: "onOff", args: { value: false } });
-                }
-                await clearCountdown(live.endpoint);
-            } catch (error) {
-                this.#log(
-                    `Endpoint ${indigoDeviceId}: could NOT recover a countdown lost across a restart (#203); ` +
-                        `it will be retried at the next attach: ${describeError(error)}`,
-                );
+    async sweepCountdowns(): Promise<void> {
+        return this.serialize("countdown sweep", async () => {
+            for (const [indigoDeviceId, live] of [...this.#live]) {
+                await this.sweepOne(indigoDeviceId, live, false);
             }
+        });
+    }
+
+    /** One endpoint's share of {@link sweepCountdowns}; `due` is the deadline timer firing (no clock check). */
+    private async sweepOne(indigoDeviceId: number, live: LiveEndpoint, due: boolean): Promise<void> {
+        const key = `countdown:${live.publishedAs}`;
+        try {
+            const reading = await readCountdown(live.endpoint);
+            if (reading === undefined) {
+                return;
+            }
+            const deadline = this.#markers.countdownDeadline(live.publishedAs);
+            if (!reading.onOff) {
+                if (reading.timerRunning) {
+                    return; // an ecosystem countdown Indigo has not confirmed yet: leave it alone
+                }
+                const cleared = await clearLeftoverCountdown(live.endpoint);
+                if (cleared !== undefined) {
+                    this.#log(
+                        `Endpoint ${indigoDeviceId}: cleared a leftover onTime of ${cleared / 10}s on an endpoint ` +
+                            "that reads off — no countdown was running (#203)",
+                    );
+                }
+                if (deadline !== undefined) {
+                    this.clearMarker(live.publishedAs);
+                }
+            } else if (deadline !== undefined && !reading.timerRunning) {
+                const remaining = due ? 0 : deadline - this.#now();
+                if (remaining > 0) {
+                    this.scheduleOff(live.publishedAs, remaining);
+                    this.#log(
+                        `Endpoint ${indigoDeviceId}: a timed-on countdown was lost across a restart with ` +
+                            `${Math.round(remaining / 100) / 10}s still to run — the device will be turned off then (#203)`,
+                    );
+                } else {
+                    this.cancelPendingOff(live.publishedAs);
+                    this.#log(
+                        `Endpoint ${indigoDeviceId}: a timed-on countdown was lost across a restart — telling ` +
+                            "Indigo to turn the device off (#203); it stays stranded, and is re-sent at the next " +
+                            "attach, until Indigo confirms",
+                    );
+                    this.options.emit({
+                        indigoDeviceId,
+                        command: "onOff",
+                        args: { value: false, reason: COUNTDOWN_LOST_REASON },
+                    });
+                }
+            }
+            this.options.warn?.(key, undefined);
+        } catch (error) {
+            const message =
+                `device ${indigoDeviceId}: could not end its timed-on countdown lost across a bridge node ` +
+                `restart (${describeError(error)}); it will be retried at the next attach`;
+            this.#log(`Endpoint ${indigoDeviceId}: ${message} (#203)`);
+            this.options.warn?.(key, message);
         }
+    }
+
+    private scheduleOff(publishedAs: string, remainingMs: number): void {
+        this.cancelPendingOff(publishedAs);
+        const timer = setTimeout(() => {
+            this.#pendingOffs.delete(publishedAs);
+            this.serialize("countdown deadline", async () => {
+                const indigoDeviceId = this.deviceIdFor(publishedAs);
+                const live = indigoDeviceId === undefined ? undefined : this.#live.get(indigoDeviceId);
+                if (indigoDeviceId !== undefined && live !== undefined) {
+                    await this.sweepOne(indigoDeviceId, live, true);
+                }
+            }).catch(error => this.#log(`countdown deadline for ${publishedAs} failed: ${describeError(error)}`));
+        }, remainingMs);
+        timer.unref?.();
+        this.#pendingOffs.set(publishedAs, timer);
+    }
+
+    private cancelPendingOff(publishedAs: string): void {
+        const timer = this.#pendingOffs.get(publishedAs);
+        if (timer !== undefined) {
+            clearTimeout(timer);
+            this.#pendingOffs.delete(publishedAs);
+        }
+    }
+
+    private clearMarker(publishedAs: string): void {
+        this.#markers.clearCountdown(publishedAs);
+        this.cancelPendingOff(publishedAs);
+    }
+
+    /** What a behaviour calls to record or end its countdown marker (#203). */
+    private countdownHooksFor(publishedAs: string, indigoDeviceId: number): CountdownHooks {
+        return {
+            mark: remainingMs => {
+                if (!this.#markers.setCountdown(publishedAs, this.#now() + remainingMs)) {
+                    this.#log(
+                        `Endpoint ${indigoDeviceId}: a timed-on countdown started but there is no endpoint-map ` +
+                            "record to note it in yet, so a node restart could not recover it (#203)",
+                    );
+                }
+            },
+            clear: () => this.clearMarker(publishedAs),
+        };
     }
 
     private async reconcileNow(desired: readonly EndpointSpec[], replaceAll: boolean): Promise<void> {
@@ -669,6 +810,10 @@ export class EndpointRegistry {
 
     /** Drop every listener. The endpoints themselves die with the ServerNode. */
     close(): void {
+        for (const timer of this.#pendingOffs.values()) {
+            clearTimeout(timer);
+        }
+        this.#pendingOffs.clear();
         for (const live of this.#live.values()) {
             live.unwatch();
         }
@@ -692,12 +837,30 @@ export class EndpointRegistry {
         }
     }
 
-    private async create(spec: EndpointSpec): Promise<Endpoint> {
+    private async create(spec: EndpointSpec, restoring = false): Promise<Endpoint> {
         const endpoint = createEndpoint(spec, this.options.bridgeIdentity);
         await this.options.aggregator.add(endpoint);
+        if (!restoring) {
+            // #203 — a fresh export has no countdown. matter.js keeps `onTime`
+            // under the endpoint id after an un-export, and the map keeps a
+            // marker until the record goes; neither belongs to this endpoint.
+            this.clearMarker(spec.publishedAs);
+            try {
+                await zeroStaleOnTime(endpoint);
+            } catch (error) {
+                await endpoint.close().catch(() => undefined);
+                throw error;
+            }
+        }
         let unwatch: () => void;
         try {
-            unwatch = watchCommands(endpoint, spec, this.options.emit, this.#log);
+            unwatch = watchCommands(
+                endpoint,
+                spec,
+                this.options.emit,
+                this.#log,
+                this.countdownHooksFor(spec.publishedAs, spec.indigoDeviceId),
+            );
         } catch (error) {
             // The endpoint is already in the Matter tree but will never be in
             // `#live`: take it back out rather than leave an accessory the
@@ -836,7 +999,13 @@ export class EndpointRegistry {
         }
         live.unwatch();
         try {
-            live.unwatch = watchCommands(live.endpoint, spec, this.options.emit, this.#log);
+            live.unwatch = watchCommands(
+                live.endpoint,
+                spec,
+                this.options.emit,
+                this.#log,
+                this.countdownHooksFor(live.publishedAs, spec.indigoDeviceId),
+            );
         } catch (error) {
             // Restore first, log, THEN throw — closeOne's order, so a caller
             // that sees `internal` can retry against a registry that still
@@ -847,6 +1016,7 @@ export class EndpointRegistry {
                 { indigoDeviceId: fromDeviceId, role: live.role, publishedAs: live.publishedAs },
                 this.options.emit,
                 this.#log,
+                this.countdownHooksFor(live.publishedAs, fromDeviceId),
             );
             this.#live.set(fromDeviceId, live);
             this.#log(
@@ -893,6 +1063,7 @@ export class EndpointRegistry {
                 { indigoDeviceId, role: live.role, publishedAs: live.publishedAs },
                 this.options.emit,
                 this.#log,
+                this.countdownHooksFor(live.publishedAs, indigoDeviceId),
             );
             this.#log(
                 `Endpoint ${indigoDeviceId} failed to close; registry and Matter tree may disagree: ` +
@@ -904,6 +1075,9 @@ export class EndpointRegistry {
             );
         }
         this.#live.delete(indigoDeviceId);
+        // The marker dies with the endpoint (#203); a re-export starts clean.
+        this.clearMarker(live.publishedAs);
+        this.options.warn?.(`countdown:${live.publishedAs}`, undefined);
         this.#log(`Endpoint ${indigoDeviceId} removed`);
     }
 

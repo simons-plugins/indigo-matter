@@ -50,6 +50,7 @@ import { MovementDirection, MovementType, WindowCoveringServer } from "@matter/m
 import { ColorControl } from "@matter/main/clusters/color-control";
 import { DoorLock } from "@matter/main/clusters/door-lock";
 import { LevelControl } from "@matter/main/clusters/level-control";
+import type { OnOff } from "@matter/main/clusters/on-off";
 import { SmokeCoAlarm } from "@matter/main/clusters/smoke-co-alarm";
 import { Thermostat } from "@matter/main/clusters/thermostat";
 import { ColorTemperatureLightDevice } from "@matter/main/devices/color-temperature-light";
@@ -587,6 +588,30 @@ interface CommandSink {
     indigoDeviceId: number;
     emit: (data: CommandEventData) => void;
     log: (message: string) => void;
+    /** #203 — where this endpoint's timed-on countdown marker lives; see {@link CountdownHooks}. */
+    countdown?: CountdownHooks;
+}
+
+/**
+ * #203 — how a behaviour reports that a timed-on countdown started or ended,
+ * without knowing where the marker is kept.
+ *
+ * The marker (a wall-clock deadline) is what lets a restart tell "a countdown
+ * was lost" from "nothing was ever counting": `onTime > 0` alone cannot, because
+ * a controller may write the attribute and a write never starts a timer. It is
+ * therefore set ONLY by an `OnWithTimedOff` that really started the timer, and
+ * cleared by every route that ends one.
+ */
+export interface CountdownHooks {
+    /** A countdown with `remainingMs` left has started (or been extended). */
+    mark(remainingMs: number): void;
+    /** The countdown is over (expired, cancelled, or the endpoint went off). */
+    clear(): void;
+}
+
+/** The hooks for the endpoint a behaviour is running on, if one is registered. */
+function countdownHooksFor(endpointId: string): CountdownHooks | undefined {
+    return COMMAND_SINKS.get(endpointId)?.countdown;
 }
 
 /**
@@ -754,7 +779,7 @@ function emitCommand(
  * than fixed — see {@link IndigoLevelControlServer}'s own class doc for the
  * fuller version of this same risk.
  */
-class IndigoOnOffServer extends OnOffServer.with("Lighting") {
+export class IndigoOnOffServer extends OnOffServer.with("Lighting") {
     /**
      * The plugin's own push, and the only writer of the `onOff` attribute.
      *
@@ -784,8 +809,8 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
      * info-level bookkeeping (0.17.3 — the plugin runs the node at INFO)
      * rather than a warning about something that might be wrong. (#203 — a bridge-node *restart* dropping a running
      * countdown, since the timer is in-memory only — is a separate half of
-     * countdown correctness, closed by `strandedCountdown()` and the
-     * registry's post-attach sweep; this guard only concerns the replayed
+     * countdown correctness, closed by the countdown marker and the
+     * registry's post-attach sweep (`sweepCountdowns`); this guard only concerns the replayed
      * push that follows such a restart.)
      */
     async applyIndigoOnOff(value: boolean): Promise<void> {
@@ -811,6 +836,7 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
             // countdown tests.
             const internal = (this as unknown as { internal?: { timedOnTimer?: { isRunning?: boolean } } }).internal;
             if (!value && internal?.timedOnTimer?.isRunning) {
+                // The countdown is still real, so its marker stays (#203).
                 // `info`, not `debug`: the plugin's LaunchAgent runs the node at
                 // MATTER_LOG_LEVEL=info (2026.32.1), and this is the only trace
                 // of a ghost-off that can darken a lamp someone re-lit.
@@ -826,44 +852,70 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
                         "onOff coupling writing ahead of Indigo) but is not the only one left.",
                 );
             }
+            if (!value) {
+                // Already off and nothing counting: no countdown can be pending (#203).
+                countdownHooksFor(this.endpoint.id)?.clear();
+            }
             return;
+        }
+        if (!value) {
+            // Indigo confirmed the device off — the one route that ends a
+            // countdown for good (#203), whether it ended naturally, was
+            // cancelled by an ecosystem, or was a lost one this node re-sent.
+            // `super.off()` below zeroes `onTime` (OnOffServer.js `off()`).
+            countdownHooksFor(this.endpoint.id)?.clear();
         }
         return value ? super.on() : super.off();
     }
 
     /**
-     * #203 — what a node restart left behind: `onTime` (persisted by matter.js
-     * on every tick) still counting down while `timedOnTimer` (an in-memory
-     * periodic timer nothing re-arms) is gone. Returns that `onTime`, or
-     * `undefined` when there is nothing to recover — which includes a
-     * countdown that IS still running (a plugin-only reattach) and the
-     * indefinite hold (`0xFFFF`), neither of which is stranded.
+     * #203 — an ecosystem's `OnWithTimedOff`. Stock behaviour runs unchanged
+     * (it starts matter.js's in-memory timer and funnels into {@link on}); this
+     * only RECORDS that a countdown really started, with its wall-clock end, so
+     * a node restart can tell a lost countdown from a mere `onTime` value — a
+     * controller's attribute write sets `onTime` and never starts a timer.
      */
-    strandedCountdown(): number | undefined {
-        const { onOff, onTime } = this.state;
-        if (onOff !== true || typeof onTime !== "number" || onTime <= 0 || onTime === 0xffff) {
-            return undefined;
+    override onWithTimedOff(request: OnOff.OnWithTimedOffRequest): MaybePromise {
+        const result = super.onWithTimedOff(request);
+        const hooks = countdownHooksFor(this.endpoint.id);
+        if (hooks !== undefined) {
+            const { onTime } = this.state;
+            const running = this.timerRunning();
+            if (running && typeof onTime === "number" && onTime > 0 && onTime !== 0xffff) {
+                hooks.mark(onTime * 100);
+            } else {
+                hooks.clear();
+            }
         }
-        // Same `internal` read (and same reason) as `applyIndigoOnOff`.
-        const internal = (this as unknown as { internal?: { timedOnTimer?: { isRunning?: boolean } } }).internal;
-        return internal?.timedOnTimer?.isRunning === true ? undefined : onTime;
+        return result;
     }
 
     /**
-     * #203 companion: an `onTime` that outlived its countdown on an attribute
-     * that reads OFF (the attribute was never persisted as on, so the attach's
-     * `off` push was a no-op and `super.off()` never zeroed it). Not stranded —
-     * the device is off — but left alone it would be misread as a stranded
-     * countdown the first time Indigo later turns the device on and the node
-     * restarts.
+     * Whether matter.js's in-memory countdown timer is running. The
+     * `.with("Lighting")` composed type loses the base's `protected internal`
+     * declaration (matter.js .d.ts quirk); the runtime shape is the stock one
+     * `#stopHeldTimer` itself reads, pinned by the countdown tests.
      */
-    hasDeadCountdown(): boolean {
-        const { onOff, onTime } = this.state;
-        if (onOff === true || typeof onTime !== "number" || onTime <= 0 || onTime === 0xffff) {
-            return false;
-        }
+    timerRunning(): boolean {
         const internal = (this as unknown as { internal?: { timedOnTimer?: { isRunning?: boolean } } }).internal;
-        return internal?.timedOnTimer?.isRunning !== true;
+        return internal?.timedOnTimer?.isRunning === true;
+    }
+
+    /**
+     * #203 — an `onTime` that outlived its countdown on an attribute that
+     * reads OFF. Cleared inside the lock (re-checking, because the read that
+     * decided to call this was not locked and a countdown could have started
+     * since). Returns the value it cleared, or `undefined` when there was
+     * nothing to clear.
+     */
+    async clearLeftoverOnTime(): Promise<number | undefined> {
+        await this.context.transaction.lock(this);
+        const { onOff, onTime } = this.state;
+        if (onOff === true || typeof onTime !== "number" || onTime <= 0 || onTime === 0xffff || this.timerRunning()) {
+            return undefined;
+        }
+        this.state.onTime = 0;
+        return onTime;
     }
 
     override on(): MaybePromise {
@@ -871,6 +923,9 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
     }
 
     override off(): MaybePromise {
+        // The countdown's own expiry, or an ecosystem's Off: either way the
+        // countdown is over (#203), so its marker goes before the command does.
+        countdownHooksFor(this.endpoint.id)?.clear();
         emitCommand(this.endpoint.id, "onOff", { value: false });
     }
 }
@@ -3034,36 +3089,47 @@ export async function applyStates(
     await applyResidual();
 }
 
-/**
- * #203 — what a restart left on this endpoint, as one read:
- * `"stranded"` (on, `onTime` counting, no timer — the device must be turned
- * off), `"dead"` (off but with a leftover `onTime` to clear), or `undefined`.
- * Endpoints without the Lighting OnOff behaviour (sensors, locks, covers) are
- * `undefined`.
- */
-export async function inspectCountdown(
-    endpoint: Endpoint,
-): Promise<{ kind: "stranded"; onTime: number } | { kind: "dead" } | undefined> {
+/** What the #203 sweep needs to know about one endpoint's countdown, read in one act. */
+export interface CountdownReading {
+    onOff: boolean;
+    onTime: number;
+    timerRunning: boolean;
+}
+
+/** #203 — `undefined` for an endpoint without the Lighting OnOff behaviour (sensors, locks, covers). */
+export async function readCountdown(endpoint: Endpoint): Promise<CountdownReading | undefined> {
     if (!endpoint.behaviors.has(IndigoOnOffServer)) {
         return undefined;
     }
     return endpoint.act(agent => {
         const behavior = agent.get(IndigoOnOffServer);
-        const onTime = behavior.strandedCountdown();
-        if (onTime !== undefined) {
-            return { kind: "stranded" as const, onTime };
-        }
-        return behavior.hasDeadCountdown() ? { kind: "dead" as const } : undefined;
+        return {
+            onOff: behavior.state.onOff === true,
+            onTime: typeof behavior.state.onTime === "number" ? behavior.state.onTime : 0,
+            timerRunning: behavior.timerRunning(),
+        };
     });
 }
 
+/** #203 — clear a leftover `onTime` on an endpoint that reads off; the value cleared, if any. */
+export async function clearLeftoverCountdown(endpoint: Endpoint): Promise<number | undefined> {
+    if (!endpoint.behaviors.has(IndigoOnOffServer)) {
+        return undefined;
+    }
+    return endpoint.act(agent => agent.get(IndigoOnOffServer).clearLeftoverOnTime());
+}
+
 /**
- * #203 — zero `onTime`. A plain attribute write through `endpoint.set()`, which
- * takes the lock asynchronously (#338) and — with no timer running — cannot
- * reach `#stopHeldTimer`'s branch that would matter.
+ * #203 — a freshly created endpoint has no countdown, so any `onTime` matter.js
+ * kept in storage under its id (an un-export mid-countdown leaves it there) is
+ * stale and is zeroed before the export's states are applied. A plain attribute
+ * write through `endpoint.set()`, which takes the lock asynchronously (#338).
  */
-export async function clearCountdown(endpoint: Endpoint): Promise<void> {
-    await endpoint.set({ onOff: { onTime: 0 } } as never);
+export async function zeroStaleOnTime(endpoint: Endpoint): Promise<void> {
+    const reading = await readCountdown(endpoint);
+    if (reading !== undefined && reading.onTime > 0 && !reading.timerRunning) {
+        await endpoint.set({ onOff: { onTime: 0 } } as never);
+    }
 }
 
 /**
@@ -3226,6 +3292,7 @@ export function watchCommands(
     spec: { indigoDeviceId: number; role: RoleValue; publishedAs: string },
     emit: (data: CommandEventData) => void,
     log: (message: string) => void = () => {},
+    countdown?: CountdownHooks,
 ): () => void {
     const teardown: (() => void)[] = [];
     // The published identity, not `endpointIdFor(spec.indigoDeviceId)`: under a
@@ -3233,7 +3300,7 @@ export function watchCommands(
     // keyed on `endpoint.id`/`Endpoint.id`, which IS `spec.publishedAs` (see
     // {@link createEndpoint}) — the sink has to be found under the same key.
     const endpointId = spec.publishedAs;
-    COMMAND_SINKS.set(endpointId, { indigoDeviceId: spec.indigoDeviceId, emit, log });
+    COMMAND_SINKS.set(endpointId, { indigoDeviceId: spec.indigoDeviceId, emit, log, countdown });
     teardown.push(() => COMMAND_SINKS.delete(endpointId));
 
     const unwatch = (): void => {
