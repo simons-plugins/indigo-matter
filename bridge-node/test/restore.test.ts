@@ -1660,6 +1660,89 @@ describe("issue #355: un-export, restart, re-export", () => {
     });
 });
 
+describe("issue #203: a countdown lost across a real node restart", () => {
+    const commandsIn = (events: Record<string, unknown>[]): unknown[] =>
+        events.filter(frame => frame.event === "command").map(frame => frame.data);
+
+    async function setStateOne(client: TestClient, messageId: string, states: Record<string, unknown>): Promise<void> {
+        client.send({
+            message_id: messageId,
+            command: "set_state",
+            args: { indigoDeviceId: KITCHEN, states },
+        });
+        for (;;) {
+            const frame = await client.next(10_000);
+            if (frame.message_id === messageId) {
+                assert.equal(frame.error_code, undefined, JSON.stringify(frame));
+                return;
+            }
+        }
+    }
+
+    /** Export the kitchen lamp ON (persisted), start a 3s ecosystem countdown, then stop the node. */
+    async function restartMidCountdown(storagePath: string): Promise<void> {
+        const first = await boot(storagePath);
+        try {
+            await attach(first.client, "a1", [{ ...KITCHEN_SPEC, states: { onOff: false } }]);
+            await setStateOne(first.client, "s1", { onOff: true });
+            const kitchen = childOf(first.bridge.server, KITCHEN);
+            assert.ok(kitchen !== undefined);
+            await kitchen.act(agent =>
+                agent.get(OnOffLighting).onWithTimedOff({
+                    onOffControl: { acceptOnlyWhenOn: false },
+                    onTime: 30,
+                    offWaitTime: 0,
+                }),
+            );
+        } finally {
+            await first.close();
+        }
+    }
+
+    it("the attach after the restart (endpoint restored from the map) turns the device off once, and a second restart does not", async () => {
+        const storagePath = storage();
+        await restartMidCountdown(storagePath);
+
+        const second = await boot(storagePath);
+        try {
+            assert.ok(childOf(second.bridge.server, KITCHEN) !== undefined, "restored from the map before attach");
+            const { events } = await attach(second.client, "a2", [{ ...KITCHEN_SPEC, states: { onOff: true } }]);
+            assert.deepEqual(
+                commandsIn(events),
+                [{ indigoDeviceId: KITCHEN, command: "onOff", args: { value: false } }],
+                "after attach, so the frame is delivered rather than dropped",
+            );
+            // The plugin's confirmation of the off it just performed.
+            await setStateOne(second.client, "s2", { onOff: false });
+        } finally {
+            await second.close();
+        }
+
+        const third = await boot(storagePath);
+        try {
+            const { events } = await attach(third.client, "a3", [{ ...KITCHEN_SPEC, states: { onOff: false } }]);
+            assert.deepEqual(commandsIn(events), [], "nothing left to recover on the next restart");
+        } finally {
+            await third.close();
+        }
+    });
+
+    it("an attach that says the device is off emits nothing", async () => {
+        const storagePath = storage();
+        await restartMidCountdown(storagePath);
+
+        const second = await boot(storagePath);
+        try {
+            const { events } = await attach(second.client, "a2", [{ ...KITCHEN_SPEC, states: { onOff: false } }]);
+            assert.deepEqual(commandsIn(events), []);
+            const kitchen = childOf(second.bridge.server, KITCHEN);
+            assert.equal((kitchen?.stateOf("onOff") as { onTime?: number } | undefined)?.onTime, 0);
+        } finally {
+            await second.close();
+        }
+    });
+});
+
 describe("restore binds to the DRIVING device, and never to a retired identity (issue #240)", () => {
     it("restores an accessory bound to the map's deviceId, not to its key", async () => {
         // The one place nothing else covers: `restore()` runs BEFORE any

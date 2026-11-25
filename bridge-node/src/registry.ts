@@ -14,6 +14,8 @@ import {
     applyLabel,
     applyReachable,
     applyStates,
+    clearCountdown,
+    inspectCountdown,
     type BridgedIdentity,
     createEndpoint,
     isSupportedRole,
@@ -290,7 +292,57 @@ export class EndpointRegistry {
      * than assume either set.
      */
     async reconcile(desired: readonly EndpointSpec[], replaceAll: boolean): Promise<void> {
-        return this.serialize("reconcile", () => this.reconcileNow(desired, replaceAll));
+        return this.serialize("reconcile", async () => {
+            await this.reconcileNow(desired, replaceAll);
+            await this.recoverStrandedCountdowns();
+        });
+    }
+
+    /**
+     * #203 — after the attach reconcile (never before: a command emitted with
+     * nobody attached is dropped), end every countdown a node restart
+     * stranded. matter.js persists `onTime` on each tick but its timer is
+     * in-memory, so after a restart the device reads on with a countdown that
+     * nothing will ever finish: tell Indigo to turn it off, THEN zero `onTime`
+     * so the next restart does not fire again. In that order on purpose — an
+     * off that never reached Indigo must stay recoverable at the next attach.
+     *
+     * By now the attach's own state push has run, so "Indigo says off" has
+     * already zeroed `onTime` via `super.off()` and nothing is found here; and
+     * a countdown whose timer is still running (a plugin-only reattach) is
+     * skipped by the timer check.
+     *
+     * **Known limitation, accepted:** `onTime` records remaining time, not a
+     * wall-clock deadline. If the user turned the device off and on again in
+     * Indigo while the node was down, the attach reads "on" and this turns off
+     * something deliberately turned on; the two cases cannot be told apart
+     * without persisting a deadline next to the map record.
+     *
+     * Best-effort per endpoint: a failure is logged and the sweep moves on, and
+     * does not fail the attach — the next attach retries whatever is left.
+     */
+    private async recoverStrandedCountdowns(): Promise<void> {
+        for (const [indigoDeviceId, live] of [...this.#live]) {
+            try {
+                const found = await inspectCountdown(live.endpoint);
+                if (found === undefined) {
+                    continue;
+                }
+                if (found.kind === "stranded") {
+                    this.#log(
+                        `Endpoint ${indigoDeviceId}: a timed-on countdown (${found.onTime / 10}s remaining when ` +
+                            "the node stopped) was lost across a restart — turning the device off (#203)",
+                    );
+                    this.options.emit({ indigoDeviceId, command: "onOff", args: { value: false } });
+                }
+                await clearCountdown(live.endpoint);
+            } catch (error) {
+                this.#log(
+                    `Endpoint ${indigoDeviceId}: could NOT recover a countdown lost across a restart (#203); ` +
+                        `it will be retried at the next attach: ${describeError(error)}`,
+                );
+            }
+        }
     }
 
     private async reconcileNow(desired: readonly EndpointSpec[], replaceAll: boolean): Promise<void> {

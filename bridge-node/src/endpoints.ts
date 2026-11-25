@@ -783,9 +783,10 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
      * *only* remaining explanation for this state, and the branch below is
      * info-level bookkeeping (0.17.3 — the plugin runs the node at INFO)
      * rather than a warning about something that might be wrong. (#203 — a bridge-node *restart* dropping a running
-     * countdown, since the timer is in-memory only — is a separate, still
-     * open half of countdown correctness; this guard only concerns the
-     * replayed push that follows such a restart.)
+     * countdown, since the timer is in-memory only — is a separate half of
+     * countdown correctness, closed by `strandedCountdown()` and the
+     * registry's post-attach sweep; this guard only concerns the replayed
+     * push that follows such a restart.)
      */
     async applyIndigoOnOff(value: boolean): Promise<void> {
         // #338: take the `onOff.state` lock ASYNCHRONOUSLY before anything
@@ -828,6 +829,41 @@ class IndigoOnOffServer extends OnOffServer.with("Lighting") {
             return;
         }
         return value ? super.on() : super.off();
+    }
+
+    /**
+     * #203 — what a node restart left behind: `onTime` (persisted by matter.js
+     * on every tick) still counting down while `timedOnTimer` (an in-memory
+     * periodic timer nothing re-arms) is gone. Returns that `onTime`, or
+     * `undefined` when there is nothing to recover — which includes a
+     * countdown that IS still running (a plugin-only reattach) and the
+     * indefinite hold (`0xFFFF`), neither of which is stranded.
+     */
+    strandedCountdown(): number | undefined {
+        const { onOff, onTime } = this.state;
+        if (onOff !== true || typeof onTime !== "number" || onTime <= 0 || onTime === 0xffff) {
+            return undefined;
+        }
+        // Same `internal` read (and same reason) as `applyIndigoOnOff`.
+        const internal = (this as unknown as { internal?: { timedOnTimer?: { isRunning?: boolean } } }).internal;
+        return internal?.timedOnTimer?.isRunning === true ? undefined : onTime;
+    }
+
+    /**
+     * #203 companion: an `onTime` that outlived its countdown on an attribute
+     * that reads OFF (the attribute was never persisted as on, so the attach's
+     * `off` push was a no-op and `super.off()` never zeroed it). Not stranded —
+     * the device is off — but left alone it would be misread as a stranded
+     * countdown the first time Indigo later turns the device on and the node
+     * restarts.
+     */
+    hasDeadCountdown(): boolean {
+        const { onOff, onTime } = this.state;
+        if (onOff === true || typeof onTime !== "number" || onTime <= 0 || onTime === 0xffff) {
+            return false;
+        }
+        const internal = (this as unknown as { internal?: { timedOnTimer?: { isRunning?: boolean } } }).internal;
+        return internal?.timedOnTimer?.isRunning !== true;
     }
 
     override on(): MaybePromise {
@@ -2996,6 +3032,38 @@ export async function applyStates(
         );
     }
     await applyResidual();
+}
+
+/**
+ * #203 — what a restart left on this endpoint, as one read:
+ * `"stranded"` (on, `onTime` counting, no timer — the device must be turned
+ * off), `"dead"` (off but with a leftover `onTime` to clear), or `undefined`.
+ * Endpoints without the Lighting OnOff behaviour (sensors, locks, covers) are
+ * `undefined`.
+ */
+export async function inspectCountdown(
+    endpoint: Endpoint,
+): Promise<{ kind: "stranded"; onTime: number } | { kind: "dead" } | undefined> {
+    if (!endpoint.behaviors.has(IndigoOnOffServer)) {
+        return undefined;
+    }
+    return endpoint.act(agent => {
+        const behavior = agent.get(IndigoOnOffServer);
+        const onTime = behavior.strandedCountdown();
+        if (onTime !== undefined) {
+            return { kind: "stranded" as const, onTime };
+        }
+        return behavior.hasDeadCountdown() ? { kind: "dead" as const } : undefined;
+    });
+}
+
+/**
+ * #203 — zero `onTime`. A plain attribute write through `endpoint.set()`, which
+ * takes the lock asynchronously (#338) and — with no timer running — cannot
+ * reach `#stopHeldTimer`'s branch that would matter.
+ */
+export async function clearCountdown(endpoint: Endpoint): Promise<void> {
+    await endpoint.set({ onOff: { onTime: 0 } } as never);
 }
 
 /**
