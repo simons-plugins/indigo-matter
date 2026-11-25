@@ -62,6 +62,35 @@ RETENTION = timedelta(minutes=15)
 # jobs. Must be < RETENTION or the job may be reaped before it can reconcile.
 RECONCILE_WINDOW = timedelta(minutes=5)
 
+#: matter-server's wording when its mDNS discovery heard nothing (issue #368).
+#: Matched case-insensitively and as a substring: matter-server wraps it in
+#: "Commission failed: discovery of node with discriminator N failed: …" and gives
+#: the error an ordinary code (1) that other failures share, so the phrase is the
+#: only thing that tells this failure apart.
+NO_DEVICE_DISCOVERED_PHRASE = "no commissionable device was discovered"
+
+#: The Plugins menu item the hint points at — must match MenuItems.xml's <Name>
+#: for restartMatterServer exactly (a test pins that).
+RESTART_MENU_ITEM = "Restart the Matter controller"
+
+NO_DEVICE_DISCOVERED_HINT = (
+    f" Hint: if the device is powered and reachable on this network, a long-running "
+    f"matter-server may have stopped hearing it. Restart it with Plugins \u25b8 Matter "
+    f"\u25b8 {RESTART_MENU_ITEM}, then retry with a fresh pairing code."
+)
+
+
+def with_discovery_hint(message: str) -> str:
+    """*message*, plus the restart hint when it is the "no device discovered" failure.
+
+    Every other commissioning failure is returned untouched. Only advice is
+    added — nothing is restarted automatically.
+    """
+    if NO_DEVICE_DISCOVERED_PHRASE in message.lower():
+        return message + NO_DEVICE_DISCOVERED_HINT
+    return message
+
+
 TIMEOUT_MESSAGE = (
     f"matter-server did not finish commissioning within {COMMISSION_TIMEOUT:.0f}s; "
     "the device may still join — check Indigo before retrying. Common causes: the "
@@ -689,7 +718,7 @@ class CommissionJobs:
             # what it reports about WHY changes.
             new_error = {
                 "code": "commissioning_failed",
-                "message": (
+                "message": with_discovery_hint(
                     "matter-server reported the commission failed after the "
                     f"plugin stopped waiting: {details}"
                 ),
@@ -868,6 +897,7 @@ class CommissionJobs:
             finally:
                 with self._lock:
                     self._removing.discard(_node_key(node_id))
+        message = with_discovery_hint(message)
         error = {"code": code, "message": message}
         if matter_error_code is not None:
             error["matterErrorCode"] = matter_error_code

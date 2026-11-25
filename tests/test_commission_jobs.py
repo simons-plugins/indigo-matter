@@ -1821,3 +1821,111 @@ def test_malformed_node_warns_when_only_identified_candidates_wait(mock_logger):
         assert body["jobId"] in logged
         assert "cannot be matched" in logged
     asyncio.run(scenario())
+
+
+# ----------------------------------------------------------------------
+# Issue #368 — a restart hint when matter-server's discovery found no device
+# ----------------------------------------------------------------------
+#: The error the reporter hit, verbatim (matter-server 0.6.8): ProtocolError's
+#: str() is "matter-server error 1: <details>", and details is this.
+_DISCOVERY_DETAILS = (
+    "Commission failed: discovery of node with discriminator 13 failed: "
+    "No commissionable device was discovered (matter error 1)")
+_RESTART_MENU_ITEM = "Restart the Matter controller"
+
+
+def _plugin_menu_names():
+    """Every <Name> in MenuItems.xml — the hint must quote one of them exactly."""
+    import xml.etree.ElementTree as ET
+    from pathlib import Path
+    xml_path = (Path(__file__).resolve().parent.parent / "indigo-matter.indigoPlugin"
+                / "Contents" / "Server Plugin" / "MenuItems.xml")
+    return {el.text for el in ET.parse(xml_path).getroot().iter("Name")}
+
+
+def _fail_with(mock_logger, error_factory):
+    async def scenario():
+        class FailingMatter(FakeMatter):
+            async def commission_with_code(self, code, **_kwargs):
+                raise error_factory()
+
+        jobs = _jobs(FailingMatter(), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "Side Gate"})
+        return jobs, body, await _await_terminal(jobs, body["jobId"])()
+    return asyncio.run(scenario())
+
+
+def test_the_hint_names_a_menu_item_that_exists():
+    assert _RESTART_MENU_ITEM in _plugin_menu_names()
+    assert commission_jobs.RESTART_MENU_ITEM == _RESTART_MENU_ITEM
+
+
+def test_discovery_failure_gets_the_restart_hint(mock_logger):
+    from protocol import ProtocolError
+    _jobs_obj, _body, final = _fail_with(mock_logger, lambda: ProtocolError(1, _DISCOVERY_DETAILS))
+    message = final["error"]["message"]
+    assert _DISCOVERY_DETAILS in message                       # the original text is kept
+    assert f"Plugins ▸ Matter ▸ {_RESTART_MENU_ITEM}" in message
+    assert "fresh pairing code" in message
+    # The menu path's only output is the failure log line — the hint is in it too.
+    assert _RESTART_MENU_ITEM in str(mock_logger.error.call_args)
+
+
+def test_the_http_error_keeps_its_documented_shape(mock_logger):
+    """API.md §3.3: error = {code, message, matterErrorCode}. The hint rides in
+    the free-text `message` only; no key is added, none renamed."""
+    from protocol import ProtocolError
+    _jobs_obj, _body, final = _fail_with(mock_logger, lambda: ProtocolError(1, _DISCOVERY_DETAILS))
+    _j2, _b2, plain = _fail_with(mock_logger, lambda: ProtocolError(1, "PASE failed"))
+    assert set(final) == set(plain)      # same envelope as any other failed job
+    assert final["status"] == "failed"
+    assert final["error"]["code"] == "commissioning_failed"
+    assert final["error"]["matterErrorCode"] == 1
+    assert set(final["error"]) == {"code", "message", "matterErrorCode"}
+
+
+@pytest.mark.parametrize("details", [
+    "NO COMMISSIONABLE DEVICE WAS DISCOVERED",
+    "no commissionable device was discovered",
+    "Error: [chip] No Commissionable Device Was Discovered after 3 minutes; giving up",
+])
+def test_the_match_survives_case_and_surrounding_text(mock_logger, details):
+    from protocol import ProtocolError
+    _j, _b, final = _fail_with(mock_logger, lambda: ProtocolError(1, details))
+    assert _RESTART_MENU_ITEM in final["error"]["message"]
+
+
+@pytest.mark.parametrize("details", [
+    "PASE failed",
+    "Commission failed: Attestation verification failed",
+    "discovery of node failed: device was not commissionable",
+    "No device was discovered",
+])
+def test_other_commissioning_failures_get_no_hint(mock_logger, details):
+    from protocol import ProtocolError
+    _j, _b, final = _fail_with(mock_logger, lambda: ProtocolError(50, details))
+    assert _RESTART_MENU_ITEM not in final["error"]["message"]
+    assert "pairing code" not in final["error"]["message"]
+    assert final["error"]["message"] == f"matter-server error 50: {details}"
+
+
+def test_a_commission_error_with_the_phrase_is_hinted_too(mock_logger):
+    _j, _b, final = _fail_with(
+        mock_logger, lambda: CommissionError("commissioning_failed", _DISCOVERY_DETAILS))
+    assert _RESTART_MENU_ITEM in final["error"]["message"]
+
+
+def test_a_late_discovery_failure_is_hinted_too(mock_logger):
+    async def scenario():
+        jobs = _jobs(TimeoutMatter(), mock_logger, schedule=asyncio.ensure_future)
+        _, body = jobs.create_job({"setupCode": "12345678901", "suggestedName": "X"})
+        await _await_terminal(jobs, body["jobId"])()
+        jobs.note_late_response(LateResponse(
+            message_id="mid-1", context=CommissionRequest(body["jobId"]),
+            error=(1, _DISCOVERY_DETAILS), result=None))
+        return jobs.get_job(body["jobId"])[1]
+    final = asyncio.run(scenario())
+    assert final["error"]["code"] == "commissioning_failed"
+    assert _RESTART_MENU_ITEM in final["error"]["message"]
+    assert set(final["error"]) == {"code", "message", "matterErrorCode"}
+
