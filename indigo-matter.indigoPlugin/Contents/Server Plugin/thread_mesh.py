@@ -678,10 +678,26 @@ def health_flags(  # pylint: disable=too-many-branches
     key = _mesh_key(diag)
     flags: list[HealthFlag] = []
 
-    if diag.role in (ROLE_UNSPECIFIED, ROLE_UNASSIGNED) or not diag.available:
+    # Two different facts, two different flags (#369). ``detached`` is a Thread
+    # statement: the node's own RoutingRole says it is not attached to a network.
+    # Role Unspecified is deliberately NOT in it — that is "RoutingRole could not be
+    # read" (the node is listed under Unreadable), not a claim about the mesh.
+    if diag.role == ROLE_UNASSIGNED:
         flags.append(HealthFlag(
             key, "bad", "detached",
-            f"{diag.name}: detached (role={diag.role_name}, available={diag.available})",
+            f"{diag.name}: detached (Thread role {diag.role_name}) — not attached to the Thread network",
+        ))
+    # ``unreachable`` is a controller statement: matter-server has no working session
+    # to the node. It says nothing about Thread attachment, and the Thread data shown
+    # for the node is matter-server's cache. Severity stays "bad" — the severity the
+    # old detached flag gave an unavailable node — because summary_states turns it
+    # into the user-bound ``threadHealth`` state (ADR-0008) and downgrading it would
+    # silently stop triggers that watch for "bad"; the code and wording carry the fix.
+    if not diag.available:
+        flags.append(HealthFlag(
+            key, "bad", "unreachable",
+            f"{diag.name}: unreachable — the controller reports no working session to this node "
+            "(Indigo's matter-server link, not Thread attachment); the Thread data shown for it is cached",
         ))
 
     if diag.is_router and diag.router_id is None:

@@ -453,13 +453,25 @@ class TestDegradation:
         assert diag.parent is None
         assert diag.best_rssi is None
 
-    def test_unavailable_node_flags_detached(self):
-        attrs = {"0/53/1": 2}
-        diag = parse_node_diag(4, "offline sensor", False, attrs)
+    def test_unavailable_router_flags_unreachable_not_detached(self):
+        # #369: "the controller has no session to this node" is not "off the Thread
+        # mesh" — a Router role (5) with available=False must NOT be called detached.
+        attrs = {"0/53/1": 5}
+        diag = parse_node_diag(4, "offline router", False, attrs)
         assert diag is not None
         assert diag.available is False
-        codes = {(f.code, f.severity) for f in health_flags(diag)}
-        assert ("detached", "bad") in codes
+        flags = health_flags(diag)
+        codes = {(f.code, f.severity) for f in flags}
+        assert ("unreachable", "bad") in codes
+        assert "detached" not in {f.code for f in flags}
+        message = next(f.message for f in flags if f.code == "unreachable")
+        assert "controller" in message and "not Thread" in message and "cached" in message
+
+    def test_unavailable_sleepy_node_flags_unreachable_not_detached(self):
+        attrs = {"0/53/1": 2}
+        diag = parse_node_diag(4, "offline sensor", False, attrs)
+        codes = {f.code for f in health_flags(diag)}
+        assert "unreachable" in codes and "detached" not in codes
 
     def test_unassigned_role_flags_detached(self):
         attrs = {"0/53/1": 1}  # Unassigned
@@ -467,6 +479,22 @@ class TestDegradation:
         assert diag is not None
         codes = {(f.code, f.severity) for f in health_flags(diag)}
         assert ("detached", "bad") in codes
+        assert "unreachable" not in {c for c, _ in codes}
+
+    def test_unassigned_and_unavailable_gets_both_flags(self):
+        # Two independent true statements: the Thread role says off the mesh, the
+        # controller says no session. Neither hides the other.
+        attrs = {"0/53/1": 1}
+        diag = parse_node_diag(5, "unassigned offline", False, attrs)
+        codes = {f.code for f in health_flags(diag)}
+        assert {"detached", "unreachable"} <= codes
+
+    def test_unspecified_role_alone_is_not_detached(self):
+        # Role Unspecified is "RoutingRole could not be read" (already listed under
+        # Unreadable), not a Thread statement — detached is Unassigned only (#369).
+        diag = parse_node_diag(6, "no role", True, {"0/53/7": []})
+        assert diag is not None and diag.role == ROLE_UNSPECIFIED
+        assert "detached" not in {f.code for f in health_flags(diag)}
 
     def test_malformed_neighbour_struct_is_skipped_and_warned(self):
         attrs = {

@@ -428,7 +428,7 @@ def test_neighbor_table_alone_yields_empty_until_role_is_also_seen():
 
 
 # ---------------------------------------------------------------------------
-# #334 post-review — B3.9: reachable == False -> detached -> "bad"
+# #334 post-review — B3.9: reachable == False -> unreachable (#369; was "detached") -> "bad"
 # ---------------------------------------------------------------------------
 
 def test_unreachable_device_reports_bad_health():
