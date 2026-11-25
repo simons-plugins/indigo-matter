@@ -1,7 +1,7 @@
 """Thread mesh survey: cache-first, optionally live-refreshed (#334).
 
 The one shared implementation of "read every Thread node's ThreadNetworkDiagnostics
-and, optionally, live-refresh the sleepy ones" — the menu diagnostic
+and, optionally, live-refresh them" — the menu diagnostic
 (:meth:`diagnostics_menu_mixin.DiagnosticsMenuMixin.menuReportThreadMesh`) and the
 IWS Thread page (``http_api_mixin.http_thread_page``) both need exactly this, and
 ``thread_mesh``'s own module docstring already explains why a cached sleepy-device
@@ -57,13 +57,15 @@ __all__ = ["Survey", "survey_thread_nodes", "run_survey"]
 
 # The five attributes a live read refreshes — exactly what a sleepy device's
 # cached snapshot can be hours stale on (role, neighbours, routes, and the two
-# fields a partition-split diagnosis hinges on). RouteTable (8) is included
-# despite this only ever live-reading NON-routers: it is NOT a router-only
-# structure — every SED in the 2026-09-01 fixture carries its own single-row
-# RouteTable (its path to the leader) — so leaving it out of the refresh used
-# to pair a freshly live LeaderRouterId with a stale cached RouteTable, which
-# could make a non-router's far_from_leader check judge a hop count that no
-# longer matched reality (#334 post-review, B4.5).
+# fields a partition-split diagnosis hinges on). RouteTable (8) is included for
+# every node: it is NOT a router-only structure — every SED in the 2026-09-01
+# fixture carries its own single-row RouteTable (its path to the leader) — so
+# leaving it out of the refresh used to pair a freshly live LeaderRouterId with a
+# stale cached RouteTable, which could make a non-router's far_from_leader check
+# judge a hop count that no longer matched reality (#334 post-review, B4.5).
+# NeighborTable (7) and RouteTable (8) are also the two attributes a router can
+# never be trusted to have fresh in the cache: Thread marks them changes-omitted,
+# so a subscription never refreshes them (#348).
 _LIVE_ATTR_IDS = (ATTR_ROUTING_ROLE, ATTR_NEIGHBOR_TABLE, ATTR_ROUTE_TABLE, ATTR_PARTITION_ID, ATTR_LEADER_ROUTER_ID)
 
 
@@ -136,12 +138,17 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
     fine but has no cluster-0x35 key at all (not a Thread node) is simply excluded
     — that is not a skip, it is a correct "not mine".
 
-    When ``live_read`` is true, every parsed diag that is NOT a router
-    (:attr:`~thread_mesh.NodeDiag.is_router`) is live-read concurrently, each
-    bounded by its own ``per_node_timeout``. Routers are never touched: a router is
-    mains-powered and polled continuously already, so its cache is not the stale
-    one. A live-read failure or timeout never drops the node: the cached
-    :class:`~thread_mesh.NodeDiag` stands, with ``read_error`` set to say why.
+    When ``live_read`` is true, EVERY parsed diag — routers included (#348) — is
+    live-read concurrently, each bounded by its own ``per_node_timeout``. Routers
+    used to be skipped on the theory that a mains-powered node's cache is fresh,
+    but NeighborTable and RouteTable are changes-omitted attributes: a
+    subscription never refreshes them, so a router's cached tables go stale
+    exactly like a sleepy device's. Because the reads are concurrent, the worst
+    case is one ``per_node_timeout`` however many nodes there are. A live-read
+    failure or timeout never drops the node: the cached
+    :class:`~thread_mesh.NodeDiag` stands, with ``read_error`` set to say why (and
+    its cached children stay too — a failed read is "unknown", never "no
+    children"; see :func:`_live_refresh` for the opposite, successful case).
 
     **#344 cache-age fields are applied AFTER live-refresh, not before.**
     ``date_commissioned``/``last_interview`` (from the raw node's own top-level
@@ -202,7 +209,7 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
         raw_stamp_values_by_node[node_id] = (raw_date_commissioned, raw_last_interview)
 
     if live_read:
-        targets = [diag for diag in diags if not diag.is_router]
+        targets = diags
         if targets:
             results = await asyncio.gather(
                 *(_live_refresh(matter, diag, raw_attributes_by_node[diag.node_id], per_node_timeout)
@@ -252,6 +259,7 @@ async def _live_refresh(matter: Any, diag: NodeDiag, raw_attributes: Mapping, pe
     cannot disturb the others sharing the same ``asyncio.gather`` call.
     """
     node_id = diag.node_id
+    cached_child_rlocs = [child.rloc16 for child in diag.children]
     try:
         values = await asyncio.wait_for(
             asyncio.gather(*(matter.read(node_id, 0, CLUSTER_THREAD_DIAG, attr) for attr in _LIVE_ATTR_IDS)),
@@ -302,6 +310,21 @@ async def _live_refresh(matter: Any, diag: NodeDiag, raw_attributes: Mapping, pe
     for declared_field in dataclasses.fields(NodeDiag):
         setattr(diag, declared_field.name, getattr(live_diag, declared_field.name))
 
+    # #348: only reached after a SUCCESSFUL read (every failure path above returned
+    # with the cached diag, children included, untouched). The live table replaced
+    # the cached one, so a cached child it no longer lists is a departed device: it
+    # is simply not drawn — the map is built from diag.children — and said so here,
+    # in the node's own parse_warnings (printed under its block and listed in the
+    # page's warnings), rather than vanishing without a word. Appended AFTER the
+    # field copy above, which would otherwise overwrite parse_warnings.
+    live_rlocs = {neighbour.rloc16 for neighbour in diag.neighbours}
+    for rloc16 in cached_child_rlocs:
+        if rloc16 not in live_rlocs:
+            diag.parse_warnings.append(
+                f"child 0x{rloc16:04X} was in matter-server's cache but is absent from the live "
+                "neighbour table — departed, not drawn"
+            )
+
 
 def _node_name(node_id: int, attributes: Mapping, node_names: Optional[Mapping[int, str]]) -> str:
     """The caller's name for this node if given, else "<vendor> <product>" from
@@ -331,7 +354,7 @@ def run_survey(
     """Indigo-thread bridge for :func:`survey_thread_nodes` (Indigo -> asyncio,
     see ``async_runtime``'s module docstring). Blocks the calling Indigo thread.
 
-    The non-router live reads inside run concurrently, so the total wait is NOT
+    The live reads inside run concurrently, so the total wait is NOT
     ``per_node_timeout`` multiplied by node count — it is one ``per_node_timeout``
     budget for the slowest of them, plus ``SURVEY_READ_TIMEOUT`` for the
     ``get_nodes()`` round trip and result marshalling back across the bridge

@@ -754,7 +754,15 @@ def health_flags(  # pylint: disable=too-many-branches
     # criterion (NodeDiag.is_router) — a REED is exactly as live-read-worthy as a
     # SED/ED, so it must get the same staleness note a cached reading deserves
     # (#334 finding B5.7; this used to name only SED/ED and silently skip REEDs).
-    if diag.source == "cache" and not diag.is_router:
+    #
+    # A router is cached-and-trusted by default (it is mains-powered), but #348:
+    # when a live pass ran and THIS router's read failed — read_error is set —
+    # its NeighborTable/RouteTable are matter-server's cache, and those two are
+    # changes-omitted, so they can be stale. It gets the note too, with wording
+    # that names the failed read. (read_error is also how a RoutingRole that
+    # would not parse is recorded, but that node is role Unspecified, never a router.)
+    router_read_failed = diag.is_router and diag.read_error is not None
+    if diag.source == "cache" and (not diag.is_router or router_read_failed):
         phrase = None
         if diag.last_interview is not None:
             # #344 (issue body): the baseline is a LOWER bound, never
@@ -766,7 +774,12 @@ def health_flags(  # pylint: disable=too-many-branches
             # unreadable as an age — _age_phrase returns None for it — so this
             # falls back to the no-age wording below rather than claim one.
             phrase = _age_phrase(seconds)
-        if phrase is not None:
+        if router_read_failed:
+            message = (
+                f"{diag.name}: cached — the live read failed ({diag.read_error}); its neighbour and route "
+                "tables are matter-server's cache, which is not refreshed by subscription and can be stale"
+            )
+        elif phrase is not None:
             message = (
                 f"{diag.name}: cached — baseline interview {phrase}; matter-server's cache can be "
                 "hours stale for sleepy devices"

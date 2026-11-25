@@ -354,7 +354,7 @@ class _ThreadFakeMatter:
         self.read_calls.append(node_id)
         if node_id in self._forbidden_nodes:
             # "Make it fatal" (root CLAUDE.md): if a future edit ever calls
-            # read() here — with liveReadNodes off, or on a router — this
+            # read() here — with liveReadNodes off — this
             # raises instead of quietly succeeding.
             raise AssertionError(f"read() must never touch node 0x{node_id:X}")
         if node_id in self._timeout_nodes:
@@ -603,14 +603,30 @@ def test_live_read_sleepy_off_performs_no_read_calls(mixin, off_value):
     assert matter.read_calls == []
 
 
-def test_routers_are_never_live_read(mixin):
+def test_routers_are_live_read_too(mixin):
+    # #348 — the opposite of the old "routers are never live-read": their
+    # NeighborTable/RouteTable are changes-omitted, so the cache cannot be trusted.
     nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
-    matter = _ThreadFakeMatter(nodes, forbidden_nodes=THREAD_ROUTER_IDS)
+    matter = _ThreadFakeMatter(nodes)
     _module, obj = _thread_mesh_mixin(mixin, matter)
     ok, _values = obj.menuReportThreadMesh({"liveReadNodes": True})[:2]
     assert ok
-    assert set(matter.read_calls) == THREAD_NON_ROUTER_IDS
-    assert not (set(matter.read_calls) & THREAD_ROUTER_IDS)
+    assert set(matter.read_calls) == THREAD_NON_ROUTER_IDS | THREAD_ROUTER_IDS
+
+
+def test_the_old_live_read_sleepy_dialog_id_is_still_honoured(mixin):
+    # Backward compatibility (#348): a saved dialog / script still sending the old
+    # checkbox id keeps its meaning, in both directions.
+    nodes = json.loads(THREAD_FIXTURE_PATH.read_text(encoding="utf-8"))
+    off = _ThreadFakeMatter(nodes, forbidden_nodes=THREAD_ROUTER_IDS | THREAD_NON_ROUTER_IDS)
+    _module, obj = _thread_mesh_mixin(mixin, off)
+    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": "false"})[:2]
+    assert ok and off.read_calls == []
+
+    on = _ThreadFakeMatter(nodes)
+    _module, obj = _thread_mesh_mixin(mixin, on)
+    ok, _values = obj.menuReportThreadMesh({"liveReadSleepy": "true"})[:2]
+    assert ok and set(on.read_calls) == THREAD_NON_ROUTER_IDS | THREAD_ROUTER_IDS
 
 
 def test_wifi_only_fabric_is_a_friendly_success_not_an_error(mixin):

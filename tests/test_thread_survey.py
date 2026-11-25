@@ -4,13 +4,13 @@
 matter-server's cache with a live refresh; both the menu diagnostic
 (``tests/test_diagnostics_menu.py``) and the IWS page (``tests/test_thread_page.py``)
 reuse it unchanged. This file owns the coroutine itself: concurrency, per-node
-timeout handling, router exclusion, naming, and the "a get_nodes() failure raises"
+timeout handling, router live-reads, naming, and the "a get_nodes() failure raises"
 contract, plus (post-review, #334) the :class:`~thread_survey.Survey` result shape,
 the live-refresh merge's own failure handling, and the sync bridge's timeout cancel.
 
 Fixture: ``tests/fixtures/thread_mesh/nodes.json`` — the same 7 real nodes
 ``test_thread_mesh.py`` parses. Routers (RoutingRole 5/Router): 0x27, 0x34, 0x3F.
-Non-routers (SED/REED, the only nodes ever live-read): 0x2E, 0x2F, 0x38, 0x40.
+Non-routers (SED/REED): 0x2E, 0x2F, 0x38, 0x40. The live pass reads all seven (#348).
 """
 from __future__ import annotations
 
@@ -22,7 +22,8 @@ from pathlib import Path
 
 import pytest
 
-from thread_mesh import ATTR_PARTITION_ID, build_mesh, parse_node_diag
+from thread_mesh import (ATTR_NEIGHBOR_TABLE, ATTR_PARTITION_ID, build_mesh, health_flags, parse_node_diag,
+                         render_report)
 from thread_survey import Survey, _parse_timestamp, run_survey, survey_thread_nodes
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "thread_mesh" / "nodes.json"
@@ -40,8 +41,11 @@ class FakeMatter:
     to read — the evidence for "routers are never touched"."""
 
     def __init__(self, nodes=None, *, timeout_nodes=(), error_nodes=(), forbidden_nodes=(),
-                 get_nodes_error=None):
+                 get_nodes_error=None, overrides=None):
         self.nodes = _fixture_nodes() if nodes is None else nodes
+        #: ``{(node_id, attribute): value}`` — what a LIVE read answers instead of
+        #: the cached value (the thing a test needs to differ between cache and live).
+        self._overrides = dict(overrides or {})
         self.read_calls: list[int] = []
         self._timeout_nodes = set(timeout_nodes)
         self._error_nodes = dict(error_nodes) if isinstance(error_nodes, dict) else \
@@ -69,8 +73,16 @@ class FakeMatter:
             raise asyncio.TimeoutError()
         if node_id in self._error_nodes:
             raise self._error_nodes[node_id]
+        if (node_id, attribute) in self._overrides:
+            return self._overrides[(node_id, attribute)]
         raw = next(n for n in self.nodes if n["node_id"] == node_id)
         return raw["attributes"].get(f"{endpoint}/{cluster}/{attribute}")
+
+    def __getattr__(self, name):
+        # "Make it fatal" (ADR-0004, read-only diagnostics): only get_nodes()/read()
+        # exist. Any write_attribute/send_command/anything else the survey might
+        # reach for raises instead of quietly succeeding.
+        raise AssertionError(f"the survey must only read; it touched matter.{name}")
 
 
 def _run(coro):
@@ -93,13 +105,14 @@ def test_without_live_read_every_fixture_node_is_returned_from_cache():
 # Live refresh (liveSleepy=True)
 # ---------------------------------------------------------------------------
 
-def test_live_read_only_ever_touches_non_router_nodes():
-    matter = FakeMatter(forbidden_nodes=ROUTER_IDS)
+def test_live_read_touches_routers_too():
+    # #348: a router's NeighborTable/RouteTable are changes-omitted, so a subscription
+    # never refreshes them and its cached tables go stale — the live pass must read
+    # routers exactly like everything else.
+    matter = FakeMatter()
     survey = _run(survey_thread_nodes(matter, live_read=True))
-    assert set(matter.read_calls) <= NON_ROUTER_IDS
-    assert set(matter.read_calls) == NON_ROUTER_IDS, "every non-router should have been live-read"
-    routers = {d.node_id: d for d in survey.diags if d.node_id in ROUTER_IDS}
-    assert all(d.source == "cache" and d.read_error is None for d in routers.values())
+    assert set(matter.read_calls) == ROUTER_IDS | NON_ROUTER_IDS, "every node should have been live-read"
+    assert all(d.source == "live" and d.read_error is None for d in survey.diags)
 
 
 def test_a_successful_live_read_flips_the_diag_to_live_and_keeps_its_data():
@@ -204,6 +217,124 @@ def test_live_read_returning_a_non_list_for_neighbor_table_keeps_the_cached_diag
     diag = next(d for d in survey.diags if d.node_id == 0x2E)
     assert diag.source == "cache"
     assert diag.read_error == "live read returned no NeighborTable"
+
+
+# ---------------------------------------------------------------------------
+# #348 — routers are live-read too: departed children, failed reads, degradation
+# ---------------------------------------------------------------------------
+
+DEPARTED_RLOC = 0x5C04  # 0x3F's cached child in the fixture
+
+
+def _cached_neighbor_table(node_id):
+    raw = next(n for n in _fixture_nodes() if n["node_id"] == node_id)
+    return raw["attributes"][f"0/53/{ATTR_NEIGHBOR_TABLE}"]
+
+
+def _mesh_names(survey):
+    return [n.name for n in build_mesh(survey.diags).nodes]
+
+
+def test_a_cached_child_absent_from_the_routers_live_table_draws_no_child_node():
+    live_table = [e for e in _cached_neighbor_table(0x3F) if e["2"] != DEPARTED_RLOC]
+    assert len(live_table) == 2, "sanity: the fixture's one child entry was removed"
+    # Control: from cache alone the child IS drawn, so the assertion below can fail.
+    cache_only = _run(survey_thread_nodes(FakeMatter(), live_read=False))
+    assert "Child 0x5C04" in _mesh_names(cache_only)
+
+    matter = FakeMatter(overrides={(0x3F, ATTR_NEIGHBOR_TABLE): live_table})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    router = next(d for d in survey.diags if d.node_id == 0x3F)
+    assert router.source == "live" and router.read_error is None
+    assert "Child 0x5C04" not in _mesh_names(survey)
+    # Said, not silent: the departure is reported, with the same wording both surfaces use.
+    assert any("0x5C04" in warning and "departed" in warning for warning in router.parse_warnings)
+    mesh = build_mesh(survey.diags)
+    assert any(node_id == 0x3F and "0x5C04" in text for node_id, text in mesh.warnings)
+
+
+def test_a_cached_child_still_in_the_live_table_is_kept_and_not_called_departed():
+    matter = FakeMatter()  # live table == cached table
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    router = next(d for d in survey.diags if d.node_id == 0x3F)
+    assert [c.rloc16 for c in router.children] == [DEPARTED_RLOC]
+    assert not any("departed" in warning for warning in router.parse_warnings)
+    assert "Child 0x5C04" in _mesh_names(survey)
+
+
+def test_a_router_whose_live_read_times_out_is_unreadable_stale_and_keeps_its_cached_children():
+    matter = FakeMatter(timeout_nodes={0x3F})
+    survey = _run(survey_thread_nodes(matter, live_read=True, per_node_timeout=5.0))
+    by_id = {d.node_id: d for d in survey.diags}
+    router = by_id[0x3F]
+    assert router.source == "cache" and "timed out" in router.read_error
+    # A failed read is "we don't know", never "no children": the cached child stays,
+    # and nothing claims it departed.
+    assert [c.rloc16 for c in router.children] == [DEPARTED_RLOC]
+    assert not any("departed" in warning for warning in router.parse_warnings)
+    assert "Child 0x5C04" in _mesh_names(survey)
+
+    mesh = build_mesh(survey.diags)
+    assert (0x3F, router.read_error) in mesh.unreadable
+    stale = [f for f in mesh.flags if f.code == "stale" and f.node_key == "node:0x3F"]
+    assert len(stale) == 1, "a failed-read router must carry the stale note (#348)"
+    assert "live read" in stale[0].message
+    report = "\n".join(render_report(mesh, survey.diags))
+    assert "freshness: cached" in report
+    assert "0x3F: live read timed out" in report
+
+    # One router failing must not touch another router's (or a leaf's) result.
+    for node_id in (0x27, 0x34, 0x2E, 0x40):
+        assert by_id[node_id].source == "live" and by_id[node_id].read_error is None
+
+
+def test_two_routers_failing_differently_each_get_their_own_reason():
+    matter = FakeMatter(timeout_nodes={0x3F}, error_nodes={0x27: ConnectionError("socket closed")})
+    survey = _run(survey_thread_nodes(matter, live_read=True, per_node_timeout=5.0))
+    by_id = {d.node_id: d for d in survey.diags}
+    assert "timed out" in by_id[0x3F].read_error
+    assert "socket closed" in by_id[0x27].read_error
+    assert by_id[0x34].source == "live" and by_id[0x34].read_error is None
+
+
+def test_a_live_neighbor_table_of_none_on_a_router_keeps_the_refusal_not_zero_neighbours():
+    matter = FakeMatter(overrides={(0x3F, ATTR_NEIGHBOR_TABLE): None})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    router = next(d for d in survey.diags if d.node_id == 0x3F)
+    assert router.source == "cache"
+    assert router.read_error == "live read returned no NeighborTable"
+    assert len(router.neighbours) == 3 and router.neighbours_known
+    assert [c.rloc16 for c in router.children] == [DEPARTED_RLOC], "None is not 'no children'"
+    assert "Child 0x5C04" in _mesh_names(survey)
+    flags = {(f.code, f.severity) for f in health_flags(router)}
+    assert ("single_neighbour", "bad") not in flags, "must not become '0 neighbours'"
+    assert "stale" in {f.code for f in health_flags(router)}
+
+
+def test_the_live_pass_with_zero_routers_still_reads_every_node():
+    nodes = [n for n in _fixture_nodes() if n["node_id"] in NON_ROUTER_IDS]
+    matter = FakeMatter(nodes=nodes, forbidden_nodes=ROUTER_IDS)
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    assert {d.node_id for d in survey.diags} == NON_ROUTER_IDS
+    assert set(matter.read_calls) == NON_ROUTER_IDS
+    assert all(d.source == "live" for d in survey.diags)
+
+
+def test_a_live_pass_that_fails_everywhere_does_not_produce_a_report_that_looks_live():
+    # Controller down mid-survey: get_nodes() answered (from cache) but every read fails.
+    matter = FakeMatter(error_nodes={n: ConnectionError("matter-server went away")
+                                     for n in ROUTER_IDS | NON_ROUTER_IDS})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    assert len(survey.diags) == 7
+    assert all(d.source == "cache" and "went away" in d.read_error for d in survey.diags)
+    mesh = build_mesh(survey.diags)
+    assert {node_id for node_id, _ in mesh.unreadable} == ROUTER_IDS | NON_ROUTER_IDS
+    stale_keys = {f.node_key for f in mesh.flags if f.code == "stale"}
+    assert stale_keys == {f"node:0x{n:X}" for n in ROUTER_IDS | NON_ROUTER_IDS}, "routers included"
+    report = "\n".join(render_report(mesh, survey.diags))
+    assert "freshness: live" not in report
+    assert report.count("freshness: cached") == 7
+    assert not any("departed" in w for _, w in mesh.warnings)
 
 
 # ---------------------------------------------------------------------------
