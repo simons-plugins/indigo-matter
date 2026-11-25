@@ -528,6 +528,9 @@ class DeviceSync:
         # later coverage change that excludes a DIFFERENT device) should be
         # free to log again.
         self._battery_exclusion_warned: set[tuple[int, int]] = set()
+        # (dev_id, cluster, attribute) already told that a null was dropped
+        # (#374) — per plugin run, same discipline as the set above.
+        self._null_warned: set[tuple[int, int, int]] = set()
         # Nodes already told their AttributeList stably fails ADR-0003's
         # node-device gate (issue #204 review, fix D) — both NodeLabel and
         # SoftwareVersionString read back False, not None. Same per-run-only
@@ -2880,19 +2883,45 @@ class DeviceSync:
             self._move_to_folder(dev_id, folder_id, dedup=dedup)
         return renamed
 
-    def _drop_null(self, handler: Any, node_id: Any, endpoint: Any, cluster: Any,
-                   attribute: Any, value: Any) -> bool:
+    def _drop_null(self, handler: Any, dev: Any, node_id: Any, endpoint: Any,
+                   cluster: Any, attribute: Any, value: Any) -> bool:
         """True when a null attribute value must not reach *handler* (#374).
 
-        A null means "no value known" (matter-server 1.5.0+ sends one when an
-        attribute is removed from a node). Writing anything for it would be a
-        made-up state, so the update is dropped, the last known state stays, and
-        no error state is set or cleared. The one choke point for live events and
-        node-snapshot priming; ``ClusterHandler.accepts_null`` is the opt-out for
-        a handler where null carries meaning.
+        A null means "no value known": matter-server 1.5.0+ sends one when an
+        attribute is removed from a node, and a nullable attribute can also be
+        temporarily unknown. Writing anything for it would be a made-up state,
+        so the update is dropped, the last known state stays, and no error state
+        is set or cleared (errorState means "unreachable" only). The one choke
+        point for live events and node-snapshot priming; ``accepts_null`` on the
+        handler is the opt-out for a cluster where null carries meaning.
+
+        Visibility: the first null per (device, cluster, attribute) per plugin
+        run is one INFO naming the device, so a state that has stopped following
+        the device is findable; repeats (every reconnect re-prime, a sensor that
+        sends null each interval) stay at debug. Same per-run discipline as
+        ``_battery_exclusion_warned``. The INFO fires for any handled cluster —
+        whether the handler maps this attribute to a state is not cheaply
+        knowable here. Never raises: the drop is decided before any logging.
         """
         if value is not None or handler.accepts_null:
             return False
+        try:
+            dev_id = int(dev.id)
+            key = (dev_id, int(cluster), int(attribute))
+            first = key not in self._null_warned
+            self._null_warned.add(key)
+            if first:
+                self.logger.info(
+                    "node %s endpoint %s (device %s \"%s\"): reported no value (null) for "
+                    "cluster %s attribute %s. The state it maps to keeps its last value "
+                    "(or its creation default if none was ever received) until a real one arrives.",
+                    node_id_to_str(node_id), endpoint, dev_id, getattr(dev, "name", "?"),
+                    cluster, attribute,
+                )
+                return True
+        except Exception as exc:  # pylint: disable=broad-except
+            # a diagnostic must not sink the update path
+            self.logger.debug("null-value notice failed: %s", exc)
         self.logger.debug(
             "null attribute value ignored, keeping last known state: node %s ep%s cl%s attr%s",
             node_id, endpoint, cluster, attribute,
@@ -3011,7 +3040,7 @@ class DeviceSync:
                     # standalone device_type_id but share this device — they must still prime.
                     if handler_type_id in ep_sibling_types:
                         continue
-            if self._drop_null(handler, node.node_id, ep, cluster, attribute, value):
+            if self._drop_null(handler, dev, node.node_id, ep, cluster, attribute, value):
                 continue
             try:
                 update = handler.on_attribute_update(dev, attribute, value)
@@ -4076,8 +4105,9 @@ class DeviceSync:
             self.apply_states(dev_id, handler.format_kv(states))
 
     def _on_attribute(self, evt: protocol.MatterEvent) -> None:  # pylint: disable=too-many-statements
-        # 51/50 statements since #344's cluster-0x35 stamp below (measured with
-        # the repo's pinned pylint config) — suppressed rather than restructured,
+        # Over the 50-statement limit since #344's cluster-0x35 stamp (51 then,
+        # measured with the repo's pinned pylint config); #374's null checks add
+        # a few more — suppressed rather than restructured,
         # the same tolerance this method's unsuppressed R0911/R0912 debt gets.
         if evt.node_id is None or evt.endpoint is None or evt.cluster is None:
             # a malformed attribute_updated frame (e.g. a truncated "ep/cl/at"
@@ -4124,8 +4154,6 @@ class DeviceSync:
         handler = self.registry.handler_for_cluster(evt.cluster)
         if handler is None:
             return
-        if self._drop_null(handler, evt.node_id, evt.endpoint, evt.cluster, evt.attribute, evt.value):
-            return
         if handler.node_scoped:
             # Node-scoped clusters (e.g. PowerSource) live on a different endpoint
             # than the devices they augment, so the update goes to the endpoints
@@ -4166,6 +4194,9 @@ class DeviceSync:
                         dev_id, evt.endpoint, evt.cluster, evt.attribute,
                     )
                     continue
+                if self._drop_null(handler, dev, evt.node_id, evt.endpoint, evt.cluster,
+                                   evt.attribute, evt.value):
+                    continue
                 try:
                     states = handler.on_attribute_update(dev, evt.attribute, evt.value)
                     if states:
@@ -4195,6 +4226,9 @@ class DeviceSync:
                 "device %s vanished mid-update (deleted?); dropped ep%s cl%s attr%s",
                 dev_id, evt.endpoint, evt.cluster, evt.attribute,
             )
+            return
+        if self._drop_null(handler, dev, evt.node_id, evt.endpoint, evt.cluster,
+                           evt.attribute, evt.value):
             return
         try:
             states = handler.on_attribute_update(dev, evt.attribute, evt.value)

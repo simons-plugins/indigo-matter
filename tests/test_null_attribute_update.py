@@ -111,7 +111,7 @@ def test_first_null_logs_one_info_naming_the_device(ds, indigo_env, mock_logger)
     assert len(infos) == 1, infos
     msg = infos[0]
     assert f'device {dev_id} "{devices[dev_id].name}"' in msg
-    assert "node 101" in msg and "endpoint 1" in msg
+    assert "node 0x65" in msg and "endpoint 1" in msg
     assert "cluster 6" in msg and "attribute 0" in msg
     assert "removed" not in msg  # a null may also be a nullable attribute that is unknown
     assert not mock_logger.warning.called

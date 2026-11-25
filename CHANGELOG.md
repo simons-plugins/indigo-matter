@@ -9,8 +9,10 @@ current version is `Info.plist`'s `PluginVersion`.
   removed from a node (after a firmware update or a re-interview) as an ordinary
   update whose value is null. The plugin read a null on/off value as "off" and
   wrote it to the device. A null now means "no value known": the plugin keeps the
-  device's last state and logs one debug line naming the node, endpoint, cluster and
-  attribute. The same applies to a null in a node's initial snapshot. Every other
+  device's last state, or its creation default if no value was ever received, and
+  logs one info line per device and attribute naming the device, node, endpoint,
+  cluster and attribute (repeats stay at debug). A null can also be a nullable
+  attribute that is temporarily unknown, so the line does not say "removed". The same applies to a null in a node's initial snapshot. Every other
   device type already ignored nulls; this is now enforced in one place for all of
   them. Thread diagnostics still reads a null neighbour table as "unknown" as before.
   Nothing here changes which matter-server the plugin uses.
