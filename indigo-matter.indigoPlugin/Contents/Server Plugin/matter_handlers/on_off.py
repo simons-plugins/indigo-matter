@@ -33,7 +33,6 @@ class OnOffHandler(ClusterHandler):
     ATTR_ON_OFF = 0x0000
     CMD_OFF = "Off"
     CMD_ON = "On"
-    CMD_TOGGLE = "Toggle"
 
     def is_primary_for(self, node: Any, endpoint: Any) -> bool:
         # A richer lighting handler (dimmer OR colour — a colour light is not
