@@ -13,10 +13,16 @@ current version is `Info.plist`'s `PluginVersion`.
   it shows it off, the same way the plugin's locks, valves and thermostats already
   behave. It falls back to Matter `Toggle` only when Indigo has no usable on/off
   state for the device. Dimmers are judged by their on/off state, not brightness.
-- User-visible consequence: if Indigo shows a light as off while it is actually
+- User-visible consequences. If Indigo shows a light as off while it is actually
   lit, Toggle sends `On` and nothing visible happens; a second Toggle then turns
-  it off. Two Toggles pressed before the device has reported back both read the
-  same shown state, so both send the same command.
+  it off. Two Toggles sent before the device has reported back used to return the
+  light to where it started (Matter `Toggle` twice); now both read the same shown
+  state and send the same command, so it ends in that state.
+- Explicit On/Off is also safer when a command times out and is retried: a late
+  command plus its retry give the same end state, where two Toggles would cancel.
+- The Matter `Toggle` fallback is defensive and not expected on real devices
+  (relays and dimmers always have an on/off state). If it is ever used, one
+  warning per device per plugin run names the device and the value.
 
 ## 2026.34.1 — Stopping the bridge node on purpose is no longer reported as a failure
 
