@@ -16,17 +16,16 @@ current version is `Info.plist`'s `PluginVersion`.
   (one day), because a larger number does not fit an Indigo state and would stop SQL
   Logger recording that device. A lock already holding more is left alone and is not
   written to the state.
-- A setting whose value the device has not reported yet now shows blank in the dialog,
-  and "unknown" on the device, instead of Indigo's default 0 (which looked like a real
-  value; for auto-relock it read as "off"). Leaving a field blank changes nothing;
-  typing a value, including 0, writes it. This applies to the existing sensor and relay
-  settings too. A save no longer refuses a value you did not change. After a change the
-  lock does not confirm, the field is blank next time you open it.
-- Not offered, on purpose: **Require PIN for remote operation**, because the plugin
-  locks and unlocks without a PIN, so switching it on would make the lock refuse
-  Indigo's commands. The "settable attributes not offered yet" report no longer
-  lists it or invites a request for it. **Operating mode** is still listed there;
-  it needs more work.
+- A setting whose value the device has not reported yet now shows blank in the dialog
+  (a picker leads with "Not read from the device yet (leave unchanged)"), and
+  "unknown" on the device, instead of Indigo's default 0 (which looked like a real
+  value; for auto-relock it read as "off"). Leaving it alone changes nothing; typing or
+  choosing a value, including 0, writes it. This applies to the existing sensor and relay
+  settings too. The values shown are the last the device reported, including for a
+  device that is currently unreachable. A save no longer refuses a value you did not
+  change. After a change the lock does not confirm, the setting is "not read" again the
+  next time you open it. Restarting a device in Indigo no longer overwrites a newer
+  value with an older one, and no longer clears its unreachable flag.
 - Fix (issue #368): when matter-server reports "No commissionable device was
   discovered", the error (Event Log, and the message dom.io shows) now
   suggests Plugins ▸ Matter ▸ **Restart the Matter controller** and retrying with a
