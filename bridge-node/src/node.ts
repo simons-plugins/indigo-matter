@@ -1681,15 +1681,33 @@ export class BridgeNode implements BridgeFacade {
         return this.getStatus();
     }
 
-    /** Whether matter.js's commissioning window is open right now (any kind, whoever opened it). */
-    private windowOpen(): boolean {
-        // `#server`, not the `server` getter: this is a plain read of the live node, and a subclass that
-        // narrows `server` (the churn-wiring test double) is about the session layer, not this.
+    /**
+     * The node's DeviceCommissioner, if one exists right now — NEVER constructing one. `env.get` on a
+     * missing service builds a fresh instance (or throws UnsupportedDependencyError), and during `erase()`
+     * matter.js tears the commissioner down and rebuilds it, so a read that went through `get` there either
+     * threw an error `settlePairingRead` does not retry or manufactured a stray commissioner and answered
+     * "closed" (#133). `#server`, not the `server` getter: a plain read of the live node, and a subclass that
+     * narrows `server` (the churn-wiring test double) is about the session layer, not this.
+     */
+    private commissioner(): DeviceCommissioner | undefined {
         const server = this.#server;
-        if (server === undefined) {
+        if (server === undefined || !server.lifecycle.isOnline) {
+            return undefined;
+        }
+        return server.env.maybeGet(DeviceCommissioner);
+    }
+
+    /**
+     * Whether matter.js's commissioning window is open right now (any kind, whoever opened it). Throws the
+     * retryable {@link UninitializedDependencyError} when the node is offline or has no commissioner (an erase
+     * in progress), exactly as the state read here did before 0.18.
+     */
+    private windowOpen(): boolean {
+        const commissioner = this.commissioner();
+        if (commissioner === undefined) {
             throw new UninitializedDependencyError("indigo-matter-bridge", "is not initialized");
         }
-        return server.env.get(DeviceCommissioner).windowStatus !== WINDOW_NOT_OPEN;
+        return commissioner.windowStatus !== WINDOW_NOT_OPEN;
     }
 
     /**
@@ -1714,7 +1732,8 @@ export class BridgeNode implements BridgeFacade {
             if (!server.lifecycle.isOnline || server.lifecycle.isCommissioned || this.#window.isOpen) {
                 return false;
             }
-            if (this.windowOpen()) {
+            const commissioner = this.commissioner();
+            if (commissioner === undefined || commissioner.windowStatus !== WINDOW_NOT_OPEN) {
                 return false;
             }
             await server.act(agent => agent.get(CommissioningServer).enterCommissionableMode());

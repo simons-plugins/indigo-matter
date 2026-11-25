@@ -29,7 +29,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, describe, it, mock } from "node:test";
 
-import { type Endpoint, Environment, Logger, Seconds, ServerNode, Time } from "@matter/main";
+import { type Endpoint, Environment, Environmental, Logger, Seconds, ServerNode, Time, UninitializedDependencyError } from "@matter/main";
 import { AdministratorCommissioning } from "@matter/main/clusters/administrator-commissioning";
 import { DeviceCommissioner } from "@matter/main/protocol";
 import { OnOffServer } from "@matter/main/behaviors/on-off";
@@ -2139,6 +2139,51 @@ describe("an uncommissioned bridge stays pairable (matter.js 0.18's 48-hour wind
             assert.equal(session.bridge.getPairing().manualPairingCode, codes.manualPairingCode);
         } finally {
             capture.restore();
+            await session.close();
+        }
+    });
+
+    it("getPairing during an erase either succeeds or throws the retryable UninitializedDependencyError, and never builds a commissioner (#133)", async () => {
+        // matter.js tears the commissioner down and rebuilds it during `erase()`. A read that goes through
+        // `env.get(DeviceCommissioner)` in that gap either throws UnsupportedDependencyError (which
+        // settlePairingRead does not retry) or CONSTRUCTS a stray commissioner and answers "closed".
+        const session = await boot(storage());
+        const created = { whileReading: 0, total: 0 };
+        let reading = false;
+        const original = (DeviceCommissioner as unknown as Record<symbol, (env: unknown) => unknown>)[Environmental.create]!;
+        (DeviceCommissioner as unknown as Record<symbol, unknown>)[Environmental.create] = function (this: unknown, env: unknown) {
+            created.total += 1;
+            if (reading) {
+                created.whileReading += 1;
+            }
+            return original.call(this, env);
+        };
+        try {
+            const outcomes = new Map<string, number>();
+            let polling = true;
+            const poll = (async () => {
+                while (polling) {
+                    try {
+                        reading = true;
+                        session.bridge.getPairing();
+                        outcomes.set("ok", (outcomes.get("ok") ?? 0) + 1);
+                    } catch (error) {
+                        const key = error instanceof UninitializedDependencyError ? "retryable" : `OTHER ${String(error)}`.slice(0, 120);
+                        outcomes.set(key, (outcomes.get(key) ?? 0) + 1);
+                    } finally {
+                        reading = false;
+                    }
+                    await new Promise(resolve => setImmediate(resolve));
+                }
+            })();
+            await session.bridge.server.erase();
+            polling = false;
+            await poll;
+            const others = [...outcomes.keys()].filter(key => key !== "ok" && key !== "retryable");
+            assert.deepEqual(others, [], `every read must succeed or throw the retryable error: ${JSON.stringify([...outcomes])}`);
+            assert.equal(created.whileReading, 0, "a read must never construct a DeviceCommissioner");
+        } finally {
+            (DeviceCommissioner as unknown as Record<symbol, unknown>)[Environmental.create] = original;
             await session.close();
         }
     });
