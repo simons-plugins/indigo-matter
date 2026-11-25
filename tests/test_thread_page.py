@@ -43,6 +43,26 @@ def _fixture_diags() -> list:
     return diags
 
 
+_ALL_IDS = (0x27, 0x2E, 0x2F, 0x34, 0x38, 0x3F, 0x40)
+
+
+def _real_survey(matter, *, live_read):
+    """A Survey built by the REAL ``survey_thread_nodes`` against a fake matter-server
+    (not cache-parsed fixtures with a flag flipped), so source / read_error /
+    parse_warnings are exactly what production produces."""
+    import asyncio  # pylint: disable=import-outside-toplevel
+    from thread_survey import survey_thread_nodes  # pylint: disable=import-outside-toplevel
+    return asyncio.run(survey_thread_nodes(matter, live_read=live_read, per_node_timeout=5.0))
+
+
+def _matter_with_old_interviews(**kwargs):
+    from test_thread_survey import FakeMatter  # pylint: disable=import-outside-toplevel
+    nodes = _raw_nodes()
+    for node in nodes:
+        node["last_interview"] = (NOW - timedelta(days=6)).isoformat()
+    return FakeMatter(nodes=nodes, **kwargs)
+
+
 def _fixture_mesh():
     diags = _fixture_diags()
     return build_mesh(diags), diags
@@ -146,17 +166,77 @@ def test_no_unreadable_section_when_nothing_is_wrong():
     assert "Unreadable / stale" not in html
 
 
-def test_live_true_shows_the_live_badge_not_cached():
-    # The CSS block always defines BOTH `.badge-live`/`.badge-cached` rules, so
-    # the check has to be on the applied class attribute, not on either
-    # substring appearing anywhere in the document.
-    mesh, diags = _fixture_mesh()
-    html_live = render_thread_page(mesh, diags, generated_at="t", live=True, plugin_id=PLUGIN_ID)
-    html_cached = render_thread_page(mesh, diags, generated_at="t", live=False, plugin_id=PLUGIN_ID)
-    assert 'class="badge badge-live"' in html_live
-    assert 'class="badge badge-cached"' not in html_live
-    assert 'class="badge badge-cached"' in html_cached
-    assert 'class="badge badge-live"' not in html_cached
+def test_the_badge_reports_what_the_survey_did_not_what_was_asked():
+    # #348 review: ``live`` only means "a live read was requested". The badge keys on
+    # the survey's own per-node source, built here by the REAL survey coroutine.
+    # The class check is on the applied attribute: the CSS defines both rules.
+    from test_thread_survey import FakeMatter  # pylint: disable=import-outside-toplevel
+    all_live = _real_survey(FakeMatter(), live_read=True)
+    mesh = build_mesh(all_live.diags)
+    html = render_thread_page(mesh, all_live.diags, generated_at="t", live=True, plugin_id=PLUGIN_ID)
+    assert 'class="badge badge-live">LIVE<' in html
+    assert 'class="badge badge-cached"' not in html
+
+    cached = _real_survey(FakeMatter(), live_read=False)
+    html = render_thread_page(build_mesh(cached.diags), cached.diags, generated_at="t", live=False,
+                              plugin_id=PLUGIN_ID)
+    assert 'class="badge badge-cached">CACHED<' in html
+    assert 'class="badge badge-live"' not in html
+
+
+def test_every_live_read_failing_does_not_show_live_and_keeps_the_stale_banner():
+    from test_thread_survey import FakeMatter  # pylint: disable=import-outside-toplevel
+    survey = _real_survey(_matter_with_old_interviews(timeout_nodes=set(_ALL_IDS)), live_read=True)
+    assert all(d.source == "cache" and d.read_error for d in survey.diags)
+    html = render_thread_page(build_mesh(survey.diags, NOW), survey.diags, generated_at="t", live=True,
+                              plugin_id=PLUGIN_ID, now=NOW)
+    assert 'class="badge badge-live"' not in html and ">LIVE<" not in html
+    assert 'class="badge badge-cached">CACHED<' in html
+    assert "a live read was requested but no node answered live" in html
+    assert "Some of this data is matter-server" in html, "the stale-cache banner must stay"
+
+
+def test_some_nodes_read_live_says_how_many_of_how_many():
+    survey = _real_survey(_matter_with_old_interviews(timeout_nodes={0x27, 0x34, 0x3F}), live_read=True)
+    html = render_thread_page(build_mesh(survey.diags, NOW), survey.diags, generated_at="t", live=True,
+                              plugin_id=PLUGIN_ID, now=NOW)
+    assert 'class="badge badge-cached">PARTLY LIVE<' in html
+    assert "4 of 7 nodes read live" in html
+    assert 'class="badge badge-live"' not in html
+    assert "Some of this data is matter-server" in html, "three cached nodes are still stale"
+
+
+def test_an_unreachable_node_is_marked_in_the_nodes_table_itself():
+    from test_thread_survey import FakeMatter  # pylint: disable=import-outside-toplevel
+    nodes = _raw_nodes()
+    next(n for n in nodes if n["node_id"] == 0x3F)["available"] = False
+    survey = _real_survey(FakeMatter(nodes=nodes), live_read=True)
+    html = render_thread_page(build_mesh(survey.diags), survey.diags, generated_at="t", live=True,
+                              plugin_id=PLUGIN_ID)
+    table = html[html.index("<h2>Nodes</h2>"):]
+    table = table[:table.index("</table>")]
+    rows = [row for row in table.split("<tr>") if "unreachable" in row]
+    assert len(rows) == 1 and "GRILLPLATS" in rows[0] and 'class="chip-stale"' in rows[0]
+    # control: an available node's row carries no such chip
+    assert table.count('title="matter-server marks this node unavailable"') == 1
+
+
+def test_a_departed_child_is_in_the_page_warnings_and_not_drawn_as_a_child():
+    # Mutation guard: a page that drops ``mesh.warnings`` loses the line; a map that
+    # ignores the live table redraws "Child 0x5C04".
+    from test_thread_survey import FakeMatter, DEPARTED_RLOC, _cached_neighbor_table  # pylint: disable=import-outside-toplevel
+    from thread_mesh import ATTR_NEIGHBOR_TABLE  # pylint: disable=import-outside-toplevel
+    cached = _real_survey(FakeMatter(), live_read=False)
+    control = render_thread_page(build_mesh(cached.diags), cached.diags, generated_at="t", live=False,
+                                 plugin_id=PLUGIN_ID)
+    assert "Child 0x5C04" in control, "control: from cache the child IS drawn"
+    live_table = [e for e in _cached_neighbor_table(0x3F) if e["2"] != DEPARTED_RLOC]
+    survey = _real_survey(FakeMatter(overrides={(0x3F, ATTR_NEIGHBOR_TABLE): live_table}), live_read=True)
+    html = render_thread_page(build_mesh(survey.diags), survey.diags, generated_at="t", live=True,
+                              plugin_id=PLUGIN_ID)
+    assert "Child 0x5C04" not in html
+    assert "child 0x5C04 was in matter-server&#x27;s cache but is absent from this router&#x27;s live" in html \
+        or "child 0x5C04 was in matter-server's cache but is absent from this router's live" in html
 
 
 def test_error_renders_the_banner_and_no_map():
@@ -238,12 +318,14 @@ def test_live_1_calls_run_survey_with_live_read_true(plug, monkeypatch):
     # test could never actually catch a broken ?live=1 rendering path (the
     # page would just show "no Thread devices" either way). Real diags make
     # ?live=1 render through the whole glue.
+    # #348 review: the fake returns what the REAL survey coroutine builds from a fake
+    # matter-server, so the LIVE badge below is earned by real per-node sources.
+    from test_thread_survey import FakeMatter  # pylint: disable=import-outside-toplevel
     calls = []
-    diags = _fixture_diags()
 
     def _fake_run_survey(runtime, matter, *, live_read, node_names=None, **kwargs):
         calls.append(live_read)
-        return Survey(diags=diags, raw_count=len(diags), skipped=[])
+        return _real_survey(FakeMatter(), live_read=live_read)
 
     monkeypatch.setattr("http_api_mixin.thread_survey.run_survey", _fake_run_survey)
     reply = plug.http_thread_page(_action(query={"live": "1"}))
@@ -829,15 +911,13 @@ def test_cached_node_under_an_hour_old_gets_neither_chip_nor_banner():
     assert "oldest node baseline: 10m" in html
 
 
-def test_live_render_shows_neither_banner_nor_oldest_baseline_note():
-    # NOTE: a per-node stale CHIP is keyed to that diag's own `source` (a live
-    # survey never live-reads routers, so a router can stay cache-sourced on
-    # an otherwise-"live" page) — only the page-wide badge note and banner are
-    # gated on the `live` flag itself, which is what this pins.
-    mesh, diags = _fixture_mesh()
-    for diag in diags:
-        diag.last_interview = NOW - timedelta(days=6)
-    html = render_thread_page(mesh, diags, generated_at="t", live=True, plugin_id=PLUGIN_ID, now=NOW)
+def test_an_all_live_render_shows_neither_banner_nor_oldest_baseline_note():
+    # Keyed on the survey: every node really read live (a REAL survey, with old
+    # interview stamps in the raw nodes), so no cached baseline is left to warn about.
+    survey = _real_survey(_matter_with_old_interviews(), live_read=True)
+    assert all(d.source == "live" for d in survey.diags)
+    html = render_thread_page(build_mesh(survey.diags, NOW), survey.diags, generated_at="t", live=True,
+                              plugin_id=PLUGIN_ID, now=NOW)
     assert "oldest node baseline" not in html
     assert "Some of this data is matter-server" not in html
 
