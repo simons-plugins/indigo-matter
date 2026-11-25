@@ -3,6 +3,18 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.35.1 — A null attribute update no longer turns an on/off device off
+
+- Fix (issue #374): matter-server 1.5.0 and later report an attribute that has been
+  removed from a node (after a firmware update or a re-interview) as an ordinary
+  update whose value is null. The plugin read a null on/off value as "off" and
+  wrote it to the device. A null now means "no value known": the plugin keeps the
+  device's last state and logs one debug line naming the node, endpoint, cluster and
+  attribute. The same applies to a null in a node's initial snapshot. Every other
+  device type already ignored nulls; this is now enforced in one place for all of
+  them. Thread diagnostics still reads a null neighbour table as "unknown" as before.
+  Nothing here changes which matter-server the plugin uses.
+
 ## 2026.34.1 — Stopping the bridge node on purpose is no longer reported as a failure
 
 - Fix (issue #366): an un-export that had completed was repeated on every plugin

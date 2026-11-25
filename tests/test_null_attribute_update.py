@@ -177,8 +177,9 @@ def test_thread_diagnostics_keeps_its_meaning_for_null(ds, indigo_env):
     result = ds.create_from_raw(node, "Plug")
     node_dev = devices[result["nodeDeviceId"]]
     ds.handle_event(_wire(111, "0/53/1", 2))  # SleepyEndDevice
+    assert node_dev.states.get("threadRole") != "SleepyEndDevice"  # gate still shut
     ds.handle_event(_wire(111, f"0/53/{thread_mesh.ATTR_NEIGHBOR_TABLE}", None))
-    assert node_dev.states.get("threadRole") == "Sleepy end device"
+    assert node_dev.states.get("threadRole") == "SleepyEndDevice"
 
 
 def test_default_for_handlers_is_to_skip_nulls():

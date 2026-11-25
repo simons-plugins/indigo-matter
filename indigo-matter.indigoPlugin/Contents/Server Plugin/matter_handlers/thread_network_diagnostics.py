@@ -116,6 +116,10 @@ class ThreadNetworkDiagnosticsHandler(ClusterHandler):
     cluster_name = "ThreadNetworkDiagnostics"
     device_type_id = "matterNode"
     node_scoped = False
+    # Null is information here: a NeighborTable of None is "seen, reading
+    # unknown" and opens the priming-order gate (#334 B2.1/B2.8). Without this
+    # device_sync's null skip (#374) would starve the gate.
+    accepts_null = True
 
     def __init__(self) -> None:
         # node_id -> {attribute_id: last-seen raw value}. See the module

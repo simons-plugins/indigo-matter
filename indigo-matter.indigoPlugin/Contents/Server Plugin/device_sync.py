@@ -2880,6 +2880,25 @@ class DeviceSync:
             self._move_to_folder(dev_id, folder_id, dedup=dedup)
         return renamed
 
+    def _drop_null(self, handler: Any, node_id: Any, endpoint: Any, cluster: Any,
+                   attribute: Any, value: Any) -> bool:
+        """True when a null attribute value must not reach *handler* (#374).
+
+        A null means "no value known" (matter-server 1.5.0+ sends one when an
+        attribute is removed from a node). Writing anything for it would be a
+        made-up state, so the update is dropped, the last known state stays, and
+        no error state is set or cleared. The one choke point for live events and
+        node-snapshot priming; ``ClusterHandler.accepts_null`` is the opt-out for
+        a handler where null carries meaning.
+        """
+        if value is not None or handler.accepts_null:
+            return False
+        self.logger.debug(
+            "null attribute value ignored, keeping last known state: node %s ep%s cl%s attr%s",
+            node_id, endpoint, cluster, attribute,
+        )
+        return True
+
     def _prime_states(self, node: NodeInfo, dev_id: int, endpoint_id: int,
                       own_type_id: str,
                       ep_sibling_types: Optional[set] = None) -> None:
@@ -2992,6 +3011,8 @@ class DeviceSync:
                     # standalone device_type_id but share this device — they must still prime.
                     if handler_type_id in ep_sibling_types:
                         continue
+            if self._drop_null(handler, node.node_id, ep, cluster, attribute, value):
+                continue
             try:
                 update = handler.on_attribute_update(dev, attribute, value)
                 if update:
@@ -4102,6 +4123,8 @@ class DeviceSync:
         # special fan-out treatment before any per-endpoint device resolution.
         handler = self.registry.handler_for_cluster(evt.cluster)
         if handler is None:
+            return
+        if self._drop_null(handler, evt.node_id, evt.endpoint, evt.cluster, evt.attribute, evt.value):
             return
         if handler.node_scoped:
             # Node-scoped clusters (e.g. PowerSource) live on a different endpoint
