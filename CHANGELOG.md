@@ -21,17 +21,37 @@ check moves.
   leaving Indigo showing off and the ecosystem showing on. The bridge now waits for the
   countdown's lock instead of failing. The same wait protects pushing a device on.
 - Fix (issue #203): restarting the bridge node mid-countdown left the device on for
-  good, because the countdown timer lived only in memory. After the next attach, a
-  device that reads on with a countdown still pending and no timer running is turned off
-  in Indigo and the countdown cleared (so it cannot fire again at the next restart).
-  **Known limitation:** the bridge stores the time remaining, not a deadline, so if you
-  turn the device off and on again in Indigo while the node is down, that deliberate
-  "on" is indistinguishable and is turned off. A countdown that is still running (a
-  plugin-only reconnect) and a device Indigo reports off are left alone.
+  good, because the countdown timer lived only in memory. The bridge now records each
+  timed-on countdown it starts (its end time, kept with the endpoint's record in
+  `endpoint-map.json`) and clears that record when the countdown ends, when the device
+  goes off by any route, and when the endpoint is removed or freshly exported. After the
+  next attach it turns off, in Indigo, a device that reads on with a recorded countdown
+  and no timer running: at once if the end time has passed, otherwise when it does. It
+  never infers a lost countdown from the remaining time alone, so a controller writing
+  the On-time attribute, or a device you re-export while its old countdown was
+  pending, is left alone. The off is sent only after the attach has completed, carries a
+  reason, and is logged in the Indigo log (`turning "<name>" off — its timed-on countdown
+  was lost when the bridge node restarted`). It is not considered done until Indigo
+  confirms the device is off, so an off that was never executed is sent again at the next
+  attach; a recovery that fails is reported in the Indigo log. A countdown that is still
+  running (a plugin-only reconnect) and a device Indigo reports off are left alone.
+  **Known limitations:** countdowns started under bridge 0.17.x have no recorded end time
+  and are not recovered; and if you turn the device off and on again in Indigo while the
+  node is down, that deliberate "on" is indistinguishable from the lost countdown and is
+  turned off.
 - Fix (issue #355): un-exporting a device, restarting the bridge node and exporting it
-  again brought the accessory back showing its old state instead of the state sent with
-  the export. The bridge now applies those states when it creates the endpoint, and a
-  failure to do so is reported rather than left silent.
+  again brought the accessory back showing its old state (on/off, brightness, colour
+  temperature) instead of the state sent with the export. The bridge now applies those
+  states when it creates the endpoint. A failure to do so is reported naming the device and
+  saying the accessory is live but may show stale state, instead of "nothing is exported",
+  and the plugin re-sends that device's state on its next change.
+- New: the plugin now warns, once per connection, when the running bridge node is older than
+  the version this plugin release installs, naming **Install/update the Matter bridge**
+  (and notes a newer one), like the existing matter-server check.
+- Internal: the bridge pins matter.js's device-type validation to `warn` explicitly, so a future
+  matter.js default change cannot refuse the mains smoke/CO endpoint and abort every attach; and
+  the commissioning window passes its duration to matter.js 0.18's own window timer so the two
+  agree (an expiry is still reported as expired).
 - Internal: the session-hygiene age in the bridge log is now a whole number of
   milliseconds (matter.js 0.18 reports session times on a monotonic clock; only
   differences between them are used).

@@ -312,6 +312,14 @@ Result: `<StatusReport>` (§4.3). The node reconciles its live endpoint set
 against `endpoints` — creating, updating and removing as needed — so a fresh
 connection is always a full reconcile (PRD §5.4 `startup`).
 
+**Work that follows the response (issue #203).** Once the attach response is written to
+the socket, and only then, the node runs one more step: it ends any timed-on countdown a
+node restart lost (see the `reason` note under §5). The commands it raises are therefore
+the first frames AFTER the attach response, never before it — a command sent during the
+attach request would reach a plugin that has not finished attaching, and Indigo's
+confirming `set_state` would be dropped as "not attached yet". The step is serialised
+with every other registry mutation and is skipped if the socket was superseded.
+
 **The live set is not empty at first attach.** Since bridge-node 0.6.0 the node
 rebuilds its last-known endpoint set from `endpoint-map.json` *before* it goes
 online (§4.3), so the first `attach` of a session reconciles against restored
@@ -1256,6 +1264,26 @@ The plugin resolves `indigoDeviceId` through the allow-list before acting; a
 command for a device no longer exported gets no action and a warning (PRD §7
 race row — the node responds to the ecosystem with failure when the endpoint
 is already gone).
+
+**`args.reason` (issue #203, additive — `protocolVersion` stays 2).** A `command` the NODE raises
+itself rather than relaying an ecosystem may carry `args.reason`. The only value today is
+`"countdown_lost_on_restart"`, on `{"command": "onOff", "args": {"value": false, "reason":
+"countdown_lost_on_restart"}}`: an ecosystem's timed-on countdown (`OnWithTimedOff`) was running when
+the node stopped, matter.js's timer died with it, and the device is still on. A client that ignores
+`reason` simply turns the device off, which is the whole of the required behaviour; the plugin
+additionally logs one INFO line naming the device. The node records each countdown it starts as a
+wall-clock deadline (`countdownDeadline` on that endpoint's `endpoint-map.json` record) and acts only
+when that marker is present, the endpoint reads on, and no timer is running — an `OnTime` attribute
+write never starts a timer and so never creates a marker. It does **not** consider the off done:
+the marker and `onTime` clear only when the plugin's `set_state {onOff: false}` confirms it, so an
+off the plugin never executed is sent again at the next attach. A deadline still in the future is
+honoured with a plain timer. A recovery that fails is reported through `StatusReport.warnings`
+(§4.3). Golden frame: `command_on_off_countdown_lost`.
+
+**`internal` after the endpoint went live (issue #355).** An `attach`/`upsert_endpoint` can fail with
+`internal` AFTER the endpoint was created, when the states sent with it could not be applied; the
+details then contain "the endpoint is live, but its exported state could not be applied" and name the
+device and role. The endpoint stays live (possibly showing stale state) and is not rolled back.
 
 ## 6. Invariants
 

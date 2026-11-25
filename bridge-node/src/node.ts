@@ -427,6 +427,12 @@ export class BridgeNode implements BridgeFacade {
         // teardown is wrong in either order, hence opting out rather than
         // relying on the sequence.
         environment.vars.set("runtime.signals", false);
+        // matter.js 0.18 validates every endpoint's device type against its conformance rules,
+        // in the mode `endpoint.validation` names ("warn" by default, "strict" refuses). Pinned
+        // here rather than inherited: the mains smoke/CO endpoint is built without Power Source
+        // and is logged, not refused, ONLY in "warn" — a strict default (or a stray
+        // MATTER_ENDPOINT_VALIDATION) would fail it, and with it every attach.
+        environment.vars.set("endpoint.validation", "warn");
 
         const server = await ServerNode.create({
             id: "indigo-matter-bridge",

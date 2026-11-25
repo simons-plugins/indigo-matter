@@ -29,7 +29,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, describe, it, mock } from "node:test";
 
-import { type Endpoint, Logger, Seconds, ServerNode } from "@matter/main";
+import { type Endpoint, Environment, Logger, Seconds, ServerNode } from "@matter/main";
 import { DeviceCommissioner } from "@matter/main/protocol";
 import { OnOffServer } from "@matter/main/behaviors/on-off";
 
@@ -1976,6 +1976,24 @@ describe("the commissioning window's timeout agrees with matter.js 0.18's own ti
     });
 });
 
+
+describe("device-type validation is pinned", () => {
+    it("the node sets endpoint.validation to 'warn' itself, whatever the environment says", async () => {
+        // matter.js 0.18 reads `endpoint.validation` (default "warn"; also MATTER_ENDPOINT_VALIDATION). A
+        // stricter value refuses a device type that fails conformance — e.g. the mains smoke/CO endpoint, which
+        // has no Power Source — and that would abort every attach. Pin it so a changed default cannot.
+        const vars = Environment.default.vars;
+        const before = vars.get("endpoint.validation");
+        vars.set("endpoint.validation", "strict");
+        const session = await boot(storage());
+        try {
+            assert.equal(vars.get("endpoint.validation"), "warn");
+        } finally {
+            vars.set("endpoint.validation", before);
+            await session.close();
+        }
+    });
+});
 
 describe("upgrade: a 0.17.x storage directory", () => {
     // Written by bridge 0.17.5 on matter.js 0.17.8 — see the README beside it for how.
