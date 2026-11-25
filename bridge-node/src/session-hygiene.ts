@@ -112,9 +112,19 @@ export interface SessionDescriptor {
     /** Hex, as matter.js logs it — matches `churn.ts`'s `peerNodeIdHex`. */
     peerNodeId: string;
     fabricIndex: number;
-    /** `Session.createdAt` — ms since epoch, stamped once at construction. */
+    /**
+     * `Session.createdAt`, stamped once at construction. Since matter.js 0.18
+     * this is `Time.nowUs` — a monotonic, sub-millisecond value that may drift
+     * from UTC, NOT epoch ms. Only differences between two sessions' values
+     * are used (see {@link supersededSessions}'s `ageMs`); never read it as a
+     * calendar time.
+     */
     createdAt: number;
-    /** `Session.activeTimestamp` — ms since epoch, last message RECEIVED. Informational only; no decision reads it. */
+    /**
+     * `Session.activeTimestamp` — last message RECEIVED, on the same monotonic
+     * clock as `createdAt` (0 until the first one). Informational only; no
+     * decision reads it.
+     */
     activeTimestamp: number;
     /** `session.subscriptions.size` at the moment of the check. Informational only; no decision reads it. */
     subscriptionCount: number;
@@ -126,7 +136,7 @@ export interface HygieneClosure {
     peerNodeId: string;
     fabricIndex: number;
     reason: HygieneReason;
-    /** The session's age at the moment of closure. */
+    /** The session's age at the moment of closure, whole milliseconds. */
     ageMs: number;
     /** How many sessions the peer held, including the new one. */
     peerSessionCount: number;
@@ -171,7 +181,9 @@ export function supersededSessions(
             peerNodeId: session.peerNodeId,
             fabricIndex: session.fabricIndex,
             reason: "superseded" as const,
-            ageMs: Math.max(0, justOpened.createdAt - session.createdAt),
+            // Rounded: the monotonic clock carries fractional milliseconds,
+            // and this is logged as "<n>ms old".
+            ageMs: Math.max(0, Math.round(justOpened.createdAt - session.createdAt)),
             peerSessionCount: peerSessions.length,
         }));
 }
