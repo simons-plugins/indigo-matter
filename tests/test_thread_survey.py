@@ -314,10 +314,18 @@ def test_a_live_neighbor_table_of_none_on_a_router_keeps_the_refusal_not_zero_ne
     assert router.read_error == "live read returned no NeighborTable"
     assert len(router.neighbours) == 3 and router.neighbours_known
     assert [c.rloc16 for c in router.children] == [DEPARTED_RLOC], "None is not 'no children'"
+    assert _no_departure_warning(router), "a refused table must never be reported as departures"
     assert "Child 0x5C04" in _mesh_names(survey)
     flags = {(f.code, f.severity) for f in health_flags(router)}
     assert ("single_neighbour", "bad") not in flags, "must not become '0 neighbours'"
     assert "stale" in {f.code for f in health_flags(router)}
+
+
+def test_a_garbage_live_neighbor_table_on_a_router_reports_no_departures():
+    matter = FakeMatter(overrides={(0x3F, ATTR_NEIGHBOR_TABLE): "garbage"})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    router = _assert_failed_read_kept_cache(survey, expect_in_error="live read returned no NeighborTable")
+    assert router.read_error == "live read returned no NeighborTable"
 
 
 def test_the_live_pass_with_zero_routers_still_reads_every_node():
@@ -329,7 +337,8 @@ def test_the_live_pass_with_zero_routers_still_reads_every_node():
     assert all(d.source == "live" for d in survey.diags)
 
 
-def test_a_live_pass_that_fails_everywhere_does_not_produce_a_report_that_looks_live():
+def test_a_live_pass_that_fails_everywhere_does_not_produce_a_text_report_that_looks_live():
+    # The text report; the page has its own (tests/test_thread_page.py).
     # Controller down mid-survey: get_nodes() answered (from cache) but every read fails.
     matter = FakeMatter(error_nodes={n: ConnectionError("matter-server went away")
                                      for n in ROUTER_IDS | NON_ROUTER_IDS})

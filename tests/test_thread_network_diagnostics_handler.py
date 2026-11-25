@@ -431,10 +431,35 @@ def test_neighbor_table_alone_yields_empty_until_role_is_also_seen():
 # #334 post-review — B3.9: reachable == False -> unreachable (#369; was "detached") -> "bad"
 # ---------------------------------------------------------------------------
 
+def _healthy_router_feed(handler, dev):
+    """Feed a real, healthy fixture router (0x27: two good router neighbours, a
+    router id from its own RouteTable) through the handler; returns the last result."""
+    import json  # pylint: disable=import-outside-toplevel
+    from pathlib import Path  # pylint: disable=import-outside-toplevel
+    from thread_mesh import ATTR_LEADER_ROUTER_ID, ATTR_ROUTE_TABLE  # pylint: disable=import-outside-toplevel
+    raw = next(n for n in json.loads((Path(__file__).parent / "fixtures" / "thread_mesh" / "nodes.json")
+                                     .read_text(encoding="utf-8")) if n["node_id"] == 0x27)["attributes"]
+    # Healthy in every other respect: no frame errors, and it IS the leader (router id
+    # 51), so neither high_frame_error nor far_from_leader can fire.
+    neighbours = [{**entry, "8": 0} for entry in raw[f"0/53/{ATTR_NEIGHBOR_TABLE}"]]
+    assert len(neighbours) >= 2
+    feed = {ATTR_ROUTING_ROLE: raw["0/53/1"], ATTR_ROUTE_TABLE: raw[f"0/53/{ATTR_ROUTE_TABLE}"],
+            ATTR_LEADER_ROUTER_ID: 51, ATTR_NEIGHBOR_TABLE: neighbours}
+    result = {}
+    for attr, value in feed.items():
+        result = handler.on_attribute_update(dev, attr, value)
+    return result
+
+
 def test_unreachable_device_reports_bad_health():
-    h = ThreadNetworkDiagnosticsHandler()
-    dev = _Dev(node_id=0x2E)
+    # Rebuilt (#348 review): the old version used an empty NeighborTable, which is
+    # "bad" (no parent) with or without unavailability, so it proved nothing. Here the
+    # router is healthy in every other respect, so the ONLY thing that can make it bad
+    # is reachable == False — and the reachable=True control shows it is otherwise "ok".
+    control = _Dev(node_id=0x27)
+    control.states["reachable"] = True
+    assert _healthy_router_feed(ThreadNetworkDiagnosticsHandler(), control)["threadHealth"] == "ok"
+
+    dev = _Dev(node_id=0x27)
     dev.states["reachable"] = False
-    h.on_attribute_update(dev, ATTR_ROUTING_ROLE, 2)  # SleepyEndDevice
-    result = h.on_attribute_update(dev, ATTR_NEIGHBOR_TABLE, [])
-    assert result["threadHealth"] == "bad"
+    assert _healthy_router_feed(ThreadNetworkDiagnosticsHandler(), dev)["threadHealth"] == "bad"
