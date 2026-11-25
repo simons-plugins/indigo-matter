@@ -1731,15 +1731,20 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # re-seeds from state, so leaving the stale value would show the
             # user a setting the device never adopted, which is the divergence
             # this whole feature exists to prevent.
+            # observed == [None] is a read-back of NULL — a real answer for a
+            # setting that declares a null state, so that is what is recorded
+            # (neither the stale value nor the one asked for).
             actual = observed[0] if observed else None
-            if actual is not None:
-                # Without clearing the error just set above: a refused or unverified
+            if actual is not None or (observed and plan.setting.null_state is not None):
+                # A null read-back is a real answer for a setting that declares a null
+                # state (#360): recorded as that state, and the setting is READ. Written
+                # without clearing the error just set above: a refused or unverified
                 # write must leave the device flagged.
                 self.device_sync.apply_states(
-                    dev_id, [{"key": plan.setting.key, "value": actual}], clear_error=False)
+                    dev_id, [plan.setting.state_entry(actual)], clear_error=False)
             else:
-                # No answer at all, or a null: the state still holds the old value
-                # and nothing confirms it, so it is not-read again (unread next open).
+                # No answer at all, or a null for a setting with no null state: the state
+                # still holds the old value and nothing confirms it, so it is unread again.
                 self.device_sync.mark_setting_unread(dev_id, plan.setting.key)
         except KeyError:
             # The device was deleted between the dialog closing and this

@@ -37,6 +37,23 @@ current version is `Info.plist`'s `PluginVersion`.
   long-running matter-server stopped hearing it. The cause is not confirmed, and
   nothing is restarted automatically. Other commissioning errors are unchanged.
 
+## 2026.37.0 — Power-on behaviour setting for dimmers and colour dimmers
+
+- New (issue #360): a dimmer or colour dimmer that implements the OnOff Lighting
+  feature now offers **After a power cut:** (Off / On / Toggle) in its Edit Device
+  dialog, the same setting on/off relays already had, with a **Power-On Behaviour**
+  state showing what the device holds. It is only shown when the device's own
+  attribute list says it supports it. Existing dimmers pick it up on upgrade;
+  nothing needs recreating. The "settable attributes not offered yet" log message
+  no longer lists StartUpOnOff for them.
+- A device that reports "restore the previous state" (null, the usual factory
+  default) is shown as **Previous state** in the dialog and as state value 255
+  ("previous state") for triggers, instead of a made-up "Off". That choice can be
+  **shown but not set from Indigo yet**: Indigo cannot write it back. Picking Off,
+  On or Toggle works as normal, and saving without touching the setting changes
+  nothing. This also fixes the same wrong "Off" on on/off relays.
+- Log lines for this setting now name the choice ("After a power cut is now On").
+
 ## 2026.34.1 — Stopping the bridge node on purpose is no longer reported as a failure
 
 - Fix (issue #366): an un-export that had completed was repeated on every plugin

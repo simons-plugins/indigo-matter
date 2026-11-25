@@ -1881,6 +1881,258 @@ def test_a_device_deleted_mid_flight_is_not_warned_about(
                    for call in mock_logger.warning.call_args_list)
 
 
+# --- issue #360: the same dialog on dimmers and colour dimmers -------------
+
+_DIMMER_ATTR_LISTS = {0x0006: [0, 16384, 16385, 16386, 16387, 65528, 65529, 65531, 65532, 65533]}
+_DIMMER_TYPES = ["matterDimmer", "matterColorDimmer"]
+
+
+def _dimmer_dev(type_id, states=None):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        id=7, name="Lamp", deviceTypeId=type_id,
+        pluginProps={"nodeId": "6", "endpointId": "1"},
+        states={"onOffState": False, "startUpOnOff": 1} if states is None else states)
+
+
+@pytest.mark.parametrize("type_id", _DIMMER_TYPES)
+def test_a_dimmers_dialog_is_seeded_with_the_current_value(plugin_cls, mock_indigo_base,
+                                                           mock_logger, type_id):
+    mock_indigo_base.devices = {7: _dimmer_dev(type_id)}
+    stub = _settings_stub(plugin_cls, mock_logger, limits={}, attr_lists=_DIMMER_ATTR_LISTS)
+    values, _errors = plugin_cls.getDeviceConfigUiValues(
+        stub, {"nodeId": "6", "endpointId": "1"}, type_id, 7)
+    assert values["hasStartUpOnOff"] == "yes"
+    assert values["startUpOnOff"] == "1"
+
+
+@pytest.mark.parametrize("type_id", _DIMMER_TYPES)
+def test_a_dimmer_lacking_the_attribute_gets_no_settings_section(plugin_cls, mock_indigo_base,
+                                                                 mock_logger, type_id):
+    mock_indigo_base.devices = {7: _dimmer_dev(type_id)}
+    stub = _settings_stub(plugin_cls, mock_logger, limits={},
+                          attr_lists={0x0006: [0, 65528, 65531]})
+    values, _errors = plugin_cls.getDeviceConfigUiValues(
+        stub, {"nodeId": "6", "endpointId": "1"}, type_id, 7)
+    assert values["hasStartUpOnOff"] == "no" and values["hasAnySetting"] == "no"
+
+
+@pytest.mark.parametrize("type_id", _DIMMER_TYPES)
+def test_a_dimmers_picker_offers_the_three_spec_values(plugin_cls, mock_indigo_base,
+                                                       mock_logger, type_id):
+    mock_indigo_base.devices = {7: _dimmer_dev(type_id)}
+    stub = _settings_stub(plugin_cls, mock_logger, limits={}, attr_lists=_DIMMER_ATTR_LISTS)
+    rows = plugin_cls.getSettingOptions(
+        stub, filter="startUpOnOff", valuesDict={"nodeId": "6", "endpointId": "1"},
+        typeId=type_id, targetId=7)
+    assert [value for value, _label in rows] == ["0", "1", "2"]
+
+
+@pytest.mark.parametrize("type_id", _DIMMER_TYPES)
+def test_closing_a_dimmers_dialog_submits_the_changed_setting(plugin_cls, mock_indigo_base,
+                                                              mock_logger, type_id):
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {7: _dimmer_dev(type_id)}
+    runtime = MagicMock()
+    stub = _settings_stub(plugin_cls, mock_logger, limits={}, runtime=runtime,
+                          matter=MagicMock(), attr_lists=_DIMMER_ATTR_LISTS)
+    stub._apply_setting = MagicMock(return_value="coro")
+    plugin_cls.closedDeviceConfigUi(
+        stub, {"nodeId": "6", "endpointId": "1", "startUpOnOff": "2"}, False, type_id, 7)
+    assert runtime.submit.call_count == 1
+    node_id, endpoint_id, dev_id, plan = stub._apply_setting.call_args.args
+    assert (node_id, endpoint_id, dev_id) == (6, 1, 7)
+    assert (plan.setting.cluster, plan.setting.attribute, plan.value) == (0x0006, 0x4003, 2)
+
+
+@pytest.mark.parametrize("type_id", _DIMMER_TYPES)
+def test_a_dimmer_write_the_device_ignores_flags_the_device_and_keeps_the_real_value(
+        plugin_cls, mock_indigo_base, mock_logger, type_id):
+    """The existing failure surface, on a dimmer: ERROR line, error state, and
+    the state is set to what the device holds — never to the asked-for value."""
+    from unittest.mock import MagicMock
+    from matter_handlers.settings import settings_for_type
+    from device_settings import PlannedWrite
+    dev = _dimmer_dev(type_id)
+    dev.setErrorStateOnServer = MagicMock()
+    mock_indigo_base.devices = {7: dev}
+    stub = _settings_stub(plugin_cls, mock_logger, matter=MagicMock())
+    stub.matter.write = _async_none
+    stub.matter.read = _async_value(1)          # ACKed, kept the old value
+    plan = PlannedWrite(settings_for_type(type_id)[0], 2, 1)
+    _run_apply(plugin_cls, stub, plan, dev_id=7)
+    assert mock_logger.error.called
+    dev.setErrorStateOnServer.assert_called_once_with("setting failed")
+    stub.device_sync.apply_states.assert_called_once_with(
+        7, [{"key": "startUpOnOff", "value": 1}])
+
+
+@pytest.mark.parametrize("type_id", _DIMMER_TYPES)
+def test_a_dimmer_write_that_cannot_be_sent_or_read_never_touches_state(
+        plugin_cls, mock_indigo_base, mock_logger, monkeypatch, type_id):
+    import functools
+    from unittest.mock import MagicMock
+    import device_settings
+    from matter_handlers.settings import settings_for_type
+    dev = _dimmer_dev(type_id)
+    dev.setErrorStateOnServer = MagicMock()
+    mock_indigo_base.devices = {7: dev}
+    stub = _settings_stub(plugin_cls, mock_logger, matter=MagicMock())
+
+    async def boom(*_args, **_kwargs):
+        raise TimeoutError("no answer")
+
+    monkeypatch.setattr(device_settings, "apply_setting",
+                        functools.partial(device_settings.apply_setting, sleep=_async_none))
+    stub.matter.write = boom
+    stub.matter.read = boom
+    plan = device_settings.PlannedWrite(settings_for_type(type_id)[0], 2, 1)
+    _run_apply(plugin_cls, stub, plan, dev_id=7)
+    assert mock_logger.error.called
+    dev.setErrorStateOnServer.assert_called_once_with("setting failed")
+    stub.device_sync.apply_states.assert_not_called()   # state not falsely updated
+
+
+@pytest.mark.parametrize("type_id", _DIMMER_TYPES)
+def test_a_dimmer_state_list_follows_its_own_attribute_list(plugin_cls, mock_indigo_base,
+                                                            mock_logger, type_id):
+    """#190 on a dimmer: gone on a positive NO, kept with the attribute, kept
+    while unknown."""
+    from types import SimpleNamespace
+    dev = SimpleNamespace(id=7, name="Lamp", deviceTypeId=type_id,
+                          pluginProps={"nodeId": "6", "endpointId": "1"})
+
+    def keys(lists):
+        plugin = _state_list_plugin(plugin_cls, mock_indigo_base, mock_logger, lists)
+        # onOffState is native to the dimmer base type; startUpOnOff must be in
+        # the type's own <States> (asserted against Devices.xml elsewhere).
+        plugin.base_state_lists[type_id] = _relay_states()
+        return [s["Key"] for s in plugin.getDeviceStateList(dev)]
+
+    assert keys(_PLAIN_PLUG_LISTS) == ["onOffState"]
+    assert keys(_LIGHTING_PLUG_LISTS) == ["onOffState", "startUpOnOff"]
+    assert keys({}) == ["onOffState", "startUpOnOff"]
+
+
+def test_the_test_fake_agrees_with_devices_xml_on_declared_states():
+    """tests/indigo_fakes.py mirrors Devices.xml's <States> by hand, and the
+    handlers' 'is this state on this device?' guard is only exercised if it does.
+
+    Both directions: every state the fake invents must exist in the XML for that
+    type, and every SETTING state the XML declares must be in the fake. (Not
+    every XML state is expected in the fake: Supports*-driven built-ins are
+    modelled separately.)
+    """
+    from indigo_fakes import _STATIC_DEVICE_TYPE_STATES
+    for type_id, fake_states in _STATIC_DEVICE_TYPE_STATES.items():
+        assert fake_states <= _device_state_ids(type_id), \
+            f"the fake gives {type_id} states Devices.xml does not declare: " \
+            f"{fake_states - _device_state_ids(type_id)}"
+    setting_keys = {s.key for s in _declared_settings()}
+    for setting in _declared_settings():
+        for type_id in setting.device_types:
+            assert setting.key in _STATIC_DEVICE_TYPE_STATES.get(type_id, set())
+    for type_id in {t for s in _declared_settings() for t in s.device_types}:
+        xml_settings = _device_state_ids(type_id) & setting_keys
+        assert xml_settings <= _STATIC_DEVICE_TYPE_STATES.get(type_id, set())
+
+
+# --- null ("previous state") at the callback level --------------------------
+
+_NULL_ROW = ("255", "Previous state (device default; cannot be chosen from Indigo)")
+
+
+@pytest.mark.parametrize("type_id", _DIMMER_TYPES)
+def test_the_picker_adds_the_previous_state_row_only_while_the_device_holds_null(
+        plugin_cls, mock_indigo_base, mock_logger, type_id):
+    def rows_for(state):
+        mock_indigo_base.devices = {7: _dimmer_dev(type_id, {"startUpOnOff": state})}
+        stub = _settings_stub(plugin_cls, mock_logger, limits={}, attr_lists=_DIMMER_ATTR_LISTS)
+        return plugin_cls.getSettingOptions(
+            stub, filter="startUpOnOff", valuesDict={"nodeId": "6", "endpointId": "1"},
+            typeId=type_id, targetId=7)
+
+    assert rows_for(255)[0] == _NULL_ROW and len(rows_for(255)) == 4
+    for state in (0, 1, 2):
+        assert [v for v, _ in rows_for(state)] == ["0", "1", "2"]
+
+
+@pytest.mark.parametrize("type_id", _DIMMER_TYPES)
+@pytest.mark.parametrize("state", [255, 0, 1, 2])
+@pytest.mark.parametrize("other_edit", [False, True])
+def test_an_untouched_startup_setting_never_validates_into_a_write(
+        plugin_cls, mock_indigo_base, mock_logger, type_id, state, other_edit):
+    """Whatever the device holds (including null), saving the dialog without
+    touching the setting — even while editing another field — validates and
+    submits nothing, and never reaches _apply_setting."""
+    from unittest.mock import MagicMock
+    dev = _dimmer_dev(type_id, {"onOffState": False, "startUpOnOff": state})
+    mock_indigo_base.devices = {7: dev}
+    runtime = MagicMock()
+    stub = _settings_stub(plugin_cls, mock_logger, limits={}, runtime=runtime,
+                          matter=MagicMock(), attr_lists=_DIMMER_ATTR_LISTS)
+
+    def touched(*_a, **_k):
+        raise AssertionError("_apply_setting must not be reached")
+
+    stub._apply_setting = touched
+    values, _ = plugin_cls.getDeviceConfigUiValues(
+        stub, {"nodeId": "6", "endpointId": "1"}, type_id, 7)
+    values = dict(values)
+    if other_edit:
+        values["nodeId"] = "6"
+        values["vendorName"] = "Edited"
+    ok = plugin_cls.validateDeviceConfigUi(stub, dict(values), type_id, 7)
+    assert ok[0] is True
+    plugin_cls.closedDeviceConfigUi(stub, dict(values), False, type_id, 7)
+    runtime.submit.assert_not_called()
+
+
+@pytest.mark.parametrize("type_id", _DIMMER_TYPES)
+def test_validate_rejects_an_out_of_enum_value_on_a_dimmer_with_a_field_error(
+        plugin_cls, mock_indigo_base, mock_logger, type_id):
+    mock_indigo_base.devices = {7: _dimmer_dev(type_id)}
+    stub = _settings_stub(plugin_cls, mock_logger, limits={}, attr_lists=_DIMMER_ATTR_LISTS)
+    result = plugin_cls.validateDeviceConfigUi(
+        stub, {"nodeId": "6", "endpointId": "1", "startUpOnOff": "7"}, type_id, 7)
+    assert result[0] is False and "startUpOnOff" in result[2]
+
+
+@pytest.mark.parametrize("type_id", _DIMMER_TYPES)
+def test_picking_off_while_the_device_holds_null_submits_a_write_of_zero(
+        plugin_cls, mock_indigo_base, mock_logger, type_id):
+    from unittest.mock import MagicMock
+    mock_indigo_base.devices = {7: _dimmer_dev(type_id, {"startUpOnOff": 255})}
+    runtime = MagicMock()
+    stub = _settings_stub(plugin_cls, mock_logger, limits={}, runtime=runtime,
+                          matter=MagicMock(), attr_lists=_DIMMER_ATTR_LISTS)
+    stub._apply_setting = MagicMock(return_value="coro")
+    plugin_cls.closedDeviceConfigUi(
+        stub, {"nodeId": "6", "endpointId": "1", "startUpOnOff": "0"}, False, type_id, 7)
+    assert runtime.submit.call_count == 1
+    plan = stub._apply_setting.call_args.args[3]
+    assert (plan.value, plan.previous) == (0, 255)
+
+
+@pytest.mark.parametrize("type_id", _DIMMER_TYPES)
+def test_a_failed_write_whose_readback_is_null_records_the_null_value(
+        plugin_cls, mock_indigo_base, mock_logger, type_id):
+    """Neither stale (1) nor the requested value (0): what the device holds."""
+    from unittest.mock import MagicMock
+    from matter_handlers.settings import settings_for_type
+    from device_settings import PlannedWrite
+    dev = _dimmer_dev(type_id, {"startUpOnOff": 255})
+    dev.setErrorStateOnServer = MagicMock()
+    mock_indigo_base.devices = {7: dev}
+    stub = _settings_stub(plugin_cls, mock_logger, matter=MagicMock())
+    stub.matter.write = _async_none
+    stub.matter.read = _async_value(None)
+    _run_apply(plugin_cls, stub, PlannedWrite(settings_for_type(type_id)[0], 0, 255), dev_id=7)
+    assert mock_logger.error.called
+    stub.device_sync.apply_states.assert_called_once_with(
+        7, [{"key": "startUpOnOff", "value": 255, "uiValue": "previous state"}])
+
+
 def test_a_crash_in_the_write_path_never_kills_the_loop(plugin_cls, mock_indigo_base,
                                                         mock_logger, monkeypatch):
     import functools

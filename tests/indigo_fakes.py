@@ -49,6 +49,8 @@ _STATIC_DEVICE_TYPE_STATES = {
     "matterRelay": {"startUpOnOff"},
     # issue #368 — the three DoorLock settings' states, as Devices.xml declares them.
     "matterLock": {"autoRelockTime", "wrongCodeEntryLimit", "userCodeTemporaryDisableTime"},
+    "matterDimmer": {"startUpOnOff"},       # issue #360
+    "matterColorDimmer": {"startUpOnOff"},
     # issue #204 / ADR-0008 — declared unconditionally in Devices.xml (no
     # Supports* prop gates any of them), same custom-type discipline as
     # matterEnergyMeter/matterUnknown's `reachable`. curEnergyLevel/

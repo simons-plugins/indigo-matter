@@ -308,7 +308,15 @@ def _is_editing(setting, values: dict) -> bool:
     two must agree — a setting one of them skips and the other does not is
     either a value validated and never sent, or one sent and never validated.
     """
-    return not _is_leave_alone(values.get(setting.key)) if setting.key in values else False
+    if setting.key not in values:
+        return False
+    text = str(values.get(setting.key, "")).strip()
+    # Blank and the "not read yet" row mean "leave alone"; so does the null row
+    # ("previous state", #360): it can never be written, so it is neither validated
+    # nor planned. Choosing a real value from it is a different string and IS a change.
+    if _is_leave_alone(text):
+        return False
+    return not (setting.null_state is not None and text == str(setting.null_state))
 
 
 def _is_leave_alone(raw: Any) -> bool:
@@ -512,10 +520,10 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
         if last_error is not None:
             # The send errored and the value is on the device anyway — exactly
             # the case that made "could not be sent" a lie.
-            return True, (f"{setting.label} is now {plan.value}{setting.unit} "
+            return True, (f"{setting.label} is now {setting.value_text(plan.value)} "
                           f"(the send reported an error — {last_error} — but the "
                           f"device holds the new value).")
-        return True, reason or f"{setting.label} is now {plan.value}{setting.unit}."
+        return True, reason or f"{setting.label} is now {setting.value_text(plan.value)}."
     if last_error is not None:
         if _is_plain_mismatch(read_back, plan.value) and not isinstance(
                 last_error, (TimeoutError, asyncio.TimeoutError)):

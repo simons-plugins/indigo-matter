@@ -64,6 +64,8 @@
                  Declared for the TYPE; getDeviceStateList removes it per unit
                  when the device's own AttributeList says it does not implement
                  the attribute (#190). -->
+            <!-- Values: 0 Off, 1 On, 2 Toggle, 255 = null / "previous state"
+                 (plugin encoding; never sent to the device — see the dimmers). -->
             <State id="startUpOnOff">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Power-On Behaviour</TriggerLabel>
@@ -119,8 +121,40 @@
             <Field id="productName" type="textfield" readonly="yes">
                 <Label>Product:</Label>
             </Field>
+            <!-- Power-on behaviour (issue #360) — the same OnOff Lighting-feature
+                 setting the relay offers (see matterRelay above), declared once in
+                 matter_handlers/settings.py for all three types. Hidden unless
+                 the unit's own AttributeList says it implements it. -->
+            <Field id="hasStartUpOnOff" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="hasAnySetting" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="settingsSeparator" type="separator"
+                   visibleBindingId="hasAnySetting" visibleBindingValue="yes"/>
+            <Field id="settingsHeading" type="label" fontColor="darkgray"
+                   visibleBindingId="hasAnySetting" visibleBindingValue="yes">
+                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home.</Label>
+            </Field>
+            <Field id="startUpOnOff" type="menu"
+                   visibleBindingId="hasStartUpOnOff" visibleBindingValue="yes">
+                <Label>After a power cut:</Label>
+                <List class="self" method="getSettingOptions" filter="startUpOnOff" dynamicReload="true"/>
+            </Field>
         </ConfigUI>
         <!-- States inherited from dimmer base type: onOffState, brightnessLevel -->
+        <States>
+            <!-- Power-on behaviour (issue #360); see matterRelay's declaration.
+                 getDeviceStateList withdraws it per unit on a positive NO from
+                 the unit's AttributeList (#190). Existing dimmers gain it when
+                 deviceStartComm rebuilds their state list.
+                 Values: 0 Off, 1 On, 2 Toggle, and 255 = the device reports null
+                 ("restore the previous state", the usual factory default;
+                 uiValue "previous state"). 255 is a plugin encoding, never sent
+                 to the device, and cannot be set from Indigo yet. -->
+            <State id="startUpOnOff">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Power-On Behaviour</TriggerLabel>
+                <ControlPageLabel>Power-On Behaviour</ControlPageLabel>
+            </State>
+        </States>
     </Device>
 
     <!-- Color dimmer: OnOff + LevelControl + ColorControl -->
@@ -146,8 +180,38 @@
             <Field id="productName" type="textfield" readonly="yes">
                 <Label>Product:</Label>
             </Field>
+            <!-- Power-on behaviour (issue #360) — the same OnOff Lighting-feature
+                 setting the relay offers (see matterRelay above), declared once in
+                 matter_handlers/settings.py for all three types. Hidden unless
+                 the unit's own AttributeList says it implements it. -->
+            <Field id="hasStartUpOnOff" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="hasAnySetting" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="settingsSeparator" type="separator"
+                   visibleBindingId="hasAnySetting" visibleBindingValue="yes"/>
+            <Field id="settingsHeading" type="label" fontColor="darkgray"
+                   visibleBindingId="hasAnySetting" visibleBindingValue="yes">
+                <Label>Device Settings — stored on the device itself, not in Indigo. Changing one changes how the device behaves for EVERY app it is paired with, including Apple Home.</Label>
+            </Field>
+            <Field id="startUpOnOff" type="menu"
+                   visibleBindingId="hasStartUpOnOff" visibleBindingValue="yes">
+                <Label>After a power cut:</Label>
+                <List class="self" method="getSettingOptions" filter="startUpOnOff" dynamicReload="true"/>
+            </Field>
         </ConfigUI>
         <States>
+            <!-- Power-on behaviour (issue #360); see matterRelay's declaration.
+                 getDeviceStateList withdraws it per unit on a positive NO from
+                 the unit's AttributeList (#190). Existing dimmers gain it when
+                 deviceStartComm rebuilds their state list.
+                 Values: 0 Off, 1 On, 2 Toggle, and 255 = the device reports null
+                 ("restore the previous state", the usual factory default;
+                 uiValue "previous state"). 255 is a plugin encoding, never sent
+                 to the device, and cannot be set from Indigo yet. -->
+            <State id="startUpOnOff">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Power-On Behaviour</TriggerLabel>
+                <ControlPageLabel>Power-On Behaviour</ControlPageLabel>
+            </State>
             <!-- ColorCapabilities bitmap (attr 0x400A): bit0 HS, bit1 EnhancedHue,
                  bit2 ColorLoop, bit3 XY, bit4 ColorTemperature. Cached so
                  handle_indigo_action can pick MoveToHueAndSaturation vs
