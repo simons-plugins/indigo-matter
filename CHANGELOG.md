@@ -3,6 +3,19 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.37.0 — Power-on behaviour setting for dimmers and colour dimmers
+
+- New (issue #360): a dimmer or colour dimmer that implements the OnOff Lighting
+  feature now offers **After a power cut:** (Off / On / Toggle) in its Edit Device
+  dialog, the same setting on/off relays already had, with a **Power-On Behaviour**
+  state showing what the device holds. It is only shown when the device's own
+  attribute list says it supports it. Existing dimmers pick it up on upgrade;
+  nothing needs recreating. The "settable attributes not offered yet" log message
+  no longer lists StartUpOnOff for them.
+- Not changed: a device set to "restore the previous state" (null) cannot be set
+  back to that from the dialog, on dimmers or relays. A null reading leaves the
+  state as it was rather than inventing a value.
+
 ## 2026.34.1 — Stopping the bridge node on purpose is no longer reported as a failure
 
 - Fix (issue #366): an un-export that had completed was repeated on every plugin
