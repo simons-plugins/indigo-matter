@@ -251,18 +251,70 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
     return Survey(diags=diags, raw_count=len(raw_nodes), skipped=skipped)
 
 
-async def _live_refresh(matter: Any, diag: NodeDiag, raw_attributes: Mapping, per_node_timeout: float) -> None:
+_ATTR_NAMES = {
+    ATTR_ROUTING_ROLE: "RoutingRole",
+    ATTR_NEIGHBOR_TABLE: "NeighborTable",
+    ATTR_ROUTE_TABLE: "RouteTable",
+    ATTR_PARTITION_ID: "PartitionId",
+    ATTR_LEADER_ROUTER_ID: "LeaderRouterId",
+}
+
+#: RoutingRole value for "Unassigned" — a node that says it is off the mesh has no
+#: partition or leader to report, so a null there is its true answer (#348 review).
+_ROLE_UNASSIGNED = 1
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _unusable_live_answers(live_values: Mapping[int, Any]) -> list[str]:
+    """Why the live answers cannot replace the cache — one message per unusable
+    attribute, empty when every one is usable. The governing rule of the live pass
+    (#348 review): a live answer replaces the cache only when it is USABLE; the
+    caller treats ANY unusable one as a failed read of the whole node, so a node
+    is never left half cached and half live."""
+    problems: list[str] = []
+    role = live_values[ATTR_ROUTING_ROLE]
+    if not _is_int(role):
+        problems.append("live read returned no usable RoutingRole")
+    if not isinstance(live_values[ATTR_NEIGHBOR_TABLE], list):
+        problems.append("live read returned no NeighborTable")
+    if not isinstance(live_values[ATTR_ROUTE_TABLE], list):
+        problems.append("live read returned no usable RouteTable")
+    detached = role == _ROLE_UNASSIGNED
+    for attr in (ATTR_PARTITION_ID, ATTR_LEADER_ROUTER_ID):
+        value = live_values[attr]
+        if not _is_int(value) and not (detached and value is None):
+            problems.append(f"live read returned no usable {_ATTR_NAMES[attr]}")
+    return problems
+
+
+async def _live_refresh(  # pylint: disable=too-many-return-statements
+        matter: Any, diag: NodeDiag, raw_attributes: Mapping, per_node_timeout: float) -> None:
     """Live-read ``diag`` in place; never raises — a failure only sets ``read_error``.
 
     Mutates ``diag`` directly (it is a plain, non-frozen dataclass already sitting
     in the caller's list) rather than returning a replacement, so one failing node
     cannot disturb the others sharing the same ``asyncio.gather`` call.
+
+    **All-or-nothing, usable-or-failed (#348 review).** Either every live answer is
+    usable and they replace the cached values together (``source`` -> ``"live"``),
+    or the read FAILED: the cached diag is left exactly as it was, ``read_error``
+    says why, ``source`` stays ``"cache"``. ``read_error`` is never set on a
+    ``"live"`` diag. Failed means: any attribute read raised or the node timed out
+    (the message names each attribute); any answer is unusable (see
+    :func:`_unusable_live_answers`); or the live NeighborTable came back empty when
+    the cache had neighbours (an empty answer from a node that was just seen with
+    neighbours is far likelier a failed read than "everyone left").
     """
     node_id = diag.node_id
     cached_child_rlocs = [child.rloc16 for child in diag.children]
+    cached_neighbour_count = len(diag.neighbours)
     try:
         values = await asyncio.wait_for(
-            asyncio.gather(*(matter.read(node_id, 0, CLUSTER_THREAD_DIAG, attr) for attr in _LIVE_ATTR_IDS)),
+            asyncio.gather(*(matter.read(node_id, 0, CLUSTER_THREAD_DIAG, attr) for attr in _LIVE_ATTR_IDS),
+                           return_exceptions=True),
             timeout=per_node_timeout,
         )
     except asyncio.TimeoutError:
@@ -278,16 +330,30 @@ async def _live_refresh(matter: Any, diag: NodeDiag, raw_attributes: Mapping, pe
         diag.read_error = f"live read failed: {exc}"
         return
 
+    # return_exceptions=True so one attribute failing is NAMED rather than hiding
+    # which of the five it was; any failure is still a failed read of the node.
+    failures = []
+    for attr, value in zip(_LIVE_ATTR_IDS, values):
+        if isinstance(value, BaseException):
+            reason = "timed out" if isinstance(value, asyncio.TimeoutError) else str(value) or repr(value)
+            failures.append(f"{_ATTR_NAMES[attr]} {reason}")
+    if failures:
+        if all(isinstance(value, asyncio.TimeoutError) for value in values):
+            diag.read_error = f"live read timed out after {per_node_timeout:g} s"  # the whole node, as before
+        else:
+            diag.read_error = f"live read failed: {'; '.join(failures)}"
+        return
+
     live_values = dict(zip(_LIVE_ATTR_IDS, values))
-    neighbor_table_value = live_values[ATTR_NEIGHBOR_TABLE]
-    if neighbor_table_value is None or not isinstance(neighbor_table_value, list):
-        # #334 post-review, B3.3: a live NeighborTable of None/garbage must not
-        # become "live / 0 neighbours / ok" — that is indistinguishable from a
-        # genuinely healthy router with no neighbours, and ties to thread_mesh's
-        # own absent-vs-empty distinction (B2.1). Keep the CACHED diag entirely
-        # (do not partial-merge the other attrs that DID answer) rather than
-        # invent a live reading this module cannot actually stand behind.
-        diag.read_error = "live read returned no NeighborTable"
+    problems = _unusable_live_answers(live_values)
+    if problems:
+        # #334 post-review, B3.3 (and #348 review): a live NeighborTable of
+        # None/garbage must not become "live / 0 neighbours / ok" — and the same
+        # goes for a role, route table, partition or leader that came back
+        # unusable. Keep the CACHED diag entirely (no partial merge of the attrs
+        # that DID answer) rather than invent a live reading this module cannot
+        # stand behind.
+        diag.read_error = "; ".join(problems)
         return
 
     merged = dict(raw_attributes)
@@ -299,9 +365,14 @@ async def _live_refresh(matter: Any, diag: NodeDiag, raw_attributes: Mapping, pe
 
     live_diag = parse_node_diag(node_id, diag.name, diag.available, merged)
     if live_diag is None:
-        # RoutingRole came back empty/unparseable — treat like any other failed
-        # live read rather than silently keeping half-updated cached data.
         diag.read_error = "live read returned no usable RoutingRole"
+        return
+    skipped_rows = len(live_values[ATTR_NEIGHBOR_TABLE]) - len(live_diag.neighbours)
+    if not live_diag.neighbours and cached_neighbour_count:
+        diag.read_error = (
+            "live neighbour table came back empty or unparseable while the cache had "
+            f"{cached_neighbour_count} neighbour(s) — the cached table is shown"
+        )
         return
     live_diag.source = "live"
     # Per-field copy rather than diag.__dict__.update(live_diag.__dict__): same
@@ -310,20 +381,23 @@ async def _live_refresh(matter: Any, diag: NodeDiag, raw_attributes: Mapping, pe
     for declared_field in dataclasses.fields(NodeDiag):
         setattr(diag, declared_field.name, getattr(live_diag, declared_field.name))
 
-    # #348: only reached after a SUCCESSFUL read (every failure path above returned
-    # with the cached diag, children included, untouched). The live table replaced
-    # the cached one, so a cached child it no longer lists is a departed device: it
-    # is simply not drawn — the map is built from diag.children — and said so here,
-    # in the node's own parse_warnings (printed under its block and listed in the
-    # page's warnings), rather than vanishing without a word. Appended AFTER the
-    # field copy above, which would otherwise overwrite parse_warnings.
-    live_rlocs = {neighbour.rloc16 for neighbour in diag.neighbours}
-    for rloc16 in cached_child_rlocs:
-        if rloc16 not in live_rlocs:
-            diag.parse_warnings.append(
-                f"child 0x{rloc16:04X} was in matter-server's cache but is absent from the live "
-                "neighbour table — departed, not drawn"
-            )
+    # #348: only reached after a SUCCESSFUL, usable read. The live table replaced
+    # the cached one, so a cached child it no longer lists was not seen live; it is
+    # not drawn as an anonymous child of this router (the map is built from
+    # diag.children) and the node's own parse_warnings say so. Worded as the
+    # OBSERVATION, not "departed": the child may have re-attached elsewhere, and an
+    # owned device is still drawn from its own parent data. Skipped when any live row
+    # was skipped as malformed — the skipped row might have been that child.
+    # Appended AFTER the field copy above, which overwrites parse_warnings.
+    if skipped_rows == 0:
+        live_rlocs = {neighbour.rloc16 for neighbour in diag.neighbours}
+        for rloc16 in cached_child_rlocs:
+            if rloc16 not in live_rlocs:
+                diag.parse_warnings.append(
+                    f"child 0x{rloc16:04X} was in matter-server's cache but is absent from this router's "
+                    "live neighbour table (it has left or re-attached elsewhere), so it is not drawn as an "
+                    "anonymous child of this router"
+                )
 
 
 def _node_name(node_id: int, attributes: Mapping, node_names: Optional[Mapping[int, str]]) -> str:

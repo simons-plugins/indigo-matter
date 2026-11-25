@@ -22,7 +22,8 @@ from pathlib import Path
 
 import pytest
 
-from thread_mesh import (ATTR_NEIGHBOR_TABLE, ATTR_PARTITION_ID, build_mesh, health_flags, parse_node_diag,
+from thread_mesh import (ATTR_LEADER_ROUTER_ID, ATTR_NEIGHBOR_TABLE, ATTR_PARTITION_ID, ATTR_ROUTE_TABLE,
+                         ATTR_ROUTING_ROLE, build_mesh, health_flags, parse_node_diag,
                          render_report)
 from thread_survey import Survey, _parse_timestamp, run_survey, survey_thread_nodes
 
@@ -74,7 +75,10 @@ class FakeMatter:
         if node_id in self._error_nodes:
             raise self._error_nodes[node_id]
         if (node_id, attribute) in self._overrides:
-            return self._overrides[(node_id, attribute)]
+            value = self._overrides[(node_id, attribute)]
+            if isinstance(value, BaseException):
+                raise value  # one attribute's read failing while its siblings answer
+            return value
         raw = next(n for n in self.nodes if n["node_id"] == node_id)
         return raw["attributes"].get(f"{endpoint}/{cluster}/{attribute}")
 
@@ -231,6 +235,10 @@ def _cached_neighbor_table(node_id):
     return raw["attributes"][f"0/53/{ATTR_NEIGHBOR_TABLE}"]
 
 
+def _no_departure_warning(diag):
+    return not any("absent from this router's live neighbour table" in w for w in diag.parse_warnings)
+
+
 def _mesh_names(survey):
     return [n.name for n in build_mesh(survey.diags).nodes]
 
@@ -248,7 +256,8 @@ def test_a_cached_child_absent_from_the_routers_live_table_draws_no_child_node()
     assert router.source == "live" and router.read_error is None
     assert "Child 0x5C04" not in _mesh_names(survey)
     # Said, not silent: the departure is reported, with the same wording both surfaces use.
-    assert any("0x5C04" in warning and "departed" in warning for warning in router.parse_warnings)
+    assert any("0x5C04" in warning and "absent from this router's live neighbour table" in warning
+               for warning in router.parse_warnings)
     mesh = build_mesh(survey.diags)
     assert any(node_id == 0x3F and "0x5C04" in text for node_id, text in mesh.warnings)
 
@@ -258,7 +267,7 @@ def test_a_cached_child_still_in_the_live_table_is_kept_and_not_called_departed(
     survey = _run(survey_thread_nodes(matter, live_read=True))
     router = next(d for d in survey.diags if d.node_id == 0x3F)
     assert [c.rloc16 for c in router.children] == [DEPARTED_RLOC]
-    assert not any("departed" in warning for warning in router.parse_warnings)
+    assert _no_departure_warning(router)
     assert "Child 0x5C04" in _mesh_names(survey)
 
 
@@ -271,7 +280,7 @@ def test_a_router_whose_live_read_times_out_is_unreadable_stale_and_keeps_its_ca
     # A failed read is "we don't know", never "no children": the cached child stays,
     # and nothing claims it departed.
     assert [c.rloc16 for c in router.children] == [DEPARTED_RLOC]
-    assert not any("departed" in warning for warning in router.parse_warnings)
+    assert _no_departure_warning(router)
     assert "Child 0x5C04" in _mesh_names(survey)
 
     mesh = build_mesh(survey.diags)
@@ -334,7 +343,131 @@ def test_a_live_pass_that_fails_everywhere_does_not_produce_a_report_that_looks_
     report = "\n".join(render_report(mesh, survey.diags))
     assert "freshness: live" not in report
     assert report.count("freshness: cached") == 7
-    assert not any("departed" in w for _, w in mesh.warnings)
+    assert not any("live neighbour table" in w for _, w in mesh.warnings)
+
+
+# ---------------------------------------------------------------------------
+# #348 review — the governing rule: a live answer replaces the cache only when it
+# is USABLE; anything else is a failed read (cached diag untouched, read_error says
+# why, source stays "cache"), and read_error is never set while source == "live".
+# ---------------------------------------------------------------------------
+
+def _assert_failed_read_kept_cache(survey, node_id=0x3F, *, expect_in_error):
+    diag = next(d for d in survey.diags if d.node_id == node_id)
+    cached = _direct_parse(node_id)
+    assert diag.source == "cache", "an unusable live answer must not flip the node to live"
+    assert diag.read_error is not None and expect_in_error in diag.read_error
+    assert diag.role == cached.role and diag.is_router
+    assert diag.router_id == cached.router_id and diag.partition_id == cached.partition_id
+    assert diag.leader_router_id == cached.leader_router_id
+    assert len(diag.neighbours) == len(cached.neighbours) and len(diag.routes) == len(cached.routes)
+    assert [c.rloc16 for c in diag.children] == [DEPARTED_RLOC]
+    assert _no_departure_warning(diag)
+    mesh = build_mesh(survey.diags)
+    assert "Child 0x5C04" in [n.name for n in mesh.nodes], "cached children stay drawn"
+    assert any(node_id == 0x3F for node_id, _ in mesh.unreadable)
+    assert any(f.code == "stale" and f.node_key == "node:0x3F" for f in mesh.flags)
+    return diag
+
+
+@pytest.mark.parametrize("bad_role", [None, "Router", {}, [], True])
+def test_an_unusable_live_routing_role_is_a_failed_read_not_an_unspecified_node(bad_role):
+    matter = FakeMatter(overrides={(0x3F, ATTR_ROUTING_ROLE): bad_role})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    diag = _assert_failed_read_kept_cache(survey, expect_in_error="live read returned no usable RoutingRole")
+    assert diag.read_error == "live read returned no usable RoutingRole"
+    assert diag.role_name == "Router"
+
+
+def test_the_unparseable_role_path_never_leaves_read_error_on_a_live_diag():
+    matter = FakeMatter(overrides={(0x3F, ATTR_ROUTING_ROLE): None})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    assert not [d for d in survey.diags if d.source == "live" and d.read_error]
+
+
+@pytest.mark.parametrize("empty_table", [[], [{"0": 1}], [{"bad": "row"}, "garbage", None]])
+def test_an_empty_or_all_malformed_live_neighbour_table_is_a_failed_read(empty_table):
+    # The cache had neighbours; "no neighbours" must not become a live fact, and
+    # every cached child must not become "departed".
+    matter = FakeMatter(overrides={(0x3F, ATTR_NEIGHBOR_TABLE): empty_table})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    diag = _assert_failed_read_kept_cache(survey, expect_in_error="live neighbour table came back empty")
+    assert "cached" in diag.read_error
+    assert ("single_neighbour", "bad") not in {(f.code, f.severity) for f in health_flags(diag)}
+
+
+def test_an_empty_live_neighbour_table_is_accepted_when_the_cache_was_empty_too():
+    nodes = _fixture_nodes()
+    raw = next(n for n in nodes if n["node_id"] == 0x3F)
+    raw["attributes"][f"0/53/{ATTR_NEIGHBOR_TABLE}"] = []
+    matter = FakeMatter(nodes=nodes, overrides={(0x3F, ATTR_NEIGHBOR_TABLE): []})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    diag = next(d for d in survey.diags if d.node_id == 0x3F)
+    assert diag.source == "live" and diag.read_error is None and diag.neighbours == []
+
+
+def test_a_live_table_with_a_skipped_malformed_row_skips_the_departed_check():
+    # One good non-child row plus one malformed row: the malformed one might have
+    # been the child, so absence proves nothing and nothing is called departed.
+    cached = _cached_neighbor_table(0x3F)
+    good_router = next(e for e in cached if not e["13"])
+    matter = FakeMatter(overrides={(0x3F, ATTR_NEIGHBOR_TABLE): [good_router, {"0": 1}]})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    diag = next(d for d in survey.diags if d.node_id == 0x3F)
+    assert diag.source == "live" and diag.read_error is None
+    assert len(diag.neighbours) == 1
+    assert _no_departure_warning(diag)
+    assert any("malformed" in w for w in diag.parse_warnings), "the skipped row is still reported"
+
+
+@pytest.mark.parametrize("attr", [ATTR_ROUTE_TABLE, ATTR_PARTITION_ID, ATTR_LEADER_ROUTER_ID])
+@pytest.mark.parametrize("bad", [None, {}, "x"])
+def test_an_unusable_live_route_table_partition_or_leader_is_a_failed_read(attr, bad):
+    matter = FakeMatter(overrides={(0x3F, attr): bad})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    diag = _assert_failed_read_kept_cache(survey, expect_in_error="live read returned no usable")
+    # Nothing partially merged: the attributes that DID answer fine are not applied.
+    names = {ATTR_ROUTE_TABLE: "RouteTable", ATTR_PARTITION_ID: "PartitionId",
+             ATTR_LEADER_ROUTER_ID: "LeaderRouterId"}
+    assert names[attr] in diag.read_error
+
+
+def test_a_detached_unassigned_node_may_legitimately_have_no_partition_or_leader():
+    # A node live-reporting role Unassigned has no partition/leader to report; that
+    # null is the true answer, not an unusable one.
+    matter = FakeMatter(overrides={(0x2E, ATTR_ROUTING_ROLE): 1, (0x2E, ATTR_PARTITION_ID): None,
+                                   (0x2E, ATTR_LEADER_ROUTER_ID): None})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    diag = next(d for d in survey.diags if d.node_id == 0x2E)
+    assert diag.source == "live" and diag.read_error is None and diag.role_name == "Unassigned"
+    assert diag.partition_id is None
+
+
+def test_a_single_failing_attribute_read_is_named_and_nothing_is_merged():
+    matter = FakeMatter(overrides={(0x3F, ATTR_ROUTE_TABLE): ConnectionError("route read boom"),
+                                   (0x3F, ATTR_PARTITION_ID): 777})  # the sibling answered; must NOT apply
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    diag = _assert_failed_read_kept_cache(survey, expect_in_error="RouteTable")
+    assert "route read boom" in diag.read_error
+    assert diag.partition_id != 777
+
+
+def test_two_failing_attribute_reads_are_both_named():
+    matter = FakeMatter(overrides={(0x3F, ATTR_ROUTE_TABLE): ConnectionError("a"),
+                                   (0x3F, ATTR_LEADER_ROUTER_ID): ConnectionError("b")})
+    survey = _run(survey_thread_nodes(matter, live_read=True))
+    diag = next(d for d in survey.diags if d.node_id == 0x3F)
+    assert "RouteTable" in diag.read_error and "LeaderRouterId" in diag.read_error
+
+
+def test_departure_detection_on_one_router_still_works_while_another_router_fails():
+    live_table = [e for e in _cached_neighbor_table(0x3F) if e["2"] != DEPARTED_RLOC]
+    matter = FakeMatter(timeout_nodes={0x27}, overrides={(0x3F, ATTR_NEIGHBOR_TABLE): live_table})
+    survey = _run(survey_thread_nodes(matter, live_read=True, per_node_timeout=5.0))
+    by_id = {d.node_id: d for d in survey.diags}
+    assert by_id[0x27].read_error and by_id[0x27].source == "cache"
+    assert by_id[0x3F].source == "live" and not _no_departure_warning(by_id[0x3F])
+    assert "Child 0x5C04" not in _mesh_names(survey)
 
 
 # ---------------------------------------------------------------------------
