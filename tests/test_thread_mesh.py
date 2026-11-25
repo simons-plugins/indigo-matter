@@ -287,6 +287,26 @@ class TestHealthFlags:
         flags = health_flags(diag)
         assert any(f.code == "stale" and f.severity == "info" for f in flags)
 
+    def test_a_cached_router_gets_the_stale_note_too_and_threadhealth_is_unchanged(self):
+        # #348 review: this PR establishes a router's neighbour/route tables go stale,
+        # so a cache-only report must say so for routers as well. Info-only: the
+        # trigger-bound threadHealth state must not move because of it.
+        diag = _parse_fixture(0x34)  # Router, source "cache"
+        assert diag.is_router and diag.source == "cache"
+        stale = next(f for f in health_flags(diag) if f.code == "stale")
+        assert stale.severity == "info"
+        assert "never refreshed by subscription" in stale.message
+        without = summary_states(diag)
+        diag.source = "live"
+        assert summary_states(diag) == without
+        assert without["threadHealth"] in ("ok", "warn", "bad")
+
+    def test_a_failed_live_read_router_keeps_the_failed_read_wording(self):
+        diag = _parse_fixture(0x34)
+        diag.read_error = "live read timed out after 30 s"
+        stale = next(f for f in health_flags(diag) if f.code == "stale")
+        assert "live read failed" in stale.message and "timed out after 30 s" in stale.message
+
     def test_live_source_gets_no_stale_note(self):
         diag = _parse_fixture(0x2F)
         diag.source = "live"
@@ -465,7 +485,7 @@ class TestDegradation:
         assert ("unreachable", "bad") in codes
         assert "detached" not in {f.code for f in flags}
         message = next(f.message for f in flags if f.code == "unreachable")
-        assert "controller" in message and "not Thread" in message and "cached" in message
+        assert "controller" in message and "not Thread" in message and "cache" in message
 
     def test_unavailable_sleepy_node_flags_unreachable_not_detached(self):
         attrs = {"0/53/1": 2}
@@ -489,12 +509,49 @@ class TestDegradation:
         codes = {f.code for f in health_flags(diag)}
         assert {"detached", "unreachable"} <= codes
 
-    def test_unspecified_role_alone_is_not_detached(self):
-        # Role Unspecified is "RoutingRole could not be read" (already listed under
-        # Unreadable), not a Thread statement — detached is Unassigned only (#369).
+    def test_unspecified_role_alone_is_not_detached_but_is_role_unknown(self):
+        # Role Unspecified is "RoutingRole could not be read" (also listed under
+        # Unreadable), not a Thread statement — detached is Unassigned only (#369) —
+        # but it must never read as healthy: it gets its own BAD role_unknown flag.
         diag = parse_node_diag(6, "no role", True, {"0/53/7": []})
         assert diag is not None and diag.role == ROLE_UNSPECIFIED
-        assert "detached" not in {f.code for f in health_flags(diag)}
+        flags = {(f.code, f.severity) for f in health_flags(diag)}
+        assert "detached" not in {c for c, _ in flags}
+        assert ("role_unknown", "bad") in flags
+        message = next(f.message for f in health_flags(diag) if f.code == "role_unknown")
+        assert "could not be read" in message and "unspecified" in message
+
+    @pytest.mark.parametrize("role", [0, None])
+    @pytest.mark.parametrize("node_id", [0x2E, 0x34])
+    def test_a_node_with_no_known_role_never_reports_threadhealth_ok(self, role, node_id):
+        # A real fixture node (good neighbours, a parent / router id), so nothing
+        # ELSE could make it "bad": only the unknown role does.
+        raw = next(n for n in _raw_nodes() if n["node_id"] == node_id)
+        attrs = dict(raw["attributes"])
+        attrs["0/53/1"] = role
+        diag = parse_node_diag(node_id, "x", True, attrs)
+        assert diag is not None and diag.role == ROLE_UNSPECIFIED
+        assert summary_states(diag)["threadHealth"] == "bad"
+        assert "role_unknown" in {f.code for f in health_flags(diag)}
+        # control: the same node with its real role is not bad for any other reason
+        healthy = parse_node_diag(node_id, "x", True, dict(raw["attributes"]))
+        assert "role_unknown" not in {f.code for f in health_flags(healthy)}
+
+    def test_unreachable_wording_for_a_cached_node_says_the_data_is_the_cache(self):
+        diag = parse_node_diag(4, "offline", False, {"0/53/1": 5})
+        message = next(f.message for f in health_flags(diag) if f.code == "unreachable")
+        assert "matter-server marks this node unavailable" in message
+        assert "not Thread attachment" in message
+        assert "matter-server's cache" in message
+        assert "live read" not in message and "no working session" not in message
+
+    def test_unreachable_wording_for_a_live_read_node_says_the_live_read_succeeded(self):
+        diag = parse_node_diag(4, "offline", False, {"0/53/1": 5})
+        diag.source = "live"
+        message = next(f.message for f in health_flags(diag) if f.code == "unreachable")
+        assert "matter-server marks this node unavailable" in message
+        assert "a live read in this survey succeeded anyway" in message
+        assert "matter-server's cache" not in message and "is cached" not in message
 
     def test_malformed_neighbour_struct_is_skipped_and_warned(self):
         attrs = {
@@ -571,6 +628,24 @@ class TestRenderReport:
         mesh = build_mesh(diags)
         for line in render_report(mesh, diags):
             assert len(line) <= 120
+
+    def test_long_flag_warning_and_unreadable_lines_wrap_inside_the_width(self):
+        # The longest messages this module can produce: unreachable, a failed-read
+        # router's stale note, a dropped-child warning and an unreadable reason.
+        diags = _all_diags()
+        router = next(d for d in diags if d.node_id == 0x3F)
+        router.available = False
+        router.read_error = "live read failed: RouteTable ConnectionError('matter-server went away'); " * 2
+        router.parse_warnings.append(
+            "child 0x5C04 was in matter-server's cache but is absent from this router's live neighbour table "
+            "(it has left or re-attached elsewhere), so it is not drawn as an anonymous child of this router")
+        mesh = build_mesh(diags)
+        lines = render_report(mesh, diags)
+        assert all(len(line) <= 120 for line in lines)
+        text = "\n".join(lines)
+        assert "unreachable" in text and "re-attached elsewhere" in text
+        # wrapped, not truncated: the tail of every long message survives
+        assert "not Thread attachment" in text and "anonymous child of this router" in text
 
     def test_empty_mesh_does_not_raise(self):
         mesh = build_mesh([])
@@ -1240,13 +1315,13 @@ class TestStaleFlagWithInterviewAge:
         diag.last_interview = self.NOW + timedelta(hours=2)
         stale = next(f for f in health_flags(diag, self.NOW) if f.code == "stale")
         assert "baseline interview" not in stale.message
-        assert stale.message == f"{diag.name}: cached — matter-server's cache can be hours stale for sleepy devices"
+        assert stale.message == f"{diag.name}: cached — matter-server's cache can be hours stale; a router's neighbour and route tables are never refreshed by subscription"
 
     def test_stale_message_keeps_the_old_wording_when_interview_is_unknown(self):
         diag = _parse_fixture(0x2F)
         stale = next(f for f in health_flags(diag, self.NOW) if f.code == "stale")
         assert "baseline interview" not in stale.message
-        assert stale.message == f"{diag.name}: cached — matter-server's cache can be hours stale for sleepy devices"
+        assert stale.message == f"{diag.name}: cached — matter-server's cache can be hours stale; a router's neighbour and route tables are never refreshed by subscription"
 
     def test_now_defaults_to_the_real_clock_without_raising(self):
         # health_flags(diag) with no `now` at all must still work — every
