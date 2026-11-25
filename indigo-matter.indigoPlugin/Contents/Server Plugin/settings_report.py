@@ -62,7 +62,7 @@ __all__ = [
     "survey_node", "report_lines", "explore_lines", "describe_fingerprint",
     "cluster_label", "attribute_label", "GLOBAL_ATTRIBUTES",
     "INFRASTRUCTURE_CLUSTERS", "DRIVEN_ATTRIBUTES", "COMMAND_FIELD_ATTRIBUTES",
-    "NOT_SETTINGS", "REVIEWED_COMMAND_FIELD_COLLISIONS",
+    "NOT_SETTINGS", "REVIEWED_COMMAND_FIELD_COLLISIONS", "DELIBERATELY_NOT_OFFERED",
     "MODEL_VERSION",
 ]
 
@@ -253,6 +253,19 @@ REVIEWED_COMMAND_FIELD_COLLISIONS: dict = {
         "SetHolidaySchedule (§5.2.10.12.4)"),
 }
 
+#: Writable attributes that ARE real settings and that the plugin deliberately
+#: never offers, so the report must not invite anyone to ask for them (#368).
+#: Distinct from ``NOT_SETTINGS`` (not settings at all, for the three reasons
+#: above) and from ``REVIEWED_COMMAND_FIELD_COLLISIONS`` (real settings the
+#: generator mis-flags): these are excluded for what offering them would DO to
+#: this plugin. The explorer is unaffected — it still shows them, as writable.
+DELIBERATELY_NOT_OFFERED: dict = {
+    (0x0101, 0x0033): (
+        "DoorLock.RequirePinForRemoteOperation: this plugin locks and unlocks "
+        "without a PIN, so switching it on would make the lock refuse every "
+        "command Indigo sends and cut Indigo off from the lock"),
+}
+
 #: Longest rendered attribute value the explorer prints before truncating. A
 #: node's AttributeList or a camera's Viewport struct can be hundreds of
 #: characters, and an event log line that wraps forty times is unreadable — but
@@ -408,6 +421,8 @@ def survey_node(node: NodeInfo,
                 if (cluster, attribute) in DRIVEN_ATTRIBUTES:
                     continue
                 if (cluster, attribute) in NOT_SETTINGS:
+                    continue
+                if (cluster, attribute) in DELIBERATELY_NOT_OFFERED:
                     continue
                 if (cluster, attribute) in already:
                     continue
