@@ -451,9 +451,11 @@ SETTINGS: tuple = (
         label="Auto-relock time",
         cluster=CLUSTER_DOOR_LOCK,
         attribute=ATTR_AUTO_RELOCK_TIME,
-        # The spec sets no limit (uint32); the one-day cap is OURS. A uint32 does not
-        # fit an Indigo Integer state, and SQL Logger's INT4 column overflows on a
-        # large value and silently stops that device's history.
+        # The spec sets no limit (uint32); the one-day cap on what a user may ENTER is
+        # ours, by choice. A separate guard (DeviceSync.apply_states) refuses to store
+        # any reading past 2**31-1 in a state, because an Indigo Integer state feeds
+        # SQL Logger's INT4 column, which overflows and silently stops that device's
+        # history. A lock already holding more than a day keeps it unless changed.
         bounds=StaticRange(0, 86400),
         device_types=frozenset({"matterLock"}),
         unit=" seconds",

@@ -6005,21 +6005,6 @@ def test_a_setting_never_read_is_not_primed(ds, indigo_env):
     assert ds.setting_primed(dev_id, "userCodeTemporaryDisableTime") is False
 
 
-def test_a_reading_dropped_because_its_state_does_not_exist_yet_is_not_primed_and_is_logged(
-        ds, indigo_env, mock_logger):
-    _indigo, devices = indigo_env
-    ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
-    dev_id = ds.lookup(0x39, 1)
-    dev = devices[dev_id]
-    for key in _LOCK_SETTING_STATES:
-        del dev.states[key]
-    ds._settings_primed.clear()                    # a fresh run
-    mock_logger.debug.reset_mock()
-    ds.reconcile_all([LOCK_SETTINGS_NODE])
-    assert not any(ds.setting_primed(dev_id, key) for key in _LOCK_SETTING_STATES)
-    assert any("autoRelockTime" in str(call) for call in mock_logger.debug.call_args_list)
-
-
 def test_priming_before_the_states_exist_is_repaired_by_a_re_prime_after_the_refresh(
         ds, indigo_env):
     """The ordering hole: reconcile primed the lock BEFORE deviceStartComm added

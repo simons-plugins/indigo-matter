@@ -103,13 +103,31 @@ class FakeDev:
             self.displayStateId = "onOffState"
 
     def updateStatesOnServer(self, kvlist):
+        # Real Indigo clears a device's error state on a state write unless told
+        # not to (the documented ``updateStateOnServer(key, value, clearErrorState)``
+        # defaults to True; the batch form is not documented as taking that
+        # argument, so the fake models the default and offers no way to opt out -
+        # a write that must NOT clear the error has to use the single-key call).
         for kv in kvlist:
-            self.states[kv["key"]] = kv["value"]
-            # Real Indigo's states dict answers a "key.ui" lookup with the
-            # display value from a uiValue-bearing write (used by both fix A's
-            # evidence check and fix D's reachable/unreachable column text).
-            if "uiValue" in kv:
-                self.states[f"{kv['key']}.ui"] = kv["uiValue"]
+            self._write_state(kv["key"], kv["value"], kv.get("uiValue"))
+        self.error = None
+        self.errorState = ""
+
+    def updateStateOnServer(self, key, value=None, uiValue=None, clearErrorState=True,
+                            decimalPlaces=None, triggerEvents=True):
+        self._write_state(key, value, uiValue)
+        if clearErrorState:
+            self.error = None
+            self.errorState = ""
+
+    def _write_state(self, key, value, ui_value):
+        self.states[key] = value
+        # Real Indigo's states dict answers a "key.ui" lookup with the display
+        # value from a uiValue-bearing write (used by both fix A's evidence check
+        # and fix D's reachable/unreachable column text). A write WITHOUT a uiValue
+        # leaves the old display string alone - the pessimistic case.
+        if ui_value is not None:
+            self.states[f"{key}.ui"] = ui_value
 
     def stateListOrDisplayStateIdChanged(self):
         self.state_list_rebuilds += 1

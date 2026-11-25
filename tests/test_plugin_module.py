@@ -1535,6 +1535,8 @@ def _settings_stub(plugin_cls, mock_logger, limits=None, runtime=None, matter=No
     from unittest.mock import MagicMock
     table = _FP300_LIMITS if limits is None else limits
     device_sync = MagicMock()
+    # Explicit, so a MagicMock's truthy auto-attribute can never silently mean "read".
+    device_sync.setting_primed.return_value = True
     device_sync.setting_limits.side_effect = (
         lambda node, ep, cluster, attr: table.get((cluster, attr)))
     lists = _FP300_ATTR_LISTS if attr_lists is None else attr_lists
@@ -1836,7 +1838,7 @@ def test_a_lying_device_leaves_the_state_alone_and_flags_the_device(plugin_cls, 
     # the device actually holds, so the dialog (which re-seeds from state)
     # cannot show a value the device never adopted.
     stub.device_sync.apply_states.assert_called_once_with(
-        5, [{"key": "holdTime", "value": 10}])
+        5, [{"key": "holdTime", "value": 10}], clear_error=False)
 
 
 def test_a_failed_flag_on_a_LIVE_device_warns_rather_than_going_quiet(
@@ -2680,7 +2682,7 @@ def test_a_failed_lock_write_is_an_error_and_never_shows_the_requested_value(
     assert "0x88" in str(mock_logger.error.call_args)
     dev.setErrorStateOnServer.assert_called_once_with("setting failed")
     stub.device_sync.apply_states.assert_called_once_with(
-        9, [{"key": "autoRelockTime", "value": 30}])      # what the lock holds, not 45
+        9, [{"key": "autoRelockTime", "value": 30}], clear_error=False)   # what the lock holds, not 45
 
 
 def test_getDeviceStateList_gives_a_lock_only_the_states_it_implements(plugin_cls, mock_indigo_base, mock_logger):

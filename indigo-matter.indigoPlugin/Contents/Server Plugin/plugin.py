@@ -116,6 +116,16 @@ def _dead_verdict_cause_text(agent) -> str:
     return cause.message.rstrip(".")
 
 
+
+def _is_flagged_unreachable(dev_id) -> bool:
+    """Is this Indigo device currently flagged "unreachable"?"""
+    try:
+        return indigo.devices[dev_id].errorState == "unreachable"
+    except Exception:  # pylint: disable=broad-except
+        # no such device yet (a new one) or an unreadable one: nothing to warn about
+        return False
+
+
 class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenuMixin,
              ExportRecoveryMenuMixin, BridgeAgentMenuMixin,
              DiagnosticsMenuMixin, NodeReplaceMenuMixin, indigo.PluginBase):
@@ -314,12 +324,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # diagnostic below reads, rather than a second copy of the state.
             outage_expected=self._restart_expected,
         )
-        self.jobs = CommissionJobs(
-            self.matter, self.device_sync.create_from_raw, self.logger,
-            schedule=self.runtime.submit,
-            knows_node=self.device_sync.knows_node,
-            managed=lambda: self.server_process is not None,
-        )
+        self.jobs = self._build_commission_jobs()
         self.http = HttpApi(
             self.jobs, self.logger,
             status_provider=self._status_body,
@@ -1223,7 +1228,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             self._setting_attribute_list_lookup(valuesDict),
             self._has_matter_node(valuesDict),
             states=self._device_states(devId),
-            primed=self._setting_primed_lookup(devId))
+            primed=self._setting_primed_lookup(devId),
+            seeds=vars(self).get("_dialog_seeds", {}).get(devId))
         if setting_errors:
             errors = indigo.Dict()
             for field, message in setting_errors.items():
@@ -1297,6 +1303,17 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         does not have on.
         """
         def note(setting, reason):
+            if reason.startswith(device_settings.NO_ATTRIBUTE_LIST_REASON):
+                # No reconcile has cached this device's capabilities yet (the plugin
+                # has not connected to matter-server since it started): that says
+                # nothing about the DEVICE, so say it once rather than per setting.
+                told = vars(self).setdefault("_settings_pending_told", set())
+                if dev_id not in told:
+                    told.add(dev_id)
+                    self.logger.info(
+                        "device %s: device settings will appear once the plugin has connected "
+                        "to matter-server and read the device", dev_id)
+                return
             self.logger.info('device %s: "%s" not offered — %s',
                              dev_id, setting.label, reason)
         return note
@@ -1511,6 +1528,12 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 device_known=self._has_matter_node(values),
                 on_skip=self._log_setting_skips(devId),
                 primed=self._setting_primed_lookup(devId)))
+            # What this dialog was SEEDED with, remembered until it closes: a field
+            # equal to its seed is "untouched" even if the device's value moves while
+            # the dialog is open (another app), so an untouched Save never overwrites it.
+            vars(self).setdefault("_dialog_seeds", {})[devId] = {
+                setting.key: values.get(setting.key, "") for setting in settings_for_type(typeId)}
+            values["settingsStale"] = "yes" if _is_flagged_unreachable(devId) else "no"
             if typeId == "matterNode":
                 # Display-only summary of settings_report's SurveyLog for THIS
                 # node (issue #204): the store stays in pluginPrefs (see
@@ -1584,7 +1607,9 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 self._has_matter_node(props)):
             if wanted and offer.setting.key != wanted:
                 continue
-            rows = device_settings.picker_rows(offer, self._setting_primed_lookup(targetId))
+            rows = device_settings.picker_rows(
+                offer, self._setting_primed_lookup(targetId),
+                current=(valuesDict or {}).get(offer.setting.key))
             if rows is not None:
                 return rows
         return []
@@ -1604,6 +1629,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         because the dialog re-seeds from device state on every open, reopening
         it shows what the device actually holds — never the value that failed.
         """
+        # The remembered seed is spent either way (Save or Cancel).
+        seeds = vars(self).get("_dialog_seeds", {}).pop(devId, None)
         if userCancelled or not settings_for_type(typeId):
             return
         try:
@@ -1612,7 +1639,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 self._setting_limits_lookup(valuesDict),
                 self._setting_attribute_list_lookup(valuesDict),
                 self._has_matter_node(valuesDict),
-                primed=self._setting_primed_lookup(devId))
+                primed=self._setting_primed_lookup(devId), seeds=seeds)
         except Exception as exc:  # pylint: disable=broad-except
             # Absorbing: anything planned_writes() raises while working out what the
             # dialog changed. Safe because it aborts having submitted NOTHING, which is
@@ -1624,10 +1651,12 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             return
         if not plans:
             return
-        if self.runtime is None or self.matter is None:
+        if self.runtime is None or self.matter is None or not getattr(self.matter, "connected", True):
+            # Refused up front: a write that can only fail would also replace the
+            # device's "unreachable" flag with "setting failed".
             self.logger.error(
-                "cannot apply device settings — the Matter connection is not running; "
-                "no setting was changed")
+                "cannot apply device settings — the plugin is NOT connected to matter-server "
+                "(the Matter connection is not running); nothing was written")
             return
         if not self._has_matter_node(valuesDict):
             # Belt-and-braces: planned_writes is already gated on the same
@@ -1704,8 +1733,10 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # this whole feature exists to prevent.
             actual = observed[0] if observed else None
             if actual is not None:
+                # Without clearing the error just set above: a refused or unverified
+                # write must leave the device flagged.
                 self.device_sync.apply_states(
-                    dev_id, [{"key": plan.setting.key, "value": actual}])
+                    dev_id, [{"key": plan.setting.key, "value": actual}], clear_error=False)
             else:
                 # No answer at all, or a null: the state still holds the old value
                 # and nothing confirms it, so it is not-read again (unread next open).
@@ -1724,6 +1755,21 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             self.logger.warning(
                 "the setting failure on device %s could not be recorded (%s) — the device's "
                 "settings dialog may show a value the device never adopted", dev_id, exc)
+
+    def _server_is_managed(self) -> bool:
+        """Does this plugin run matter-server itself? (``server_process`` None = it
+        does not: LaunchAgent management is off.) Asked at failure time, not at
+        construction, so switching management off later is honoured."""
+        return self.server_process is not None
+
+    def _build_commission_jobs(self):
+        """The commissioning job table, wired to this plugin's own collaborators."""
+        return CommissionJobs(
+            self.matter, self.device_sync.create_from_raw, self.logger,
+            schedule=self.runtime.submit,
+            knows_node=self.device_sync.knows_node,
+            managed=self._server_is_managed,
+        )
 
     def deviceStartComm(self, dev):  # noqa: N802
         # Indigo builds a device's state list at creation and does NOT re-read

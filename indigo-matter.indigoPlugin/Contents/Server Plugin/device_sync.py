@@ -1127,6 +1127,9 @@ class DeviceSync:
                         continue
                     try:
                         dev = indigo.devices[old.dev_id]    # fresh: earlier writes may have changed it
+                        # The new node's readings are the ones to trust, not whatever
+                        # this device read from the node it is leaving.
+                        self._forget_settings_read(dev)
                         dev.replacePluginPropsOnServer(rebound_props(
                             dict(dev.pluginProps), new_node,
                             software_version=software_version if old.type_id == "matterNode" else None))
@@ -2897,7 +2900,7 @@ class DeviceSync:
     def _prime_states(self, node: NodeInfo, dev_id: int, endpoint_id: int,
                       own_type_id: str,
                       ep_sibling_types: Optional[set] = None,
-                      clear_error: bool = True) -> None:
+                      clear_error: bool = True, skip_read: bool = False) -> None:
         """Apply the node's current attribute values to a freshly-created device.
 
         get_node carries a snapshot of every attribute; matter-server only emits
@@ -3015,8 +3018,7 @@ class DeviceSync:
                 # one bad attr must not abort priming
                 self.logger.warning("prime %s attr %s/%s failed: %s", dev_id, cluster, attribute, exc)
         if kv:
-            self.apply_states(dev_id, kv, clear_error=clear_error)
-        self._log_unwritable_setting_readings(node, dev, endpoint_id)
+            self.apply_states(dev_id, kv, clear_error=clear_error, skip_read=skip_read)
 
     # ------------------------------------------------------------------
     # Writable-setting limits cache (issues #85, #186)
@@ -3950,7 +3952,10 @@ class DeviceSync:
         if dev_id is None:
             return
         try:
-            indigo.devices[dev_id].updateStatesOnServer([_reachable_kv(reachable)])
+            # Single-key, clearErrorState=False: a state write clears the device's
+            # error by default, which would undo the "unreachable" marking
+            # _apply_reachability just made (the batch call cannot opt out).
+            self._write_keeping_error(indigo.devices[dev_id], [_reachable_kv(reachable)])
         except KeyError:
             self.logger.debug(
                 "could not write matterNode reachable state for node %s: the device is gone",
@@ -4210,13 +4215,19 @@ class DeviceSync:
             self.apply_states(dev_id, handler.format_kv(states))
 
     def apply_states(self, dev_id: int, kvlist: list, *, clear_error: bool = True,
-                     count_as_read: bool = True) -> None:
+                     count_as_read: bool = True, skip_read: bool = False) -> None:
         """The single asyncio→Indigo write seam (see module docstring).
 
         ``clear_error=False`` is for a write that is NOT evidence the device is
-        reachable (a cached reading replayed from a snapshot); ``count_as_read=False``
-        is for a display-only write (``uiValue="unknown"``) that must not mark a
-        setting as read.
+        reachable (a cached reading replayed from a snapshot). Indigo clears a device's
+        error state on a state write by default, and only the single-key
+        ``updateStateOnServer(key, value, clearErrorState)`` documents how to opt out,
+        so such a write goes key by key through that call - never through the batch
+        one. ``count_as_read=False`` is for a display-only write (``uiValue="unknown"``)
+        that must not mark a setting as read (and does not fire triggers).
+        ``skip_read=True`` drops a setting state that has been read since the caller
+        decided to write it, checked immediately before the write, so a replay of an
+        older value can never overwrite a newer one.
         """
         try:
             dev = indigo.devices[dev_id]
@@ -4230,17 +4241,40 @@ class DeviceSync:
                 dev_id, len(kvlist),
             )
             return
+        if skip_read:
+            keys = self._setting_keys(dev)
+            kvlist = [kv for kv in kvlist
+                      if kv.get("key") not in keys or not self.setting_primed(dev.id, kv["key"])]
         if count_as_read:
             kvlist = self._drop_unstorable_settings(dev, kvlist)
             kvlist = self._with_setting_display(dev, kvlist)
         if not kvlist:
             return
-        dev.updateStatesOnServer(kvlist)
+        if clear_error:
+            dev.updateStatesOnServer(kvlist)
+        else:
+            self._write_keeping_error(dev, kvlist, trigger_events=count_as_read)
         if count_as_read:
             self._note_settings_primed(dev, kvlist)
         # a fresh value means the device is reachable — clear any stale error
         if clear_error and getattr(dev, "errorState", ""):
             dev.setErrorStateOnServer("")
+
+    @staticmethod
+    def _write_keeping_error(dev: Any, kvlist: list, trigger_events: bool = True) -> None:
+        """Write states one key at a time WITHOUT clearing the device's error state.
+
+        Indigo's documented ``updateStateOnServer(key, value, clearErrorState)``; the
+        batch ``updateStatesOnServer`` is not documented as taking that argument.
+        """
+        for kv in kvlist:
+            kwargs: dict = {"value": kv["value"], "clearErrorState": False}
+            for optional in ("uiValue", "decimalPlaces"):
+                if optional in kv:
+                    kwargs[optional] = kv[optional]
+            if not trigger_events:
+                kwargs["triggerEvents"] = False
+            dev.updateStateOnServer(kv["key"], **kwargs)
 
     # ------------------------------------------------------------------
     # Has a setting's state been READ? (review fix pass, PR #388)
@@ -4273,7 +4307,11 @@ class DeviceSync:
                 if first:
                     self.logger.info(
                         'device "%s": the device reports %s = %s, which is too large to hold in '
-                        "an Indigo state, so the state is left unset", dev.name, kv["key"], value)
+                        "an Indigo state, so this setting is shown as not read", dev.name,
+                        kv["key"], value)
+                # The state would otherwise keep showing the OLD value as current.
+                if self.setting_primed(dev.id, kv["key"]):
+                    self.mark_setting_unread(dev.id, kv["key"])
                 continue
             kept.append(kv)
         return kept
@@ -4330,6 +4368,12 @@ class DeviceSync:
             self.logger.debug("no display label for %s=%r", setting.key, value, exc_info=True)
         return str(value)
 
+    def _forget_settings_read(self, dev: Any) -> None:
+        """Drop every "read this run" entry of *dev* (it is about to change node)."""
+        keys = self._setting_keys(dev)
+        with self._lock:
+            self._settings_primed -= {(int(dev.id), key) for key in keys}
+
     def setting_primed(self, dev_id: Any, key: str) -> bool:
         """Has a real device reading of this setting been written this run?"""
         with self._lock:
@@ -4341,32 +4385,51 @@ class DeviceSync:
         For a write whose read-back got no answer: the state still holds the old
         value, which must not read as confirmed.
         """
-        with self._lock:
-            self._settings_primed.discard((int(dev_id), key))
         try:
             dev = indigo.devices[int(dev_id)]
         except KeyError:
-            return
-        self._flag_unknown(dev, [key])
+            dev = None
+        with self._lock:
+            self._settings_primed.discard((int(dev_id), key))
+            # And forget the cached reading: it is what a later deviceStartComm
+            # would replay to re-vouch for the very value that was just doubted.
+            if dev is not None:
+                props = dev.pluginProps
+                setting = next((s for s in settings_for_type(getattr(dev, "deviceTypeId", "") or "")
+                                if s.key == key), None)
+                if setting is not None and self._prop_present(props.get("nodeId")) \
+                        and self._prop_present(props.get("endpointId")):
+                    node_id = int(props["nodeId"])
+                    reading_key = (int(props["endpointId"]), setting.cluster, setting.attribute)
+                    readings = dict(self._setting_readings.get(node_id, {}))
+                    if reading_key in readings:
+                        del readings[reading_key]
+                        self._setting_readings = {**self._setting_readings, node_id: readings}
+        if dev is not None:
+            self._flag_unknown(dev, [key])
 
     def flag_unread_settings(self, dev: Any) -> None:
         """Give every not-yet-read setting state of *dev* ``uiValue="unknown"``.
 
         The ADR-0007 convention (display only; triggers still see the number). Applies
-        only to states the device actually has.
+        only to states the device actually has - judged on a FRESH fetch, because the
+        ``dev`` ``deviceStartComm`` was handed predates the state-list refresh that
+        adds them.
         """
-        wanted = [key for key in sorted(self._setting_keys(dev))
-                  if key in getattr(dev, "states", {}) and not self.setting_primed(dev.id, key)]
-        self._flag_unknown(dev, wanted)
+        self._flag_unknown(dev, sorted(self._setting_keys(dev)))
 
     def _flag_unknown(self, dev: Any, keys: list) -> None:
-        current = getattr(dev, "states", {})
+        try:
+            fresh = indigo.devices[dev.id]
+        except KeyError:
+            return
+        current = getattr(fresh, "states", {})
         kv = [{"key": key, "value": current.get(key, 0), "uiValue": "unknown"}
-              for key in keys if key in current]
+              for key in keys if key in current and not self.setting_primed(fresh.id, key)]
         if kv:
-            # Through the one write seam, and as neither a reading nor evidence the
-            # device is reachable.
-            self.apply_states(dev.id, kv, clear_error=False, count_as_read=False)
+            # Through the one write seam; neither a reading nor evidence the device is
+            # reachable; and skip_read re-checks "read?" immediately before the write.
+            self.apply_states(fresh.id, kv, clear_error=False, count_as_read=False, skip_read=True)
 
     def reprime_settings(self, dev: Any) -> None:
         """Write this device's cached setting readings into its states again.
@@ -4397,7 +4460,7 @@ class DeviceSync:
         if not own:
             return
         self._prime_states(NodeInfo(node_id=node_id, attributes=own), dev.id, endpoint_id,
-                           type_id, clear_error=False)
+                           type_id, clear_error=False, skip_read=True)
 
     def _prime_settings_only(self, node: NodeInfo) -> None:
         """Write a node's SETTING states from its snapshot - and nothing else.
@@ -4419,17 +4482,7 @@ class DeviceSync:
                 continue
             for type_id, dev_id in type_map.items():
                 self._prime_states(NodeInfo(node_id=node.node_id, attributes=own), dev_id, ep,
-                                   type_id, clear_error=False)
-
-    def _log_unwritable_setting_readings(self, node: NodeInfo, dev: Any, endpoint_id: int) -> None:
-        """Debug-log a setting reading that could not land because its state is not
-        on the device yet (so a missing value is explainable, not just absent)."""
-        for setting in settings_for_type(getattr(dev, "deviceTypeId", "") or ""):
-            reading = node.attributes.get((endpoint_id, setting.cluster, setting.attribute))
-            if reading is not None and setting.key not in getattr(dev, "states", {}):
-                self.logger.debug(
-                    "device %s: not priming %s - the device has no such state yet "
-                    "(its state list has not been rebuilt)", dev.id, setting.key)
+                                   type_id, clear_error=False, skip_read=True)
 
     # ------------------------------------------------------------------
     # Indigo action → Matter command (B1 path)
