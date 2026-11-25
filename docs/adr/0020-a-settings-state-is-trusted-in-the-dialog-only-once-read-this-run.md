@@ -44,7 +44,8 @@ written from a device reading (a prime, a live update, or a verified write read-
 then the dialog seeds the field blank (a picker leads with a "not read yet, leave
 unchanged" row), `planned_writes` treats the previous value as unknown so any entered
 value is written and verified, and the state's display is "unknown". A write whose
-read-back is unanswered or null makes the setting unread again. A snapshot of an
+read-back is unanswered or null makes the setting unread again, and its cached reading
+is dropped so a later restart of the device cannot re-vouch for it. A snapshot of an
 unavailable node still counts as a reading (last values reported).
 
 This **narrows ADR-0002's acceptance of cached state** without editing it: the dialog

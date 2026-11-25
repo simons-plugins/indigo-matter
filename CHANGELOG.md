@@ -11,11 +11,12 @@ current version is `Info.plist`'s `PluginVersion`.
   time** (seconds, 1-255; how long code entry is disabled after too many wrong
   codes). Like other device settings they are stored on the lock itself, are read
   back after a change, and each has a state you can use in triggers. Locks you
-  already have gain them on upgrade with no need to recreate the device. The
-  Matter sets no upper limit on auto-relock; the plugin caps it at 86400 seconds
-  (one day), because a larger number does not fit an Indigo state and would stop SQL
-  Logger recording that device. A lock already holding more is left alone and is not
-  written to the state.
+  already have gain them on upgrade with no need to recreate the device.
+  Matter sets no upper limit on auto-relock; the plugin caps what you can enter at
+  86400 seconds (one day) by choice. Separately, a reading past 2,147,483,647 is never
+  stored in a state (it would overflow SQL Logger's integer column and stop that
+  device's history); the setting then shows as not read. A lock already holding more
+  than a day keeps its value unless you change it.
 - A setting whose value the device has not reported yet now shows blank in the dialog
   (a picker leads with "Not read from the device yet (leave unchanged)"), and
   "unknown" on the device, instead of Indigo's default 0 (which looked like a real
@@ -26,6 +27,9 @@ current version is `Info.plist`'s `PluginVersion`.
   change. After a change the lock does not confirm, the setting is "not read" again the
   next time you open it. Restarting a device in Indigo no longer overwrites a newer
   value with an older one, and no longer clears its unreachable flag.
+- The existing sensor and relay setting states now carry a display value (the number with
+  its unit, or the option name, such as "Standard"), and while a state shows "unknown"
+  its numeric value, which triggers compare, is still the previous number.
 - Fix (issue #368): when matter-server reports "No commissionable device was
   discovered", the error (Event Log, and the message dom.io shows) now
   suggests Plugins ▸ Matter ▸ **Restart the Matter controller** and retrying with a
