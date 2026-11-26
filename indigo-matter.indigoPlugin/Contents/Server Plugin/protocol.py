@@ -55,6 +55,13 @@ KEY_ARGS = "args"
 KEY_RESULT = "result"
 KEY_ERROR_CODE = "error_code"
 KEY_ERROR_DETAILS = "details"
+# Optional error-frame keys from matter-server 1.6.1 (issue #374): ``reason`` names why a
+# commission_with_code failed (not-discovered, passcode-mismatch, invalid-payload,
+# attestation-rejected, timeout, other); ``status``/``cluster_status`` are the device's
+# Matter status when there was one. Absent on older servers.
+KEY_ERROR_REASON = "reason"
+KEY_ERROR_STATUS = "status"
+KEY_ERROR_CLUSTER_STATUS = "cluster_status"
 KEY_EVENT = "event"
 KEY_DATA = "data"
 
@@ -279,12 +286,20 @@ class MatterEvent:
 
 
 class ProtocolError(Exception):
-    """Raised when a response frame carries an error_code."""
+    """Raised when a response frame carries an error_code.
 
-    def __init__(self, code: Any, details: str = "") -> None:
-        super().__init__(f"matter-server error {code}: {details}")
+    ``reason``/``status``/``cluster_status`` are the optional 1.6.1 keys (see
+    ``KEY_ERROR_REASON``); None when the server did not send them.
+    """
+
+    def __init__(self, code: Any, details: str = "", *, reason: Optional[str] = None,
+                 status: Any = None, cluster_status: Any = None) -> None:
+        super().__init__(f"matter-server error {code}: {details or reason or ''}")
         self.code = code
         self.details = details
+        self.reason = reason
+        self.status = status
+        self.cluster_status = cluster_status
 
 
 def _to_int(value: Any) -> int:
@@ -422,7 +437,9 @@ class Protocol:
     def parse_result(self, frame: dict) -> Any:
         """Return the result payload, or raise :class:`ProtocolError`."""
         if KEY_ERROR_CODE in frame:
-            raise ProtocolError(frame.get(KEY_ERROR_CODE), str(frame.get(KEY_ERROR_DETAILS, "")))
+            raise ProtocolError(frame.get(KEY_ERROR_CODE), str(frame.get(KEY_ERROR_DETAILS, "")),
+                                reason=frame.get(KEY_ERROR_REASON), status=frame.get(KEY_ERROR_STATUS),
+                                cluster_status=frame.get(KEY_ERROR_CLUSTER_STATUS))
         return frame.get(KEY_RESULT)
 
     def parse_event(self, frame: dict) -> MatterEvent:

@@ -69,6 +69,13 @@ RECONCILE_WINDOW = timedelta(minutes=5)
 #: only thing that tells this failure apart.
 NO_DEVICE_DISCOVERED_PHRASE = "no commissionable device was discovered"
 
+#: matter-server 1.6.1's machine-readable ``reason`` for the same failure (issue #374;
+#: ws-controller ControllerCommandHandler.commissionFailureOf, from matter.js's
+#: DeviceNotDiscoveredError). Preferred when present; the phrase stays the fallback for
+#: servers that send no reason. "timeout" is deliberately NOT included: in 1.6.1 it also
+#: covers DiscoveryIncompleteError, where a device WAS found.
+NO_DEVICE_DISCOVERED_REASON = "not-discovered"
+
 #: The Plugins menu item the hint points at — must match MenuItems.xml's <Name>
 #: for restartMatterServer exactly (a test pins that).
 RESTART_MENU_ITEM = "Restart the Matter controller"
@@ -88,14 +95,15 @@ NO_DEVICE_DISCOVERED_HINT_REMOTE = (
 )
 
 
-def with_discovery_hint(message: str, managed: bool = True) -> str:
+def with_discovery_hint(message: str, managed: bool = True, reason: Optional[str] = None) -> str:
     """*message*, plus the restart hint when it is the "no device discovered" failure.
 
     ``managed`` is whether this plugin runs matter-server (the menu item only works
-    then). Every other commissioning failure is returned untouched. Only advice is
-    added - nothing is restarted automatically.
+    then). ``reason`` is the error frame's 1.6.1 ``reason`` if any. Every other
+    commissioning failure is returned untouched. Only advice is added - nothing is
+    restarted automatically.
     """
-    if NO_DEVICE_DISCOVERED_PHRASE in message.lower():
+    if reason == NO_DEVICE_DISCOVERED_REASON or NO_DEVICE_DISCOVERED_PHRASE in message.lower():
         return message + (NO_DEVICE_DISCOVERED_HINT if managed else NO_DEVICE_DISCOVERED_HINT_REMOTE)
     return message
 
@@ -869,7 +877,8 @@ class CommissionJobs:
             # PASE/CASE failure, …) — a device/commissioning failure, not a plugin
             # bug, so report it as such rather than internal_error.
             await self._fail(job, "commissioning_failed", str(exc), node_id,
-                             opt_int(getattr(exc, "code", None)))
+                             opt_int(getattr(exc, "code", None)),
+                             reason=getattr(exc, "reason", None))
         except Exception as exc:  # pylint: disable=broad-except
             # last-resort, mapped to internal_error
             #
@@ -882,7 +891,8 @@ class CommissionJobs:
             await self._fail(job, "internal_error", _exc_message(exc), node_id)
 
     async def _fail(self, job: Job, code: str, message: str,
-                    node_id: Any, matter_error_code: Optional[int] = None) -> None:
+                    node_id: Any, matter_error_code: Optional[int] = None,
+                    *, reason: Optional[str] = None) -> None:
         # _node_held_by_other_job, when it returns False (not held), also
         # marks node_id in-flight in self._removing in the SAME lock
         # acquisition as the holder check (A2) — closing the gap a separate
@@ -909,7 +919,7 @@ class CommissionJobs:
             finally:
                 with self._lock:
                     self._removing.discard(_node_key(node_id))
-        message = with_discovery_hint(message, self._managed())
+        message = with_discovery_hint(message, self._managed(), reason)
         error = {"code": code, "message": message}
         if matter_error_code is not None:
             error["matterErrorCode"] = matter_error_code
