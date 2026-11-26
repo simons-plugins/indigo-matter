@@ -54,7 +54,7 @@ settable Matter attributes a device implements that Indigo does not yet offer,
 a power-user explorer for dumping any node/endpoint/cluster from the cache, and
 **Report Thread mesh…**, which prints every Thread node's role, links
 (RSSI/LQI/frame-error), the leader, foreign routers and health flags to the
-event log — with an option to live-read the sleepy devices first for accuracy.
+event log — with an option to live-read every node first for accuracy (a router's neighbour and route tables go stale in matter-server's cache too).
 The same picture is also a page: `http://<indigo-host>:8176/message/com.simons-plugins.indigo-matter/thread`
 renders it as a self-contained HTML page with an inline radial map, readable on a
 phone over the Reflector, with `?live=1` for the same live-read pass. Thread

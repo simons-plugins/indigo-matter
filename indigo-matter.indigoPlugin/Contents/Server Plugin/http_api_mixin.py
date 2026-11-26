@@ -353,7 +353,7 @@ class HttpApiMixin:
     def http_thread_page(self, action, dev=None, caller_waiting_for_result=None):  # noqa: N802, ARG002
         """Serve the Thread mesh page. GET only, mirroring ``http_pairing``.
 
-        ``?live=1`` live-refreshes every sleepy (non-router) node first, via
+        ``?live=1`` live-refreshes every node (routers included, #348) first, via
         the exact same :func:`thread_survey.run_survey` the "Report Thread
         mesh…" menu diagnostic uses — the cache-vs-live policy lives in one
         place, not two drifting call sites. Always 200 for a GET: a
@@ -387,7 +387,7 @@ class HttpApiMixin:
         # per-node freshness cells, and `generated_at`) — so every cache-age
         # figure on one render of this page agrees with every other.
         now = datetime.now(timezone.utc)
-        mesh, diags, error = self._thread_mesh_snapshot(live_sleepy=live, now=now)
+        mesh, diags, error = self._thread_mesh_snapshot(live_read=live, now=now)
         generated_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         content = render_thread_page(
             mesh, diags, generated_at=generated_at, live=live,
@@ -400,7 +400,7 @@ class HttpApiMixin:
         reply["content"] = content
         return reply
 
-    def _thread_mesh_snapshot(self, *, live_sleepy: bool, now=None):  # pylint: disable=too-many-return-statements
+    def _thread_mesh_snapshot(self, *, live_read: bool, now=None):  # pylint: disable=too-many-return-statements
         """``(mesh, diags, error)`` for the Thread page.
 
         Mirrors ``DiagnosticsMenuMixin.menuReportThreadMesh``'s failure
@@ -447,19 +447,19 @@ class HttpApiMixin:
 
         def _survey(live: bool):
             return thread_survey.run_survey(
-                self.runtime, self.matter, live_sleepy=live,
+                self.runtime, self.matter, live_read=live,
                 per_node_timeout=_PAGE_LIVE_PER_NODE_TIMEOUT if live else ATTRIBUTE_TIMEOUT,
                 node_names=self._thread_node_names(), event_stamps=stamps,
             )
 
         try:
-            survey = _survey(live_sleepy)
+            survey = _survey(live_read)
         except FuturesTimeoutError:
-            if not live_sleepy:
+            if not live_read:
                 return thread_mesh.build_mesh([], now), [], "matter-server did not answer in time."
             self.logger.warning(
                 "Matter: Thread mesh survey timed out after %.0f s (live=%s) — falling back to cache.",
-                _PAGE_LIVE_PER_NODE_TIMEOUT + SURVEY_READ_TIMEOUT, live_sleepy)
+                _PAGE_LIVE_PER_NODE_TIMEOUT + SURVEY_READ_TIMEOUT, live_read)
             try:
                 survey = _survey(False)
             except FuturesTimeoutError:

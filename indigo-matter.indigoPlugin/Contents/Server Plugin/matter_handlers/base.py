@@ -11,6 +11,7 @@ where they translate Indigo actions.
 """
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Optional, Union
@@ -79,6 +80,66 @@ def node_endpoint(indigo_dev: Any) -> tuple[int, int]:
     return node_id, endpoint_id
 
 
+#: Devices already warned about this plugin run (issue #367) — one warning per
+#: device, not one per button press. Module-level because the helper has no
+#: access to DeviceSync; keyed on the Indigo device id.
+TOGGLE_FALLBACK_WARNED: set = set()
+
+
+def _toggle_fallback(indigo_dev: Any, problem: str) -> str:
+    """Warn (once per device) that Toggle fell back to Matter ``Toggle``."""
+    log = logging.getLogger("Plugin")
+    try:
+        key = indigo_dev.id
+        name = indigo_dev.name
+    except Exception:  # pylint: disable=broad-except
+        # Absorbing: the warning must never be the thing that fails a Toggle.
+        key, name = ("obj", id(indigo_dev)), "<unknown device>"
+    if key not in TOGGLE_FALLBACK_WARNED:
+        TOGGLE_FALLBACK_WARNED.add(key)
+        log.warning(
+            'Toggle "%s": no usable on/off state to toggle from (%s), so Matter Toggle was sent; '
+            "the result follows the device's own state, not what Indigo shows",
+            name, problem)
+    return "Toggle"
+
+
+def toggle_command_name(indigo_dev: Any) -> str:
+    """OnOff command that an Indigo *Toggle* should send (issue #367).
+
+    Matter's own ``Toggle`` flips what the DEVICE believes, which is the
+    opposite of what Indigo's screen promised when the two disagree (an IKEA
+    KAJPLATS bulb keeps reporting on while dark after a power cut). So Toggle is
+    resolved from the on/off state Indigo SHOWS: ``Off`` if shown on, ``On`` if
+    shown off. ``Toggle`` is only a defensive fallback, not expected on real
+    relay/dimmer devices (their state is seeded at creation): the state is
+    missing, ``None``, not a real ``bool`` (``"false"`` or ``1`` must not be
+    guessed at), or reading it raises (including an AttributeError from inside
+    the property). Every fallback logs a WARNING once per device.
+
+    Deliberately reads ``onState`` (on/off), never brightness, and ignores
+    ``errorState``: an unreachable device is toggled from its last shown state,
+    exactly as before.
+    """
+    try:
+        shown_on = indigo_dev.onState
+    except Exception as exc:  # pylint: disable=broad-except
+        # Absorbing: any failure reading the shown state. Safe because the
+        # fallback is the old behaviour (Matter Toggle), never an explicit
+        # command from state we could not read, and it is warned about.
+        return _toggle_fallback(indigo_dev, f"reading onState raised {exc!r}")
+    if not isinstance(shown_on, bool):
+        return _toggle_fallback(indigo_dev, f"onState is {shown_on!r}")
+    command = "Off" if shown_on else "On"
+    try:
+        name = indigo_dev.name
+    except Exception:  # pylint: disable=broad-except
+        name = "?"  # the debug line must never fail a Toggle
+    logging.getLogger("Plugin").debug(
+        'Toggle "%s": shown %s, sending %s', name, "on" if shown_on else "off", command)
+    return command
+
+
 class ClusterHandler(ABC):
     """Maps a Matter cluster to Indigo device(s), state, and actions."""
 
@@ -93,6 +154,16 @@ class ClusterHandler(ABC):
     #: of the node's Indigo devices rather than just the one at the event's
     #: endpoint.
     node_scoped: bool = False
+    #: Whether this handler gives a JSON null attribute value a meaning of its
+    #: own. Default False: null means "no value known" (matter-server 1.5.0+ sends
+    #: one when an attribute is REMOVED from a node, #374), and ``device_sync``
+    #: then drops the update before it reaches the handler, so the last known
+    #: state stays. Only a handler that reads null as information sets True.
+    accepts_null: bool = False
+    #: Attribute ids for which a null carries meaning, for a handler where that is
+    #: true of some attributes only (OnOff: a null StartUpOnOff is "restore the
+    #: previous state", a null OnOff is still "no value known").
+    accepts_null_attributes: frozenset = frozenset()
     #: Display-capability props every device this handler creates must carry.
     #: Indigo applies Supports*/subtype capabilities via creation props, not
     #: Devices.xml statics, for API-created devices (the colour lesson;

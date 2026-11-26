@@ -52,10 +52,12 @@ Four disciplines worth knowing before editing:
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Optional
 
+import bridge_agent
 import bridge_health
 import bridge_protocol
 import ct_bounds
@@ -283,6 +285,7 @@ class ExportBridge:
         #: Set once the "the node is not running" line has been said for this
         #: outage, so a manually-started-later node does not fill the log first.
         self._unreachable_reported = False
+        self._bridge_drift_reported = False
         #: Same latch shape, one per condition that persists until a human or a
         #: reconnect changes it. Each is cleared by :meth:`_on_attached`, which
         #: is the only event that means "whatever that was, it is over".
@@ -466,6 +469,7 @@ class ExportBridge:
         self._halted_reported = False
         self._recovery_reported = False
         self._refusal_reported = None
+        self._bridge_drift_reported = False
         self._fire(self.client.run(), "bridge client run loop",
                    lost="nothing will be exported until the plugin is reloaded")
         self._logger.info(
@@ -1700,6 +1704,13 @@ class ExportBridge:
                 "Matter bridge: %r arrived for device %s, which no longer exists in Indigo — "
                 "ignoring.", command.command, device_id)
             return
+        if (command.command == export_handlers.COMMAND_ON_OFF
+                and command.args.get(bridge_protocol.KEY_REASON) == bridge_protocol.COUNTDOWN_LOST_REASON):
+            # #203: the node raised this off itself, not an ecosystem — say so in the
+            # Indigo log, or nobody can tell why the light went off.
+            self._logger.info(
+                'Matter export: turning "%s" off — its timed-on countdown was lost when the '
+                'bridge node restarted', getattr(dev, "name", device_id))
         try:
             outcome = handler.dispatch(command.command, command.args, dev, entry.options)
         except Exception as exc:  # pylint: disable=broad-except
@@ -1936,6 +1947,7 @@ class ExportBridge:
                           status.endpoint_count,
                           "commissioned" if status.commissioned else "not yet paired")
         self._report_node_warnings(status)
+        self._check_bridge_version()
         self._health._apply_subscription_churn(  # pylint: disable=protected-access
             getattr(status, "subscription_churn", None), getattr(status, "fabrics", None))
         self._health._apply_session_hygiene(  # pylint: disable=protected-access
@@ -1955,6 +1967,37 @@ class ExportBridge:
                 self._stop_soon("closing the bridge client after the outstanding un-export")
                 self._fire(self._stop_agent_off_loop(),
                            "stopping the bridge agent after the outstanding un-export")
+
+    def _check_bridge_version(self) -> None:
+        """Say once per connection streak if the running bridge node is behind (or ahead of) this release's pin.
+
+        The bridge-node twin of the matter-server drift check (#75): upgrading the plugin never upgrades
+        the bridge node — only the install menu item does — so a stale node otherwise looks healthy.
+        Advisory only: a missing or unreadable version is a debug line, and nothing here can raise.
+        """
+        try:
+            hello = getattr(self.client, "hello", None)
+            raw = getattr(hello, "bridge_version", None)
+            drift = bridge_agent.bridge_version_drift(raw)
+            if drift is None:
+                self._logger.debug("Matter bridge: could not read the bridge node's version (%r); "
+                                   "the version check is skipped", raw)
+                return
+            running, pinned, status = drift
+            if status == "current" or self._bridge_drift_reported:
+                return
+            self._bridge_drift_reported = True
+            if status == "older":
+                self._logger.warning(
+                    "Matter bridge: the running bridge node is %s but this plugin release is built for %s; "
+                    "upgrading the plugin does not upgrade the bridge node. Run Plugins ▸ Matter ▸ %s to "
+                    "update it", running, pinned, bridge_agent.BRIDGE_INSTALL_MENU)
+            else:
+                self._logger.info(
+                    "Matter bridge: the running bridge node is %s, ahead of %s, the version this plugin "
+                    "release installs", running, pinned)
+        except Exception:  # pylint: disable=broad-except
+            self._logger.debug("Matter bridge: the bridge version check failed; skipped", exc_info=True)
 
     def _report_node_warnings(self, status) -> None:
         """Say what the node could not persist (§4.3 ``warnings``).
@@ -2029,6 +2072,15 @@ class ExportBridge:
             if self._refusal_reported == code:
                 return
             self._refusal_reported = code
+        if bridge_protocol.STATE_NOT_APPLIED_PHRASE in str(details):
+            # #355: the node added the endpoint, THEN failed applying its states, and
+            # does not roll the endpoint back. "Nothing is being exported" is false —
+            # the accessory may be live in every ecosystem, showing stale state.
+            self._logger.error(
+                "Matter bridge: the bridge node's attach failed part-way (%s: %s). The accessory may "
+                "be live in your ecosystems showing STALE state, and the rest of the export was not "
+                "applied; the plugin will reconnect and push the state again.", code, details)
+            return
         self._logger.error("Matter bridge: the bridge node refused the connection (%s: %s). "
                            "Nothing is being exported.", code, details)
 
@@ -2253,6 +2305,7 @@ class ExportBridge:
         if self._unreachable_reported:
             return
         self._unreachable_reported = True
+        self._bridge_drift_reported = False   # the outage ends the streak: the next attach says it again
         self._logger.warning(
             "Matter bridge: the bridge node is not responding after %d attempts on port %s. "
             "Indigo devices and inbound Matter control are unaffected; exported accessories "
@@ -2385,12 +2438,24 @@ class ExportBridge:
         if exc is None:
             return
         if what.startswith("upsert_endpoint"):
-            # Names the consequence, not just the failure: an `upsert_endpoint`
-            # that never lands leaves the device un-exported, and "failed" alone
-            # does not say whether that heals itself or needs a human.
-            self._logger.warning(
-                "Matter bridge: %s failed — %s. The device is not exported until the next "
-                "reconnect/attach.", what, exc)
+            # The spec built for this upsert seeded `_pushed` as if it had landed; it did not,
+            # so forget it and the next diff re-sends the full state rather than a delta.
+            found = re.search(r"\bdev (\d+)", what)
+            if found:
+                self._pushed.pop(int(found.group(1)), None)
+            if bridge_protocol.STATE_NOT_APPLIED_PHRASE in str(exc):
+                # #355: the endpoint WAS created; only its state did not land.
+                self._logger.warning(
+                    "Matter bridge: %s failed — %s. The accessory may be live in your ecosystems "
+                    "showing stale state; the state is re-sent at the next change or reconnect/attach.",
+                    what, exc)
+            else:
+                # Names the consequence, not just the failure: an `upsert_endpoint`
+                # that never lands leaves the device un-exported, and "failed" alone
+                # does not say whether that heals itself or needs a human.
+                self._logger.warning(
+                    "Matter bridge: %s failed — %s. The device is not exported until the next "
+                    "reconnect/attach.", what, exc)
         elif what.startswith("identity change"):
             # Worse than the above, and worth its own sentence: `replace()`
             # removes BEFORE it adds, so a failure anywhere in that coroutine

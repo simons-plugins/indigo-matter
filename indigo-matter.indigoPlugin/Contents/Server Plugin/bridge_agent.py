@@ -47,7 +47,7 @@ import time
 from typing import Any, Callable, Optional
 
 from launch_agent import AgentSpec, LaunchAgent, expand_home
-from server_process import LABEL as CONTROLLER_LABEL
+from server_process import LABEL as CONTROLLER_LABEL, compare_versions
 
 #: launchd job label. A SUFFIX of the controller's, never the same string:
 #: the label is the plist filename stem and launchd's job identity, so sharing
@@ -63,7 +63,22 @@ BRIDGE_PACKAGE = "indigo-matter-bridge"
 #: and matter.js patch releases have changed what Apple Home renders with no code
 #: change on the bridge side. **This is the one line a release bumps**, in step
 #: with ``bridge-node/package.json``'s ``version``.
-DEFAULT_INSTALL_SPEC = f"{BRIDGE_PACKAGE}@0.17.5"
+DEFAULT_INSTALL_SPEC = f"{BRIDGE_PACKAGE}@0.18.0"
+
+def bridge_version_drift(bridge_version: Any, install_spec: Any = DEFAULT_INSTALL_SPEC) -> Optional[tuple]:
+    """Compare the running bridge node (the ``hello``'s ``bridgeVersion``) with this release's pin.
+
+    The bridge-node twin of ``server_process.version_drift``: ``(running, pinned, status)`` with
+    ``status`` ``"older"``/``"current"``/``"newer"``, or None when the comparison is impossible
+    (either side missing or unparseable). Never raises. Upgrading the plugin never upgrades the
+    bridge node — only :data:`BRIDGE_INSTALL_MENU` does — so a stale node otherwise looks healthy.
+    """
+    if not isinstance(bridge_version, str) or not isinstance(install_spec, str) or "@" not in install_spec:
+        return None
+    running, pinned = bridge_version.strip(), install_spec.split("@", 1)[1].strip()
+    status = compare_versions(running, pinned)
+    return None if status is None else (running, pinned, status)
+
 
 #: Fallback entry point when the installed package's ``package.json`` is missing
 #: or unreadable. Must match ``bridge-node/package.json``'s ``main``;

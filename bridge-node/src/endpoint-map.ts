@@ -970,6 +970,11 @@ export class EndpointMapStore {
         return removed;
     }
 
+    /** The published identities the map records — what a marker file is pruned against. */
+    uniqueIds(): Set<string> {
+        return new Set(this.#endpoints.keys());
+    }
+
     /**
      * Compare the live endpoint numbers against the map (PRD §4.3).
      *

@@ -66,6 +66,7 @@ consult it before drawing any conclusion from ``neighbours``/``parent``.
 from __future__ import annotations
 
 import re
+import textwrap
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -649,6 +650,12 @@ def _worst_link_reading(diag: NodeDiag) -> tuple[Optional[int], Optional[str]]:
     return _worst_reading(parent) if parent is not None else (None, None)
 
 
+_STALE_CACHE_NOTE = (
+    "matter-server's cache can be hours stale; a router's neighbour and route tables are never "
+    "refreshed by subscription"
+)
+
+
 def health_flags(  # pylint: disable=too-many-branches
         diag: NodeDiag, now: Optional[datetime] = None) -> list[HealthFlag]:
     """Derive health flags for one node. Never raises: every check degrades to
@@ -678,10 +685,41 @@ def health_flags(  # pylint: disable=too-many-branches
     key = _mesh_key(diag)
     flags: list[HealthFlag] = []
 
-    if diag.role in (ROLE_UNSPECIFIED, ROLE_UNASSIGNED) or not diag.available:
+    # Three different facts, three different flags (#369). ``detached`` is a Thread
+    # statement: the node's own RoutingRole says it is not attached to a network.
+    # Role Unspecified is a different fact — "RoutingRole could not be read" — and
+    # gets ``role_unknown`` instead of being mislabelled detached. It stays "bad", the
+    # severity the old detached flag gave it, because dropping it would let
+    # summary_states report threadHealth "ok" for a node whose role nobody knows.
+    if diag.role == ROLE_UNASSIGNED:
         flags.append(HealthFlag(
             key, "bad", "detached",
-            f"{diag.name}: detached (role={diag.role_name}, available={diag.available})",
+            f"{diag.name}: detached (Thread role {diag.role_name}) — not attached to the Thread network",
+        ))
+    if diag.role == ROLE_UNSPECIFIED:
+        flags.append(HealthFlag(
+            key, "bad", "role_unknown",
+            f"{diag.name}: Thread role could not be read / is unspecified — its mesh state is unknown",
+        ))
+    # ``unreachable`` is a controller statement: matter-server has no working session
+    # to the node. It says nothing about Thread attachment, and the Thread data shown
+    # for the node is matter-server's cache. Severity stays "bad" — the severity the
+    # old detached flag gave an unavailable node — because summary_states turns it
+    # into the user-bound ``threadHealth`` state (ADR-0008) and downgrading it would
+    # silently stop triggers that watch for "bad"; the code and wording carry the fix.
+    if not diag.available:
+        # Say only what is known: matter-server's own flag says unavailable. What the
+        # Thread data is depends on THIS survey — the #369 reporter saw successful
+        # reads while the flag fired, so "the data is cached" is only true for a node
+        # that was not live-read.
+        if diag.source == "live":
+            data_note = "a live read in this survey succeeded anyway"
+        else:
+            data_note = "the Thread data shown for it is matter-server's cache"
+        flags.append(HealthFlag(
+            key, "bad", "unreachable",
+            f"{diag.name}: unreachable — matter-server marks this node unavailable "
+            f"(its controller-side flag, not Thread attachment); {data_note}",
         ))
 
     if diag.is_router and diag.router_id is None:
@@ -734,13 +772,14 @@ def health_flags(  # pylint: disable=too-many-branches
             key, "warn", "unstable_parent", f"{diag.name}: {parent_changes} parent changes",
         ))
 
-    # "Sleepy/live-read candidate" is defined ONCE, by thread_survey's own
-    # criterion (NodeDiag.is_router) — a REED is exactly as live-read-worthy as a
-    # SED/ED, so it must get the same staleness note a cached reading deserves
-    # (#334 finding B5.7; this used to name only SED/ED and silently skip REEDs).
-    if diag.source == "cache" and not diag.is_router:
+    # Every CACHED node gets the note (#348 review): a sleepy device's snapshot can be
+    # hours old, and a router's NeighborTable/RouteTable are changes-omitted, so no
+    # subscription ever refreshes them either. A router whose live read FAILED gets
+    # wording that says so. Info-level, so summary_states (which drops info flags) —
+    # and with it the trigger-bound threadHealth state — is untouched.
+    if diag.source == "cache":
         phrase = None
-        if diag.last_interview is not None:
+        if diag.last_interview is not None and not diag.is_router:
             # #344 (issue body): the baseline is a LOWER bound, never
             # "accurate as of" — a stale PartitionId has been observed to
             # survive a later interview, so this names when the interview
@@ -750,13 +789,15 @@ def health_flags(  # pylint: disable=too-many-branches
             # unreadable as an age — _age_phrase returns None for it — so this
             # falls back to the no-age wording below rather than claim one.
             phrase = _age_phrase(seconds)
-        if phrase is not None:
+        if diag.is_router and diag.read_error is not None:
             message = (
-                f"{diag.name}: cached — baseline interview {phrase}; matter-server's cache can be "
-                "hours stale for sleepy devices"
+                f"{diag.name}: cached — the live read failed ({diag.read_error}); its neighbour and route "
+                "tables are matter-server's cache, which is not refreshed by subscription and can be stale"
             )
+        elif phrase is not None:
+            message = f"{diag.name}: cached — baseline interview {phrase}; {_STALE_CACHE_NOTE}"
         else:
-            message = f"{diag.name}: cached — matter-server's cache can be hours stale for sleepy devices"
+            message = f"{diag.name}: cached — {_STALE_CACHE_NOTE}"
         flags.append(HealthFlag(key, "info", "stale", message))
 
     return flags
@@ -1186,8 +1227,18 @@ def _node_lines(diag: NodeDiag, mesh: Mesh, now: datetime) -> list[str]:
     if not diag.neighbours:
         lines.append("   neighbour table: empty" if diag.neighbours_known else "   neighbour table: unknown")
     for warning in diag.parse_warnings:
-        lines.append(f"   ! {warning}")
+        lines.extend(_wrapped(f"   ! {warning}", continuation="     "))
     return lines
+
+
+_REPORT_WIDTH = 120
+
+
+def _wrapped(text: str, *, continuation: str) -> list[str]:
+    """``text`` wrapped to the report's 120-char budget (never truncated); the
+    continuation lines carry ``continuation`` as their indent."""
+    return textwrap.wrap(text, width=_REPORT_WIDTH, subsequent_indent=continuation,
+                         break_long_words=False, break_on_hyphens=False) or [text]
 
 
 def render_report(mesh: Mesh, diags: list[NodeDiag], *, page_url: Optional[str] = None,
@@ -1231,7 +1282,8 @@ def render_report(mesh: Mesh, diags: list[NodeDiag], *, page_url: Optional[str] 
     lines.append("-- Flags --")
     if mesh.flags:
         for flag in sorted(mesh.flags, key=lambda f: {"bad": 0, "warn": 1, "info": 2}.get(f.severity, 3)):
-            lines.append(f"   [{flag.severity.upper():4s}] {flag.code}: {flag.message}")
+            lines.extend(_wrapped(f"   [{flag.severity.upper():4s}] {flag.code}: {flag.message}",
+                                  continuation="          "))
     else:
         lines.append("   none")
 
@@ -1245,7 +1297,7 @@ def render_report(mesh: Mesh, diags: list[NodeDiag], *, page_url: Optional[str] 
         lines.append("")
         lines.append("-- Unreadable --")
         for node_id, reason in mesh.unreadable:
-            lines.append(f"   0x{node_id:X}: {reason}")
+            lines.extend(_wrapped(f"   0x{node_id:X}: {reason}", continuation="        "))
 
     if page_url:
         lines.append("")

@@ -16,6 +16,8 @@ interface Harness {
     window: CommissioningWindow;
     /** Fire the scheduled expiry, if one is armed. */
     fire(): void;
+    /** Move the injected clock. */
+    advance(ms: number): void;
     scheduled(): number | undefined;
     cancels: number;
     logs: string[];
@@ -25,6 +27,7 @@ interface Harness {
 
 function harness(options: { onExpire?: () => void } = {}): Harness {
     let pending: { callback: () => void; ms: number } | undefined;
+    let nowMs = 1_000_000;
     const state = {
         cancels: 0,
         logs: [] as string[],
@@ -32,7 +35,7 @@ function harness(options: { onExpire?: () => void } = {}): Harness {
         expiries: 0,
     };
     const window = new CommissioningWindow({
-        now: () => 1_000_000,
+        now: () => nowMs,
         log: message => state.logs.push(message),
         schedule: (callback, ms) => {
             pending = { callback, ms };
@@ -50,6 +53,9 @@ function harness(options: { onExpire?: () => void } = {}): Harness {
     return {
         window,
         fire: () => pending?.callback(),
+        advance: (ms: number) => {
+            nowMs += ms;
+        },
         scheduled: () => pending?.ms,
         get cancels() {
             return state.cancels;
@@ -125,6 +131,29 @@ describe("CommissioningWindow", () => {
         // A later, unrelated end callback is still a no-op.
         assert.equal(window.noteEnded(), false);
         assert.deepEqual(h.closed, ["expired"]);
+    });
+
+    it("reports \"expired\", not \"commissioned\", when matter.js's own timer ends the window at its deadline", () => {
+        // matter.js 0.18 starts a window timer of its own (0.17.8 never did), set to the same
+        // duration but a few ms EARLIER than ours, because it starts before our codes are encoded.
+        // Its end callback is `noteEnded`; reaching it at the deadline is an expiry, whichever timer won.
+        const h = harness();
+        h.window.open(900, MANUAL, QR);
+        h.advance(900_000 - 5); // matter's timer fires a few ms before our recorded expiry
+        assert.equal(h.window.noteEnded(), true);
+        assert.deepEqual(h.closed, ["expired"]);
+        assert.equal(h.expiries, 0, "matter.js already closed it; nothing left to end");
+        assert.equal(h.cancels, 1);
+        h.fire();
+        assert.deepEqual(h.closed, ["expired"], "our own late timer must not announce a second close");
+    });
+
+    it("still reports \"commissioned\" for an end well before the deadline", () => {
+        const h = harness();
+        h.window.open(900, MANUAL, QR);
+        h.advance(300_000);
+        h.window.noteEnded();
+        assert.deepEqual(h.closed, ["commissioned"]);
     });
 
     it("closes with reason \"commissioned\" and cancels the timer when a commissioner completes", () => {

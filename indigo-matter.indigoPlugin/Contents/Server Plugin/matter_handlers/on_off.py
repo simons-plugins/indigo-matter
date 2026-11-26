@@ -16,6 +16,7 @@ from .base import (
     MatterCommand,
     base_props,
     node_endpoint,
+    toggle_command_name,
 )
 from .electrical import meter_props
 from .settings import ATTR_START_UP_ON_OFF, CLUSTER_ON_OFF, SETTINGS
@@ -32,7 +33,6 @@ class OnOffHandler(ClusterHandler):
     ATTR_ON_OFF = 0x0000
     CMD_OFF = "Off"
     CMD_ON = "On"
-    CMD_TOGGLE = "Toggle"
 
     def is_primary_for(self, node: Any, endpoint: Any) -> bool:
         # A richer lighting handler (dimmer OR colour — a colour light is not
@@ -80,6 +80,11 @@ class OnOffHandler(ClusterHandler):
 
     #: Settings on this cluster, by attribute id — for their null handling.
     _SETTINGS_BY_ATTRIBUTE = {s.attribute: s for s in SETTINGS if s.cluster == CLUSTER_ON_OFF}
+
+    #: A null on these is an answer (the setting declares what it means), so
+    #: ``device_sync`` lets it through; a null OnOff itself is still dropped (#374).
+    accepts_null_attributes = frozenset(
+        a for a, s in _SETTINGS_BY_ATTRIBUTE.items() if s.null_state is not None)
 
     def attributes_to_subscribe(self) -> list[int]:
         return [self.ATTR_ON_OFF, *self.SETTING_STATES]
@@ -132,7 +137,7 @@ class OnOffHandler(ClusterHandler):
         elif device_action == indigo.kDeviceAction.TurnOff:
             command = self.CMD_OFF
         elif device_action == indigo.kDeviceAction.Toggle:
-            command = self.CMD_TOGGLE
+            command = toggle_command_name(indigo_dev)
         else:
             return None
         return MatterCommand(
