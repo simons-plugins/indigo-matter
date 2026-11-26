@@ -65,6 +65,11 @@ _STATIC_DEVICE_TYPE_STATES = {
 }
 
 
+#: Device types whose Devices.xml declares the String state ``settingsError`` (#388).
+_SETTINGS_ERROR_TYPES = {"matterRelay", "matterDimmer", "matterColorDimmer", "matterMotionSensor",
+                         "matterContactSensor", "matterLock"}
+
+
 class FakeDev:
     def __init__(self, dev_id, name, device_type_id, props, initial_states=None):
         self.id = dev_id
@@ -77,6 +82,10 @@ class FakeDev:
                 self.states[state_key] = 0  # Indigo-style initial value
         for state_key in _STATIC_DEVICE_TYPE_STATES.get(device_type_id, ()):
             self.states.setdefault(state_key, 0)
+        # String states start empty in real Indigo (not 0). #388: every type that
+        # carries settings declares settingsError.
+        if device_type_id in _SETTINGS_ERROR_TYPES:
+            self.states.setdefault("settingsError", "")
         # Callers that need states Devices.xml wouldn't auto-derive here (e.g.
         # matterButton's lastButtonEvent/pressCount) seed them explicitly.
         self.states.update(dict(initial_states or {}))

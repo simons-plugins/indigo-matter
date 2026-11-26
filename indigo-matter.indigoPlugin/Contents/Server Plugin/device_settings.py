@@ -455,7 +455,8 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
                         sleep: Callable = asyncio.sleep,
                         retry_delay: float = 2.0,
                         timeout: float = ATTRIBUTE_TIMEOUT,
-                        on_observed: Optional[Callable] = None) -> tuple[bool, str]:
+                        on_observed: Optional[Callable] = None,
+                        on_cause: Optional[Callable] = None) -> tuple[bool, str]:
     """Write a setting and PROVE it landed. Returns ``(ok, message)``.
 
     Success means one thing only: a subsequent read returns the value we asked
@@ -549,6 +550,8 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
                           f"(the send reported an error — {last_error} — but the "
                           f"device holds the new value).")
         return True, reason or f"{setting.label} is now {setting.value_text(plan.value)}."
+    if on_cause is not None:
+        on_cause(_short_cause(setting, plan.value, read_back, last_error))
     if last_error is not None:
         if _is_plain_mismatch(read_back, plan.value) and not isinstance(
                 last_error, (TimeoutError, asyncio.TimeoutError)):
@@ -566,6 +569,25 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
         # really happened, that is self-defeating.
         reason = f"{reason} (read-back failed: {read_error})"
     return False, reason
+
+
+def _short_cause(setting: DeviceSetting, intended: int, read_back: Any, send_error: Any) -> str:
+    """One short phrase for why a write failed, for the ``settingsError`` state.
+
+    No ``;`` (the state joins several failures with it) and no newlines.
+    """
+    if read_back is NO_ANSWER:
+        cause = f"the device did not confirm {setting.value_text(intended)}"
+    elif read_back is None:
+        cause = f"the device answered with no value after {setting.value_text(intended)}"
+    elif _is_plain_mismatch(read_back, intended):
+        if send_error is not None and not isinstance(send_error, (TimeoutError, asyncio.TimeoutError)):
+            cause = f"the device rejected {setting.value_text(intended)}"
+        else:
+            cause = f"the device ignored the change (still {setting.value_text(int(read_back))})"
+    else:
+        cause = f"the device answered with something unreadable after {setting.value_text(intended)}"
+    return cause.replace(";", ",").replace("\n", " ")
 
 
 def _is_plain_mismatch(read_back: Any, intended: int) -> bool:

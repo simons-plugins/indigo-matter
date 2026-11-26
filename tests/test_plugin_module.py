@@ -1848,7 +1848,7 @@ def test_a_lying_device_leaves_the_state_alone_and_flags_the_device(plugin_cls, 
     stub.matter.read = _async_value(10)     # ACKed the write, kept the old value
     _run_apply(plugin_cls, stub, _hold_time_plan())
     assert mock_logger.error.called
-    dev.setErrorStateOnServer.assert_called_once_with("setting failed")
+    dev.setErrorStateOnServer.assert_not_called()
     # The requested value is NEVER written — that would be the optimistic echo
     # this feature exists to kill. What IS written is what the read-back proved
     # the device actually holds, so the dialog (which re-seeds from state)
@@ -1869,9 +1869,9 @@ def test_a_failed_flag_on_a_LIVE_device_warns_rather_than_going_quiet(
     """
     from unittest.mock import MagicMock
     dev = _fp300_dev()
-    dev.setErrorStateOnServer = MagicMock(side_effect=RuntimeError("server not answering"))
     mock_indigo_base.devices = {5: dev}
     stub = _settings_stub(plugin_cls, mock_logger, matter=MagicMock())
+    stub.device_sync.apply_states.side_effect = RuntimeError("server not answering")
     stub.matter.write = _async_none
     stub.matter.read = _async_value(10)          # ACKed the write, kept the old value
     _run_apply(plugin_cls, stub, _hold_time_plan())
@@ -1978,7 +1978,7 @@ def test_a_dimmer_write_the_device_ignores_flags_the_device_and_keeps_the_real_v
     plan = PlannedWrite(settings_for_type(type_id)[0], 2, 1)
     _run_apply(plugin_cls, stub, plan, dev_id=7)
     assert mock_logger.error.called
-    dev.setErrorStateOnServer.assert_called_once_with("setting failed")
+    dev.setErrorStateOnServer.assert_not_called()
     stub.device_sync.apply_states.assert_called_once_with(
         7, [{"key": "startUpOnOff", "value": 1}], clear_error=False)
 
@@ -2005,7 +2005,7 @@ def test_a_dimmer_write_that_cannot_be_sent_or_read_never_touches_state(
     plan = device_settings.PlannedWrite(settings_for_type(type_id)[0], 2, 1)
     _run_apply(plugin_cls, stub, plan, dev_id=7)
     assert mock_logger.error.called
-    dev.setErrorStateOnServer.assert_called_once_with("setting failed")
+    dev.setErrorStateOnServer.assert_not_called()
     stub.device_sync.apply_states.assert_not_called()   # state not falsely updated
 
 
@@ -2949,7 +2949,7 @@ def test_a_failed_lock_write_is_an_error_and_never_shows_the_requested_value(
     assert mock_logger.error.called
     assert "UnsupportedWrite" in str(mock_logger.error.call_args)
     assert "0x88" in str(mock_logger.error.call_args)
-    dev.setErrorStateOnServer.assert_called_once_with("setting failed")
+    dev.setErrorStateOnServer.assert_not_called()
     stub.device_sync.apply_states.assert_called_once_with(
         9, [{"key": "autoRelockTime", "value": 30}], clear_error=False)   # what the lock holds, not 45
 
@@ -3060,6 +3060,6 @@ def test_a_write_whose_read_back_got_no_answer_makes_the_setting_unread(
     finally:
         device_settings.apply_setting = original
     assert mock_logger.error.called
-    dev.setErrorStateOnServer.assert_called_once_with("setting failed")        # kept
+    dev.setErrorStateOnServer.assert_not_called()        # reachability only
     stub.device_sync.mark_setting_unread.assert_called_once_with(9, "autoRelockTime")
     stub.device_sync.apply_states.assert_not_called()

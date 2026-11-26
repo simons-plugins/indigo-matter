@@ -66,6 +66,18 @@ a resend of the value the dialog opened with; they change it and change it back.
 An edit that cannot be sent (plugin not connected, or the device flagged unreachable) is
 refused in validation with a field error rather than failing after the dialog has closed.
 
+### Failures are recorded on the setting, not on the device
+
+The Indigo device error flag means "unreachable" and nothing else: a failed or unverified
+setting write never sets or replaces it. The failure is recorded on the String state
+`settingsError` (one short sentence per setting naming its label and cause, joined with
+"; "), written without clearing the device's error flag and with an explicit uiValue. The
+failed setting's own state keeps the device's real value (the read-back, else the previous
+value), never the requested one. A setting's sentence is cleared by that setting's next
+successful write, or by a later device reading of the value the user asked for (remembered
+in memory only); unrelated reports do not clear it, and after a restart only a good write
+does.
+
 ### Consequences
 
 * Good, because 0 is no longer indistinguishable from "unread".

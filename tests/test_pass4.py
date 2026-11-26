@@ -116,7 +116,7 @@ def test_a_failed_write_never_replaces_an_existing_unreachable_flag(plugin_cls, 
                  matter=_Matter(write=TimeoutError("timed out"), read=TimeoutError("timed out")))
     _run_apply(plugin_cls, stub, dev, device_settings.PlannedWrite(ARL, 45, 30))
     assert dev.errorState == "unreachable"
-    assert "unreachable" in str(mock_logger.error.call_args)
+    assert dev.states["settingsError"].startswith("Auto-relock time:")     # recorded on the setting
     assert _open(plugin_cls, stub, dev, "matterLock")["settingsStale"] != "no"
 
 
@@ -396,7 +396,7 @@ def test_a_null_read_back_for_a_null_state_setting_leaves_the_device_flagged(
     dev = devices[ds.lookup(raw["node_id"], 1, "matterRelay")]
     stub = _stub(plugin_cls, ds, mock_logger, matter=_Matter(read=None))
     _run_apply(plugin_cls, stub, dev, device_settings.PlannedWrite(SUS, 0, 1), node=raw["node_id"])
-    assert dev.errorState == "setting failed"
+    assert dev.errorState == ""
     assert dev.states["startUpOnOff"] == 255
 
 

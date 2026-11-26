@@ -55,6 +55,13 @@
                    visibleBindingId="settingsStale" visibleBindingValue="server">
                 <Label>The plugin is not connected to matter-server; these are the last values it read.</Label>
             </Field>
+            <!-- The last failed setting write (#388), as text: a label cannot vary, so a
+                 readonly field bound to a hidden marker, like the Range fields. -->
+            <Field id="settingsErrorShown" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="settingsErrorText" type="textfield" readonly="yes"
+                   visibleBindingId="settingsErrorShown" visibleBindingValue="yes">
+                <Label>Last failure:</Label>
+            </Field>
             <Field id="startUpOnOff" type="menu"
                    visibleBindingId="hasStartUpOnOff" visibleBindingValue="yes">
                 <Label>After a power cut:</Label>
@@ -107,6 +114,13 @@
                 <TriggerLabel>OnTime (retired)</TriggerLabel>
                 <ControlPageLabel>OnTime (retired)</ControlPageLabel>
             </State>
+            <!-- The last failed setting write (#388): empty when nothing failed. The device
+                 error flag is for reachability only, so a failure lives here instead. -->
+            <State id="settingsError">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Settings Error</TriggerLabel>
+                <ControlPageLabel>Settings Error</ControlPageLabel>
+            </State>
         </States>
         <UiDisplayStateId>onOffState</UiDisplayStateId>
     </Device>
@@ -150,6 +164,13 @@
                    visibleBindingId="settingsStale" visibleBindingValue="server">
                 <Label>The plugin is not connected to matter-server; these are the last values it read.</Label>
             </Field>
+            <!-- The last failed setting write (#388), as text: a label cannot vary, so a
+                 readonly field bound to a hidden marker, like the Range fields. -->
+            <Field id="settingsErrorShown" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="settingsErrorText" type="textfield" readonly="yes"
+                   visibleBindingId="settingsErrorShown" visibleBindingValue="yes">
+                <Label>Last failure:</Label>
+            </Field>
             <Field id="startUpOnOff" type="menu"
                    visibleBindingId="hasStartUpOnOff" visibleBindingValue="yes">
                 <Label>After a power cut:</Label>
@@ -170,6 +191,13 @@
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Power-On Behaviour</TriggerLabel>
                 <ControlPageLabel>Power-On Behaviour</ControlPageLabel>
+            </State>
+            <!-- The last failed setting write (#388): empty when nothing failed. The device
+                 error flag is for reachability only, so a failure lives here instead. -->
+            <State id="settingsError">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Settings Error</TriggerLabel>
+                <ControlPageLabel>Settings Error</ControlPageLabel>
             </State>
         </States>
     </Device>
@@ -220,6 +248,13 @@
                    visibleBindingId="settingsStale" visibleBindingValue="server">
                 <Label>The plugin is not connected to matter-server; these are the last values it read.</Label>
             </Field>
+            <!-- The last failed setting write (#388), as text: a label cannot vary, so a
+                 readonly field bound to a hidden marker, like the Range fields. -->
+            <Field id="settingsErrorShown" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="settingsErrorText" type="textfield" readonly="yes"
+                   visibleBindingId="settingsErrorShown" visibleBindingValue="yes">
+                <Label>Last failure:</Label>
+            </Field>
             <Field id="startUpOnOff" type="menu"
                    visibleBindingId="hasStartUpOnOff" visibleBindingValue="yes">
                 <Label>After a power cut:</Label>
@@ -262,6 +297,13 @@
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Color Y</TriggerLabel>
                 <ControlPageLabel>Color Y</ControlPageLabel>
+            </State>
+            <!-- The last failed setting write (#388): empty when nothing failed. The device
+                 error flag is for reachability only, so a failure lives here instead. -->
+            <State id="settingsError">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Settings Error</TriggerLabel>
+                <ControlPageLabel>Settings Error</ControlPageLabel>
             </State>
         </States>
     </Device>
@@ -371,6 +413,13 @@
                    visibleBindingId="settingsStale" visibleBindingValue="server">
                 <Label>The plugin is not connected to matter-server; these are the last values it read.</Label>
             </Field>
+            <!-- The last failed setting write (#388), as text: a label cannot vary, so a
+                 readonly field bound to a hidden marker, like the Range fields. -->
+            <Field id="settingsErrorShown" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="settingsErrorText" type="textfield" readonly="yes"
+                   visibleBindingId="settingsErrorShown" visibleBindingValue="yes">
+                <Label>Last failure:</Label>
+            </Field>
             <Field id="holdTime" type="textfield"
                    visibleBindingId="hasHoldTime" visibleBindingValue="yes">
                 <Label>Presence hold time (seconds):</Label>
@@ -410,6 +459,13 @@
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Presence Hold Time</TriggerLabel>
                 <ControlPageLabel>Presence Hold Time</ControlPageLabel>
+            </State>
+            <!-- The last failed setting write (#388): empty when nothing failed. The device
+                 error flag is for reachability only, so a failure lives here instead. -->
+            <State id="settingsError">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Settings Error</TriggerLabel>
+                <ControlPageLabel>Settings Error</ControlPageLabel>
             </State>
         </States>
         <UiDisplayStateId>onOffState</UiDisplayStateId>
@@ -452,6 +508,13 @@
                    visibleBindingId="settingsStale" visibleBindingValue="server">
                 <Label>The plugin is not connected to matter-server; these are the last values it read.</Label>
             </Field>
+            <!-- The last failed setting write (#388), as text: a label cannot vary, so a
+                 readonly field bound to a hidden marker, like the Range fields. -->
+            <Field id="settingsErrorShown" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="settingsErrorText" type="textfield" readonly="yes"
+                   visibleBindingId="settingsErrorShown" visibleBindingValue="yes">
+                <Label>Last failure:</Label>
+            </Field>
             <Field id="sensitivityLevel" type="menu"
                    visibleBindingId="hasSensitivity" visibleBindingValue="yes">
                 <Label>Sensitivity:</Label>
@@ -470,6 +533,13 @@
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Sensitivity Level</TriggerLabel>
                 <ControlPageLabel>Sensitivity Level</ControlPageLabel>
+            </State>
+            <!-- The last failed setting write (#388): empty when nothing failed. The device
+                 error flag is for reachability only, so a failure lives here instead. -->
+            <State id="settingsError">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Settings Error</TriggerLabel>
+                <ControlPageLabel>Settings Error</ControlPageLabel>
             </State>
         </States>
         <UiDisplayStateId>onOffState</UiDisplayStateId>
@@ -612,6 +682,13 @@
                    visibleBindingId="settingsStale" visibleBindingValue="server">
                 <Label>The plugin is not connected to matter-server; these are the last values it read.</Label>
             </Field>
+            <!-- The last failed setting write (#388), as text: a label cannot vary, so a
+                 readonly field bound to a hidden marker, like the Range fields. -->
+            <Field id="settingsErrorShown" type="textfield" hidden="true" defaultValue="no"/>
+            <Field id="settingsErrorText" type="textfield" readonly="yes"
+                   visibleBindingId="settingsErrorShown" visibleBindingValue="yes">
+                <Label>Last failure:</Label>
+            </Field>
             <Field id="autoRelockTime" type="textfield"
                    visibleBindingId="hasAutoRelockTime" visibleBindingValue="yes">
                 <Label>Auto-relock (seconds):</Label>
@@ -681,6 +758,13 @@
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Lockout Time After Wrong Codes (seconds)</TriggerLabel>
                 <ControlPageLabel>Lockout Time After Wrong Codes (seconds)</ControlPageLabel>
+            </State>
+            <!-- The last failed setting write (#388): empty when nothing failed. The device
+                 error flag is for reachability only, so a failure lives here instead. -->
+            <State id="settingsError">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Settings Error</TriggerLabel>
+                <ControlPageLabel>Settings Error</ControlPageLabel>
             </State>
         </States>
         <UiDisplayStateId>onOffState</UiDisplayStateId>

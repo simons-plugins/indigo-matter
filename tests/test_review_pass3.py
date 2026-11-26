@@ -102,7 +102,7 @@ def test_A_a_refused_write_leaves_the_device_flagged(plugin_cls, ds, indigo_env,
     stub = _stub(plugin_cls, ds, mock_logger,
                  matter=_Matter(write=RuntimeError("Write failed: CONSTRAINT_ERROR (0x87)"), read=5))
     _run_apply(plugin_cls, stub, dev, device_settings.PlannedWrite(WCL, 3, 5))
-    assert dev.errorState == "setting failed"
+    assert dev.errorState == ""
     assert dev.states["wrongCodeEntryLimit"] == 5
 
 

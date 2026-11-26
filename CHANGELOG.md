@@ -41,6 +41,13 @@ current version is `Info.plist`'s `PluginVersion`.
   The dialog says why values may be out of date (device unreachable, or plugin not connected).
 - Fix: a Matter node device's own "reachable" state was written in a way that cleared its
   "unreachable" flag the moment it was set, so a node going offline could show as fine.
+- A failed or unconfirmed setting write no longer marks the whole device as in error (a lock
+  keeps showing Locked/Unlocked, a relay on/off). The failure is recorded on a new text state,
+  **Settings Error**, on every device type that has settings, e.g. "Auto-relock time: the
+  device rejected 99999 seconds", shown in the Edit Device dialog and usable in triggers. It is
+  cleared per setting by the next successful write of that setting, or by the device later
+  reporting the value you asked for, and not by unrelated reports. The Event Log ERROR line is
+  unchanged. The device error flag now means "unreachable" only.
 - The existing sensor and relay setting states now carry a display value (the number with
   its unit, or the option name, such as "Standard"), and while a state shows "unknown"
   its numeric value, which triggers compare, is still the previous number.

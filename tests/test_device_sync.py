@@ -6181,7 +6181,7 @@ def test_operating_mode_and_require_pin_never_become_states(ds, indigo_env):
     ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
     dev = devices[ds.lookup(0x39, 1)]
     states = {k for k in dev.states if not k.endswith(".ui")}
-    assert states - {"onOffState", "lockState", *_LOCK_SETTING_STATES} == set()
+    assert states - {"onOffState", "lockState", "settingsError", *_LOCK_SETTING_STATES} == set()
 
 
 def test_an_existing_lock_gains_the_settings_on_upgrade_without_recreation(ds, indigo_env):
@@ -6422,4 +6422,4 @@ def test_after_a_write_whose_read_back_got_no_answer_the_next_open_is_blank(
     finally:
         device_settings.apply_setting = original_apply
     assert seeded() == ""                                     # no longer vouched for
-    dev.setErrorStateOnServer.assert_called_once_with("setting failed")
+    dev.setErrorStateOnServer.assert_not_called()

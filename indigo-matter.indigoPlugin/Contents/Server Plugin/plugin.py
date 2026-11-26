@@ -135,6 +135,18 @@ def _is_flagged_unreachable(dev_id, logger=None) -> bool:
         return True
 
 
+def _record_setting_outcome(plugin, dev_id, plan, cause) -> None:
+    """Record (cause given) or clear (None) the setting's failure text; never raises."""
+    try:
+        if cause is None:
+            plugin.device_sync.clear_setting_failure(dev_id, plan.setting)
+        else:
+            plugin.device_sync.record_setting_failure(dev_id, plan.setting, plan.value, cause)
+    except Exception as exc:  # pylint: disable=broad-except
+        # the ERROR line already said what failed; this says the state did not follow
+        plugin.logger.warning("could not update the settings error of device %s (%s)", dev_id, exc)
+
+
 def _matter_connected(plugin) -> bool:
     """Is the plugin connected to matter-server? No permissive default: a client with
     no ``connected`` attribute is NOT connected."""
@@ -1248,8 +1260,9 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             if "lastSurveySummary" in valuesDict:
                 del valuesDict["lastSurveySummary"]
         # A dialog-only marker (#388), like lastSurveySummary: never a stored prop.
-        if "settingsStale" in valuesDict:
-            del valuesDict["settingsStale"]
+        for dialog_only in ("settingsStale", "settingsErrorShown", "settingsErrorText"):
+            if dialog_only in valuesDict:
+                del valuesDict[dialog_only]
         created = ""
         try:
             created = indigo.devices[devId].pluginProps.get("createdTypeId", "")
@@ -1605,6 +1618,9 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # the dialog is open (another app), so an untouched Save never overwrites it.
             _remember_seed(self, devId, {
                 setting.key: values.get(setting.key, "") for setting in settings_for_type(typeId)})
+            failure = str(states.get("settingsError") or "")
+            values["settingsErrorShown"] = "yes" if failure else "no"
+            values["settingsErrorText"] = failure
             values["settingsStale"] = "no"
             if values.get("hasAnySetting") == "yes":
                 if not _matter_connected(self):
@@ -1632,6 +1648,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 values[device_settings.marker_field(setting)] = device_settings.MARKER_NO
             values["hasAnySetting"] = device_settings.MARKER_NO
             values["settingsStale"] = "no"
+            values["settingsErrorShown"] = "no"
+            values["settingsErrorText"] = ""
             vars(self).get("_dialog_seeds", {}).pop(devId, None)
         # MUST be indigo.Dict, not a plain dict — the same shape
         # getPrefsConfigUiValues returns. Returning a plain dict fails INSIDE
@@ -1708,12 +1726,14 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         that inside validateDeviceConfigUi would freeze the Indigo UI with no
         way out. By the time this runs the dialog is gone, so the round trip
         goes onto the asyncio loop and reports through the event log and the
-        device's error state instead of a dialog.
+        device's ``settingsError`` state instead of a dialog (never the device error
+        flag, which means "unreachable" and nothing else).
 
         The consequence worth knowing: a failure surfaces AFTER the dialog has
-        closed. It is logged as an error, the device is marked in error, and
-        because the dialog re-seeds from device state on every open, reopening
-        it shows what the device actually holds — never the value that failed.
+        closed. It is logged as an error, recorded in ``settingsError`` (shown when the
+        dialog next opens), and because the dialog re-seeds from device state on every
+        open, reopening it shows what the device actually holds — never the value that
+        failed.
         """
         # The remembered seed is spent either way (Save or Cancel).
         slot = vars(self).get("_dialog_seeds", {}).pop(devId, None)
@@ -1802,17 +1822,17 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
 
         Runs on the asyncio loop, so the STATE write goes through
         ``device_sync.apply_states`` — the same discipline the attribute
-        firehose and the export bridge's command dispatch already use. The error
-        flag is set directly, as ``device_sync``'s own ``_safe_unreachable`` /
-        ``_clear_error`` do from the same thread; the seam rule covers
-        ``updateStatesOnServer``, not every Indigo call.
+        firehose and the export bridge's command dispatch already use. The device
+        error flag is NEVER set here: it means "unreachable" and nothing else, so a
+        failure is recorded on the ``settingsError`` state instead.
         """
         label = plan.setting.label
         observed: list = []
+        cause: list = []
         try:
             ok, message = await device_settings.apply_setting(
                 self.matter, node_id, endpoint_id, plan,
-                on_observed=observed.append)
+                on_observed=observed.append, on_cause=cause.append)
         except Exception as exc:  # pylint: disable=broad-except
             # a crash here must not kill the loop
             self.logger.exception('"%s" could not be applied: %s', label, exc)
@@ -1824,16 +1844,12 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # action does. apply_states also clears any stale error flag.
             self.device_sync.apply_states(dev_id, [{"key": plan.setting.key,
                                                     "value": plan.value}])
+            _record_setting_outcome(self, dev_id, plan, None)
             return
         self.logger.error("%s", message)
+        # The device error flag is for REACHABILITY ONLY: a failed setting write never sets
+        # (or replaces) it. The failure is recorded on the setting's own settingsError state.
         try:
-            dev = indigo.devices[dev_id]
-            if getattr(dev, "errorState", "") == "unreachable":
-                # Never replace "unreachable" with "setting failed": the device being
-                # unreachable is the more important fact, and the reason this failed.
-                self.logger.error('"%s" was unreachable, so its flag was left as it was', dev.name)
-            else:
-                dev.setErrorStateOnServer("setting failed")
             # A mismatch means the read-back told us what the device ACTUALLY
             # holds. Recording it keeps the dialog honest on next open — it
             # re-seeds from state, so leaving the stale value would show the
@@ -1844,10 +1860,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # (neither the stale value nor the one asked for).
             actual = observed[0] if observed else None
             if actual is not None or (observed and plan.setting.null_state is not None):
-                # A null read-back is a real answer for a setting that declares a null
-                # state (#360): recorded as that state, and the setting is READ. Written
-                # without clearing the error just set above: a refused or unverified
-                # write must leave the device flagged.
+                # Written without clearing the error: whatever flag the device has
+                # (reachability) is not ours to clear.
                 self.device_sync.apply_states(
                     dev_id, [plan.setting.state_entry(actual)], clear_error=False)
             else:
@@ -1856,18 +1870,18 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 self.device_sync.mark_setting_unread(dev_id, plan.setting.key)
         except KeyError:
             # The device was deleted between the dialog closing and this
-            # running on the loop — routine, and there is nothing left to
-            # flag or to keep honest.
-            self.logger.debug("could not flag failed setting: device %s is gone", dev_id)
+            # running on the loop — routine, and there is nothing left to record.
+            self.logger.debug("could not record failed setting: device %s is gone", dev_id)
+            return
         except Exception as exc:  # pylint: disable=broad-except
-            # NOT gone: the device exists and the flag/state write failed, so
+            # NOT gone: the device exists and the state write failed, so
             # the dialog will re-seed from state and show a setting the device
-            # never adopted — the exact divergence the comment above says this
-            # write exists to prevent. The write failure was already reported
+            # never adopted. The write failure was already reported
             # to the user at ERROR; this says the record of it did not stick.
             self.logger.warning(
                 "the setting failure on device %s could not be recorded (%s) — the device's "
                 "settings dialog may show a value the device never adopted", dev_id, exc)
+        _record_setting_outcome(self, dev_id, plan, cause[0] if cause else "the write failed")
 
     def _server_is_managed(self) -> bool:
         """Does this plugin run matter-server itself? (``server_process`` None = it
