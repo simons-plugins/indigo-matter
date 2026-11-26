@@ -1700,6 +1700,24 @@ def test_version_drift_defaults_to_pin():
     assert version_drift("matter-server/0.0.1")[1] == pinned
 
 
+# sdk_version exactly as matter-server 1.6.1 reported it in server_info, captured from a
+# throwaway local instance on 2026-11-26 (issue #374).
+_REAL_1_6_1 = "matter-server/1.6.1 (matter.js/0.18.1)"
+
+
+def test_version_drift_default_pin_matches_the_real_1_6_1_server():
+    assert version_drift(_REAL_1_6_1) == ("1.6.1", "1.6.1", "current")
+
+
+@pytest.mark.parametrize("running", [
+    "matter-server/1.2.2 (matter.js/0.17.5-alpha.0-20260710-82b39217b)",  # the previous pin
+    "matter-server/1.6.0 (matter.js/0.18.1-alpha.0-20261114-0000000)",
+    "matter-server/1.6.1-alpha.0-20261125-0000000 (matter.js/0.18.1)",
+])
+def test_version_drift_default_pin_calls_anything_below_1_6_1_older(running):
+    assert version_drift(running)[1:] == ("1.6.1", "older")
+
+
 def test_version_drift_oversized_numeric_component_is_unknown_not_an_exception():
     # Python refuses int() on strings past its digit limit; the helper's "never raises" must hold.
     assert version_drift("matter-server/" + "9" * 5000, "matter-server@1.2.2") is None

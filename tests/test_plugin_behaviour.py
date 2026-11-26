@@ -2672,6 +2672,19 @@ def test_drift_warns_once_in_managed_mode(plug):
     plug.device_sync.reconcile_all.assert_called()
 
 
+def test_drift_warns_an_install_still_on_the_previous_pin(plug):
+    # Issue #374: updating the plugin leaves matter-server 1.2.2 running until the user
+    # runs the install menu item. That server must be called outdated, with the backup
+    # step named first, not passed over as current.
+    from server_process import BACKUP_MENU, INSTALL_MENU
+    _drift_plug(plug, "matter-server/1.2.2 (matter.js/0.17.5-alpha.0-20260710-82b39217b)")
+    asyncio.run(plug._resync())
+    texts = _warning_texts(plug)
+    assert len(texts) == 1
+    assert "1.2.2" in texts[0] and "1.6.1" in texts[0]
+    assert f"Plugins ▸ Matter ▸ {BACKUP_MENU}, then Plugins ▸ Matter ▸ {INSTALL_MENU}" in texts[0]
+
+
 def test_drift_rewarns_for_a_different_running_version(plug):
     _drift_plug(plug, OLD)
     asyncio.run(plug._resync())
@@ -2799,7 +2812,11 @@ def test_status_body_reports_pin_and_outdated(plug):
 
 @pytest.mark.parametrize("info,expected", [
     ({"sdk_version": "matter-server/0.6.8"}, "older"),
-    ({"sdk_version": "matter-server/1.2.2"}, "current"),
+    ({"sdk_version": "matter-server/1.6.1 (matter.js/0.18.1)"}, "current"),
+    # The previous pin. An install the user has not yet updated through the menu item
+    # must read as outdated, not as current (issue #374).
+    ({"sdk_version": "matter-server/1.2.2 (matter.js/0.17.5-alpha.0-20260710-82b39217b)"}, "older"),
+    ({"sdk_version": "matter-server/1.6.0"}, "older"),
     ({"sdk_version": "matter-server/9.0.0"}, "newer"),
     ({}, "unknown"),
     ({"sdk_version": "garbage"}, "unknown"),
