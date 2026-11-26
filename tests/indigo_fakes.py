@@ -125,10 +125,16 @@ class FakeDev:
         self.error = None
         self.errorState = ""
 
-    def updateStateOnServer(self, key, value=None, clearErrorState=True, *, uiValue=None,
-                            decimalPlaces=None, triggerEvents=True):
-        """The documented single-key call: ``(key, value, clearErrorState)`` positionally,
-        the rest keyword-only. Every call's keywords are recorded for tests to assert."""
+    # The REAL signature, read live from Indigo 2026.1 on 2026-11-26 with
+    # ``indigo.Device.updateStateOnServer.__doc__``:
+    #   updateStateOnServer(key, value [, decimalPlaces=-1 [, triggerEvents=True
+    #                       [, clearErrorState=True [, uiValue=None]]]])
+    # The third POSITIONAL is decimalPlaces - not clearErrorState. A version of this fake
+    # that put clearErrorState third hid a bug where every "keep the error" write
+    # cleared it. Do not reorder; tests/test_fake_signature.py pins it.
+    def updateStateOnServer(self, key, value, decimalPlaces=-1, triggerEvents=True,
+                            clearErrorState=True, uiValue=None):
+        """Records every call's arguments (as the real parameters) for tests to assert."""
         self.single_key_calls.append({
             "key": key, "value": value, "clearErrorState": clearErrorState, "uiValue": uiValue,
             "decimalPlaces": decimalPlaces, "triggerEvents": triggerEvents})

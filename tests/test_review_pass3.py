@@ -137,7 +137,7 @@ def test_a_write_that_must_not_clear_the_error_uses_the_documented_single_key_ca
                     clear_error=False)
     assert dev.single_key_calls[before:] == [{
         "key": "sensitivityLevel", "value": 2, "clearErrorState": False, "uiValue": "High",
-        "decimalPlaces": None, "triggerEvents": True}]
+        "decimalPlaces": -1, "triggerEvents": True}]
     assert dev.errorState == "unreachable"
 
 

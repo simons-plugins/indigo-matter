@@ -4231,10 +4231,10 @@ class DeviceSync:
 
         ``clear_error=False`` is for a write that is NOT evidence the device is
         reachable (a cached reading replayed from a snapshot). Indigo clears a device's
-        error state on a state write by default, and only the single-key
-        ``updateStateOnServer(key, value, clearErrorState)`` documents how to opt out,
-        so such a write goes key by key through that call - never through the batch
-        one. ``count_as_read=False`` is for a display-only write (``uiValue="unknown"``)
+        error state on a state write by default, and only the single-key call (real
+        signature, Indigo 2026.1: ``updateStateOnServer(key, value, decimalPlaces=-1,
+        triggerEvents=True, clearErrorState=True, uiValue=None)``) can opt out, so such a
+        write goes key by key through that call, BY KEYWORD - never through the batch one. ``count_as_read=False`` is for a display-only write (``uiValue="unknown"``)
         that must not mark a setting as read (and does not fire triggers).
         ``skip_read=True`` drops a setting state that has been read since the caller
         decided to write it, checked immediately before the write, so a replay of an
@@ -4279,21 +4279,26 @@ class DeviceSync:
     def _write_keeping_error(self, dev: Any, kvlist: list, trigger_events: bool = True) -> set:
         """Write states one key at a time WITHOUT clearing the device's error state.
 
-        Indigo's documented ``updateStateOnServer(key, value, clearErrorState)``; the
-        batch ``updateStatesOnServer`` is not documented as taking that argument. One
+        The single-key ``updateStateOnServer(key, value, decimalPlaces=-1, triggerEvents=True,
+        clearErrorState=True, uiValue=None)``, called by keyword; the batch
+        ``updateStatesOnServer`` is not documented as taking ``clearErrorState``. One
         key failing must not abort the rest, so each is isolated and logged; the keys
         that failed are returned (and are not counted as read by the caller).
         """
         failed: set = set()
         for kv in kvlist:
-            kwargs: dict = {}
+            # KEYWORDS ONLY past ``value``. The real signature (Indigo 2026.1) is
+            # updateStateOnServer(key, value, decimalPlaces=-1, triggerEvents=True,
+            # clearErrorState=True, uiValue=None): a positional False here lands in
+            # decimalPlaces and the error flag is cleared anyway.
+            kwargs: dict = {"clearErrorState": False}
             for optional in ("uiValue", "decimalPlaces"):
                 if optional in kv:
                     kwargs[optional] = kv[optional]
             if not trigger_events:
                 kwargs["triggerEvents"] = False
             try:
-                dev.updateStateOnServer(kv["key"], kv["value"], False, **kwargs)
+                dev.updateStateOnServer(kv["key"], value=kv["value"], **kwargs)
             except Exception as exc:  # pylint: disable=broad-except
                 # one refused state write must not stop the others; named and counted
                 failed.add(kv["key"])
