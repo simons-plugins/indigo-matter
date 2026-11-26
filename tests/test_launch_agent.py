@@ -24,12 +24,12 @@ from datetime import datetime
 import pytest
 
 from launch_agent import (
-    FATAL_FRESHNESS_SLACK_SECONDS, INSTALL_NODE_STAMP, NO_BOOTSTRAP_RECENT_WINDOW_SECONDS,
+    EADDRINUSE_MARKER, FATAL_FRESHNESS_SLACK_SECONDS, INSTALL_NODE_STAMP, NO_BOOTSTRAP_RECENT_WINDOW_SECONDS,
     VERDICT_CONFLICT_FREE, VERDICT_DEAD, VERDICT_PENDING, AgentSpec, FatalCause, LaunchAgent,
 )
 from server_process import APPLIED_PLIST_MARKER, LABEL, ServerProcess
 
-from test_server_process import FakeRunner, ProcRunner
+from test_server_process import FakeRunner, ProcRunner, launchctl_print_fixture
 
 
 def _argv(agent):
@@ -807,6 +807,89 @@ def test_verdict_is_pending_when_the_pids_age_is_unknowable(tmp_path, mock_logge
     # Fail closed, same discipline as port_conflict_report's own age gate: "cannot
     # tell" must never read as "old enough" and render a verdict it hasn't earned.
     agent = _portful(tmp_path, mock_logger, ProcRunner(print_pid=5423, proc_etime=None))
+    assert agent.post_bootstrap_verdict() == VERDICT_PENDING
+
+
+# ---------------------------------------------------------------------------
+# Issue #374 — matter-server 1.6.1 EXITS 1 on a failed start, and launchd's KeepAlive
+# respawns it about every 10 s. Every attempt is young and the gap between attempts
+# has no pid, so "pending" and "dead" alternate and neither is the truth. The real
+# `launchctl print` text (tests/fixtures/launchctl_print) is what tells them apart.
+# ---------------------------------------------------------------------------
+
+def _write_fatal(agent, text):
+    """Append a matter-server-style FATAL line stamped NOW to the agent's err log."""
+    os.makedirs(agent.log_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    with open(os.path.join(agent.log_dir, agent.spec.err_log), "a", encoding="utf-8") as handle:
+        handle.write(f"{stamp} FATAL MatterServer Server failed to start {text}\n")
+
+
+_EADDRINUSE = "listen EADDRINUSE: address already in use 127.0.0.1:5580"
+
+
+@pytest.mark.parametrize("fixture,etime", [
+    ("respawn_attempt_running", "00:04"),    # sampled while one attempt is alive
+    ("respawn_spawn_scheduled", "00:04"),    # sampled between attempts: no pid at all
+])
+def test_verdict_is_not_pending_for_a_job_launchd_keeps_respawning(tmp_path, mock_logger, fixture, etime):
+    import launch_agent
+    agent = _portful(tmp_path, mock_logger,
+                     ProcRunner(print_text=launchctl_print_fixture(fixture), proc_etime=etime))
+    assert agent.post_bootstrap_verdict() == launch_agent.VERDICT_RESPAWNING
+
+
+@pytest.mark.parametrize("fixture,etime,expected", [
+    ("first_run_never_exited", "10:00", VERDICT_CONFLICT_FREE),   # healthy, long running
+    ("first_run_never_exited", "00:05", VERDICT_PENDING),         # healthy, slow first start
+    # Two failed starts long ago, then a server that has stayed up: not a loop now.
+    ("respawn_attempt_running", "3-04:00:00", VERDICT_CONFLICT_FREE),
+])
+def test_verdict_for_a_job_that_is_not_respawning_is_unchanged(tmp_path, mock_logger, fixture, etime, expected):
+    agent = _portful(tmp_path, mock_logger,
+                     ProcRunner(print_text=launchctl_print_fixture(fixture), proc_etime=etime))
+    assert agent.post_bootstrap_verdict() == expected
+
+
+@pytest.mark.parametrize("fixture", ["respawn_attempt_running", "respawn_spawn_scheduled"])
+def test_a_respawn_loop_is_a_report_in_every_phase_with_the_fatal_cause(tmp_path, mock_logger, fixture):
+    # Port free (nothing listening): before #374 this answered None in BOTH phases —
+    # nobody holds the port and every attempt is younger than the grace window.
+    agent = _portful(tmp_path, mock_logger,
+                     ProcRunner(print_text=launchctl_print_fixture(fixture), proc_etime="00:01"))
+    _write_fatal(agent, "[storage-lock] Storage is locked by another process (pid 607)")
+    report = agent.port_conflict_report()
+    assert report is not None
+    assert "keeps failing to start" in report and "restart" in report
+    assert "storage lock" in report
+
+
+def test_a_respawn_loop_report_is_the_same_text_whichever_attempt_is_sampled(tmp_path, mock_logger):
+    """A rival holds the port. The old conflict message named OUR pid, which changes
+    on every respawn, so the plugin's "log only when it changes" never deduplicated
+    it. The respawn report must read identically in every phase, across attempts."""
+    state = {"text": launchctl_print_fixture("respawn_attempt_running")}
+    runner = ProcRunner(print_text=lambda: state["text"], proc_etime="00:03", listen_pids=[777],
+                        ps_lines=["777 node /elsewhere/MatterServer.js --port 5580"])
+    agent = _portful(tmp_path, mock_logger, runner)
+    _write_fatal(agent, _EADDRINUSE)
+    first = agent.port_conflict_report()
+    state["text"] = launchctl_print_fixture("respawn_spawn_scheduled")
+    time.sleep(0.002)                                    # next attempt's FATAL: new timestamp
+    _write_fatal(agent, _EADDRINUSE)
+    between = agent.port_conflict_report()
+    state["text"] = launchctl_print_fixture("respawn_attempt_running").replace("33602", "33688")
+    later = agent.port_conflict_report()
+    assert first is not None and first == between == later
+    assert "777" in first and EADDRINUSE_MARKER in first
+    assert "33602" not in first and "33688" not in later
+
+
+def test_a_single_crash_and_restart_is_not_called_a_loop(tmp_path, mock_logger):
+    # runs = 2 with last exit code 1: it failed once and the restart is (so far) fine.
+    text = launchctl_print_fixture("respawn_attempt_running").replace("runs = 3", "runs = 2")
+    agent = _portful(tmp_path, mock_logger, ProcRunner(print_text=text, proc_etime="00:04"))
+    assert agent.port_conflict_report() is None
     assert agent.post_bootstrap_verdict() == VERDICT_PENDING
 
 

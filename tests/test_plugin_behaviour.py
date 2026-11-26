@@ -2333,6 +2333,97 @@ def test_a_verification_stuck_past_the_hard_timeout_is_disarmed_loudly(plug):
     assert not plug.logger.warning.called
 
 
+# ---------------------------------------------------------------------------
+# Issue #374 — a matter-server 1.6.1 that cannot start exits 1, and launchd
+# respawns it about every 10 s. Driven end to end through a REAL ServerProcess
+# whose `launchctl print` answers with text captured from a real exit-1 job, on
+# a mocked monotonic clock, so every phase of the 10 s cycle the 15 s watchdog
+# can land on is exercised.
+# ---------------------------------------------------------------------------
+
+def _respawning_controller(tmp_path, monkeypatch, *, alive_for, phase, listen_pids, fatal):
+    from test_server_process import ProcRunner, _sp_proc, launchctl_print_fixture
+    clock = {"t": 50_000.0}
+    start = clock["t"]
+    monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+
+    def offset():
+        return (clock["t"] - start + phase) % 10
+
+    running = launchctl_print_fixture("respawn_attempt_running")
+    between = launchctl_print_fixture("respawn_spawn_scheduled")
+    runner = ProcRunner(print_text=lambda: running if offset() < alive_for else between,
+                        proc_etime=lambda: f"00:{int(offset()):02d}", listen_pids=listen_pids,
+                        ps_lines=[f"{pid} node /elsewhere/MatterServer.js --port 5580" for pid in listen_pids])
+
+    def fatal_if_restarted(cmd, **kwargs):
+        # Make-it-fatal: nothing in the watchdog may restart, stop or signal anything.
+        if cmd[:2] in (["launchctl", "bootout"], ["launchctl", "bootstrap"]) or cmd[:1] == ["kill"]:
+            raise AssertionError(f"the watchdog must only report, never act: {cmd}")
+        return runner(cmd, **kwargs)
+    agent = _sp_proc(tmp_path, Mock(), fatal_if_restarted)
+    os.makedirs(agent.log_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    with open(os.path.join(agent.log_dir, agent.spec.err_log), "w", encoding="utf-8") as handle:
+        handle.write(f"{stamp} FATAL MatterServer Server failed to start {fatal}\n")
+    agent._bootstrap_wall_time = time.time() - 1          # as _bootstrap_and_record() sets it
+    agent._bootstrap_verify_after = start + STARTUP_GRACE_SECONDS
+    return agent, clock
+
+
+def _texts(method):
+    return [c.args[0] % c.args[1:] if len(c.args) > 1 else str(c.args[0]) for c in method.call_args_list]
+
+
+@pytest.mark.parametrize("alive_for,fatal", [
+    (1, "[storage-lock] Storage is locked by another process (pid 607)"),   # ~1 s attempts
+    (9, "some other startup failure"),                                      # ~9 s attempts
+])
+@pytest.mark.parametrize("phase", [0, 0.5, 4, 8.5, 9.5])
+def test_a_respawn_loop_of_short_lived_pids_is_reported_not_abandoned(plug, tmp_path, monkeypatch,
+                                                                      alive_for, fatal, phase):
+    """Port FREE, so nobody else holds it. Before #374 the report was None in every
+    phase, the verdict alternated PENDING/DEAD by luck of sampling, and after
+    2*STARTUP_GRACE_SECONDS the verification was abandoned with a warning saying
+    the server was NOT necessarily unhealthy — then the interval check stayed
+    quiet for ever."""
+    agent, clock = _respawning_controller(tmp_path, monkeypatch, alive_for=alive_for, phase=phase,
+                                          listen_pids=[], fatal=fatal)
+    plug.server_process = agent
+    plug.bridge_process = None
+    for _ in range(60):                                   # 15 minutes of 15 s watchdog ticks
+        plug._port_conflict_tick()
+        clock["t"] += 15
+    errors = [t for t in _texts(plug.logger.error) if "keeps failing to start" in t]
+    assert len(errors) == 1, _texts(plug.logger.error)
+    assert fatal.split("]")[-1].strip()[:20] in errors[0] or "storage lock" in errors[0]
+    assert not [t for t in _texts(plug.logger.warning) if "abandoned" in t]
+    assert not [t for t in _texts(plug.logger.info) if "resolved" in t]
+    assert agent.due_for_bootstrap_verification() is None   # a verdict was reached and cleared
+
+
+@pytest.mark.parametrize("phase", [0, 4, 8.5, 9.5])
+def test_a_respawning_controller_behind_a_rival_is_reported_once_and_never_resolved(
+        plug, tmp_path, monkeypatch, phase):
+    """A rival (pid 777) holds the port. The old conflict message named OUR pid, new on
+    every respawn, so it was logged again every interval; and a sample between
+    respawns read None, after which "now owns port … resolved" could be logged
+    while the rival still held it."""
+    agent, clock = _respawning_controller(
+        tmp_path, monkeypatch, alive_for=9, phase=phase, listen_pids=[777],
+        fatal="listen EADDRINUSE: address already in use 127.0.0.1:5580")
+    plug.server_process = agent
+    plug.bridge_process = None
+    for _ in range(80):                                   # 20 minutes: several interval checks
+        plug._port_conflict_tick()
+        clock["t"] += 15
+    errors = _texts(plug.logger.error)
+    assert len(errors) == 1, errors
+    assert "777" in errors[0] and "EADDRINUSE" in errors[0]
+    assert not [t for t in _texts(plug.logger.info) if "resolved" in t]
+    assert not [t for t in _texts(plug.logger.warning) if "abandoned" in t]
+
+
 def test_a_concurrent_rearm_during_the_probe_survives_a_stale_clear(plug):
     """Compare-and-clear (#187 review): a re-arm that lands on another thread
     (a menu restart) DURING this tick's slow port_conflict_report() call must
