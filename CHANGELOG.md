@@ -3,6 +3,23 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.37.0 — Power-on behaviour setting for dimmers and colour dimmers
+
+- New (issue #360): a dimmer or colour dimmer that implements the OnOff Lighting
+  feature now offers **After a power cut:** (Off / On / Toggle) in its Edit Device
+  dialog, the same setting on/off relays already had, with a **Power-On Behaviour**
+  state showing what the device holds. It is only shown when the device's own
+  attribute list says it supports it. Existing dimmers pick it up on upgrade;
+  nothing needs recreating. The "settable attributes not offered yet" log message
+  no longer lists StartUpOnOff for them.
+- A device that reports "restore the previous state" (null, the usual factory
+  default) is shown as **Previous state** in the dialog and as state value 255
+  ("previous state") for triggers, instead of a made-up "Off". That choice can be
+  **shown but not set from Indigo yet**: Indigo cannot write it back. Picking Off,
+  On or Toggle works as normal, and saving without touching the setting changes
+  nothing. This also fixes the same wrong "Off" on on/off relays.
+- Log lines for this setting now name the choice ("After a power cut is now On").
+
 ## 2026.36.0 — The Thread mesh report reads routers live and stops calling an unreachable device "detached"
 
 - Fix (issue #348): **Report Thread mesh…** with the live-read option on (and the

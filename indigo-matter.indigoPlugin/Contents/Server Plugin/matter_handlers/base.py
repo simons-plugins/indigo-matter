@@ -160,6 +160,10 @@ class ClusterHandler(ABC):
     #: then drops the update before it reaches the handler, so the last known
     #: state stays. Only a handler that reads null as information sets True.
     accepts_null: bool = False
+    #: Attribute ids for which a null carries meaning, for a handler where that is
+    #: true of some attributes only (OnOff: a null StartUpOnOff is "restore the
+    #: previous state", a null OnOff is still "no value known").
+    accepts_null_attributes: frozenset = frozenset()
     #: Display-capability props every device this handler creates must carry.
     #: Indigo applies Supports*/subtype capabilities via creation props, not
     #: Devices.xml statics, for API-created devices (the colour lesson;

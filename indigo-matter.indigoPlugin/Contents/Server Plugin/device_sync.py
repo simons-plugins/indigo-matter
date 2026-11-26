@@ -2893,7 +2893,8 @@ class DeviceSync:
         so the update is dropped, the last known state stays, and no error state
         is set or cleared (errorState means "unreachable" only). The one choke
         point for live events and node-snapshot priming; ``accepts_null`` on the
-        handler is the opt-out for a cluster where null carries meaning.
+        handler is the opt-out for a cluster where null carries meaning, and
+        ``accepts_null_attributes`` for single attributes of a cluster.
 
         Visibility: the first null per (device, cluster, attribute) per plugin
         run is one INFO naming the device, so a state that has stopped following
@@ -2903,7 +2904,8 @@ class DeviceSync:
         whether the handler maps this attribute to a state is not cheaply
         knowable here. Never raises: the drop is decided before any logging.
         """
-        if value is not None or handler.accepts_null:
+        if (value is not None or handler.accepts_null
+                or attribute in handler.accepts_null_attributes):
             return False
         try:
             dev_id = int(dev.id)

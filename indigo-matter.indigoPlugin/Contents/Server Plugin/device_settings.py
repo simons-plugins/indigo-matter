@@ -258,7 +258,13 @@ def _is_editing(setting, values: dict) -> bool:
     """
     if setting.key not in values:
         return False
-    return bool(str(values.get(setting.key, "")).strip())
+    text = str(values.get(setting.key, "")).strip()
+    # The null row ("previous state") means "leave this alone": it can never be
+    # written, so it is neither validated nor planned. Choosing a real value
+    # from it is a different string and IS a change.
+    if setting.null_state is not None and text == str(setting.null_state):
+        return False
+    return bool(text)
 
 
 def validate_settings(device_type_id: str, values: dict, limits: LimitsLookup,
@@ -412,10 +418,10 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
         if last_error is not None:
             # The send errored and the value is on the device anyway — exactly
             # the case that made "could not be sent" a lie.
-            return True, (f"{setting.label} is now {plan.value}{setting.unit} "
+            return True, (f"{setting.label} is now {setting.value_text(plan.value)} "
                           f"(the send reported an error — {last_error} — but the "
                           f"device holds the new value).")
-        return True, reason or f"{setting.label} is now {plan.value}{setting.unit}."
+        return True, reason or f"{setting.label} is now {setting.value_text(plan.value)}."
     if last_error is not None:
         reason = f"{reason} The send also failed: {last_error}."
     if read_error is not None:

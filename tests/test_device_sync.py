@@ -3200,6 +3200,245 @@ def test_lighting_settings_are_primed_onto_the_relay(ds, indigo_env):
     assert dev.states.get("startUpOnOff") == 1
 
 
+#: A dimmer implementing OnOff's Lighting feature on endpoint 1 — modelled on the
+#: Tapo S505D of issue #360 (OnOff + LevelControl, DimmableLight). The OnOff
+#: AttributeList is the live-fabric shape; StartUpOnOff reads 1 (On).
+LIGHTING_DIMMER_NODE = {
+    "node_id": 0x06,
+    "available": True,
+    "attributes": {
+        "0/40/1": "TP-Link",
+        "0/40/3": "Smart Wi-Fi Dimmer Switch",
+        "1/29/0": [{"0": 257, "1": 2}],  # DimmableLight
+        "1/6/0": False,
+        "1/6/16387": 1,
+        "1/6/65531": [0, 16384, 16385, 16386, 16387, 65528, 65529, 65531, 65532, 65533],
+        "1/8/0": 254,
+        "1/8/65531": [0, 15, 17, 18, 19, 16384, 65528, 65529, 65531, 65532, 65533],
+    },
+}
+
+#: The same, as an ExtendedColorLight.
+LIGHTING_COLOR_DIMMER_NODE = {
+    "node_id": 0x07,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Acme", "0/40/3": "Colour bulb",
+        "1/29/0": [{"0": 269, "1": 1}],  # ExtendedColorLight
+        "1/6/0": False,
+        "1/6/16387": 2,
+        "1/6/65531": [0, 16384, 16385, 16386, 16387, 65528, 65529, 65531, 65532, 65533],
+        "1/8/0": 254,
+        "1/768/0": 0, "1/768/1": 0, "1/768/8": 0,
+    },
+}
+
+#: A dimmer whose OnOff list has no Lighting attributes.
+PLAIN_DIMMER_NODE = {
+    "node_id": 0x08,
+    "available": True,
+    "attributes": {
+        "0/40/1": "Acme", "0/40/3": "Basic dimmer",
+        "1/29/0": [{"0": 257, "1": 2}],
+        "1/6/0": False,
+        "1/6/65531": [0, 65528, 65529, 65531, 65532, 65533],
+        "1/8/0": 254,
+    },
+}
+
+
+@pytest.mark.parametrize("raw,type_id", [
+    (LIGHTING_DIMMER_NODE, "matterDimmer"),
+    (LIGHTING_COLOR_DIMMER_NODE, "matterColorDimmer"),
+])
+def test_startup_setting_is_primed_onto_a_dimmer_and_a_colour_dimmer(ds, indigo_env, raw, type_id):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(raw, "Lamp")
+    dev = devices[ds.lookup(raw["node_id"], 1, type_id)]
+    assert dev.states.get("startUpOnOff") == raw["attributes"]["1/6/16387"]
+
+
+@pytest.mark.parametrize("raw,type_id", [
+    (LIGHTING_DIMMER_NODE, "matterDimmer"),
+    (LIGHTING_COLOR_DIMMER_NODE, "matterColorDimmer"),
+])
+def test_a_live_startup_change_on_a_dimmer_endpoint_updates_the_state(ds, indigo_env, raw, type_id):
+    """OnOff (0x0006) on a dimmer endpoint is served by OnOffHandler, whose own
+    device type (matterRelay) is absent there, so the update falls back to the
+    endpoint's one device — the dimmer."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(raw, "Lamp")
+    dev = devices[ds.lookup(raw["node_id"], 1, type_id)]
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED, node_id=raw["node_id"], endpoint=1,
+        cluster=0x0006, attribute=0x4003, value=0))
+    assert dev.states["startUpOnOff"] == 0
+    # ...and ordinary on/off on the same endpoint is undisturbed.
+    ds.handle_event(MatterEvent(
+        kind=protocol.EVT_ATTRIBUTE_UPDATED, node_id=raw["node_id"], endpoint=1,
+        cluster=0x0006, attribute=0x0000, value=True))
+    assert dev.states["onOffState"] is True
+
+
+def test_a_dimmer_attribute_list_is_cached_for_the_onoff_cluster(ds, indigo_env):
+    ds.create_from_raw(LIGHTING_DIMMER_NODE, "Lamp")
+    assert 16387 in ds.attribute_list(0x06, 1, 0x0006)
+    ds.create_from_raw(PLAIN_DIMMER_NODE, "Basic")
+    assert 16387 not in ds.attribute_list(0x08, 1, 0x0006)
+
+
+def test_a_dimmer_created_before_this_version_gains_the_value_without_recreation(
+        ds, indigo_env):
+    """Fielded dimmers have no startUpOnOff state until Indigo rebuilds their
+    state list (deviceStartComm does that on every start). Until then the guard
+    in OnOffHandler leaves a reading alone; once the state exists the next
+    reconcile primes it. The device is never deleted or recreated."""
+    _indigo, devices = indigo_env
+    ds.create_from_raw(LIGHTING_DIMMER_NODE, "Lamp")
+    dev_id = ds.lookup(0x06, 1, "matterDimmer")
+    dev = devices[dev_id]
+    del dev.states["startUpOnOff"]           # what a pre-upgrade dimmer looks like
+    ds.reconcile_all([LIGHTING_DIMMER_NODE])
+    assert "startUpOnOff" not in dev.states, "no state, no write — never a phantom key"
+    dev.states["startUpOnOff"] = 0           # Indigo's rebuild adds it at its default
+    ds.reconcile_all([LIGHTING_DIMMER_NODE])
+    assert dev.states["startUpOnOff"] == 1
+    assert ds.lookup(0x06, 1, "matterDimmer") == dev_id, "same device, not a new one"
+
+
+def test_a_dimmer_gets_its_state_list_rebuilt_when_its_attribute_list_arrives(ds, indigo_env):
+    """Same #190 mechanism as the relay. The rebuild must be CAUSED by the list
+    arriving: unchanged lists rebuild nothing, a list that gains an attribute does."""
+    import copy
+    _indigo, devices = indigo_env
+    cold = copy.deepcopy(PLAIN_DIMMER_NODE)
+    del cold["attributes"]["1/6/65531"]            # no OnOff AttributeList yet
+    ds.create_from_raw(cold, "Basic")
+    dev = devices[ds.lookup(0x08, 1, "matterDimmer")]
+    ds.reconcile_all([cold])
+    settled = dev.state_list_rebuilds
+    ds.reconcile_all([cold])
+    assert dev.state_list_rebuilds == settled, "nothing changed, nothing rebuilt"
+    ds.reconcile_all([PLAIN_DIMMER_NODE])           # the list arrives
+    assert dev.state_list_rebuilds > settled
+
+
+def _null_variant(raw):
+    """The same node, but StartUpOnOff reads null — 'restore the previous
+    state', the usual factory default (issue #360 review)."""
+    import copy
+    changed = copy.deepcopy(raw)
+    changed["attributes"]["1/6/16387"] = None
+    return changed
+
+
+_LIGHTING_CASES = [
+    (LIGHTING_PLUG_NODE, "matterRelay"),
+    (LIGHTING_DIMMER_NODE, "matterDimmer"),
+    (LIGHTING_COLOR_DIMMER_NODE, "matterColorDimmer"),
+]
+
+
+def _dialog_values(ds, raw, type_id, dev):
+    import device_settings
+    nid = raw["node_id"]
+    return device_settings.config_ui_values(
+        type_id, dict(dev.states), lambda c, a: None,
+        attribute_list=lambda cluster: ds.attribute_list(nid, 1, cluster))
+
+
+@pytest.mark.parametrize("raw,type_id", _LIGHTING_CASES)
+def test_a_null_startup_reading_is_recorded_as_the_null_value_not_dropped(
+        ds, indigo_env, raw, type_id):
+    """Dropped, the state sat at Indigo's Integer default 0 — 'Off' — and
+    triggers saw a fabricated 0."""
+    _indigo, devices = indigo_env
+    null_raw = _null_variant(raw)
+    ds.create_from_raw(null_raw, "Lamp")
+    dev = devices[ds.lookup(null_raw["node_id"], 1, type_id)]
+    assert dev.states["startUpOnOff"] == 255
+    assert dev.states["startUpOnOff.ui"] == "previous state"
+
+
+@pytest.mark.parametrize("raw,type_id", _LIGHTING_CASES)
+def test_a_null_holding_device_shows_the_previous_state_row_and_an_untouched_save_is_quiet(
+        ds, indigo_env, raw, type_id):
+    import device_settings
+    _indigo, devices = indigo_env
+    null_raw = _null_variant(raw)
+    ds.create_from_raw(null_raw, "Lamp")
+    dev = devices[ds.lookup(null_raw["node_id"], 1, type_id)]
+    values = _dialog_values(ds, null_raw, type_id, dev)
+    assert values["hasStartUpOnOff"] == "yes" and values["startUpOnOff"] == "255"
+    lists = lambda cluster: ds.attribute_list(null_raw["node_id"], 1, cluster)  # noqa: E731
+    assert device_settings.validate_settings(type_id, values, lambda c, a: None, lists) == {}
+    assert device_settings.planned_writes(type_id, values, dict(dev.states),
+                                          lambda c, a: None, lists) == []
+    # ...and choosing Off IS a change, written as 0 — the old code saw 0 == 0.
+    values["startUpOnOff"] = "0"
+    plans = device_settings.planned_writes(type_id, values, dict(dev.states),
+                                           lambda c, a: None, lists)
+    assert [(p.value, p.previous) for p in plans] == [(0, 255)]
+
+
+@pytest.mark.parametrize("raw,type_id", _LIGHTING_CASES)
+def test_a_live_change_to_null_replaces_the_old_value(ds, indigo_env, raw, type_id):
+    _indigo, devices = indigo_env
+    ds.create_from_raw(raw, "Lamp")
+    nid = raw["node_id"]
+    dev = devices[ds.lookup(nid, 1, type_id)]
+    assert dev.states["startUpOnOff"] == raw["attributes"]["1/6/16387"]
+    ds.handle_event(MatterEvent(kind=protocol.EVT_ATTRIBUTE_UPDATED, node_id=nid, endpoint=1,
+                                cluster=0x0006, attribute=0x4003, value=None))
+    assert dev.states["startUpOnOff"] == 255
+    assert dev.states["startUpOnOff.ui"] == "previous state"
+
+
+@pytest.mark.parametrize("raw,type_id", _LIGHTING_CASES)
+def test_a_live_value_after_null_replaces_it_and_the_row_goes_away(ds, indigo_env, raw, type_id):
+    _indigo, devices = indigo_env
+    null_raw = _null_variant(raw)
+    ds.create_from_raw(null_raw, "Lamp")
+    nid = null_raw["node_id"]
+    dev = devices[ds.lookup(nid, 1, type_id)]
+    ds.handle_event(MatterEvent(kind=protocol.EVT_ATTRIBUTE_UPDATED, node_id=nid, endpoint=1,
+                                cluster=0x0006, attribute=0x4003, value=1))
+    assert dev.states["startUpOnOff"] == 1
+    assert _dialog_values(ds, null_raw, type_id, dev)["startUpOnOff"] == "1"
+    from matter_handlers.settings import settings_for_type
+    setting = settings_for_type(type_id)[0]
+    rows = setting.option_rows(setting.resolve_bounds(lambda c, a: None),
+                               dev.states["startUpOnOff"])
+    assert [v for v, _ in rows] == ["0", "1", "2"]
+
+
+def test_other_nullable_settings_are_unaffected_by_the_null_value_mechanism(ds, indigo_env):
+    """Only a setting that declares a null state records one."""
+    from matter_handlers.settings import SETTINGS
+    assert [s.key for s in SETTINGS if s.null_state is not None] == ["startUpOnOff"]
+
+
+def _unoffered(survey):
+    return [(a.cluster, a.attribute) for ep in survey.endpoints for a in ep.settable]
+
+
+def test_the_report_no_longer_lists_startuponoff_for_a_dimmer_but_keeps_the_rest(
+        ds, indigo_env):
+    """Issue #360's own list. StartUpOnOff is now offered; the other five are not, and still must be named so
+    the follow-up work stays visible."""
+    ds.create_from_raw(LIGHTING_DIMMER_NODE, "Lamp")
+    survey = ds.survey_node(_parsed(LIGHTING_DIMMER_NODE))
+    pairs = _unoffered(survey)
+    assert (0x0006, 0x4003) not in pairs
+    assert sorted(pairs) == [(0x0008, 0x000F), (0x0008, 0x0011), (0x0008, 0x0012),
+                             (0x0008, 0x0013), (0x0008, 0x4000)]
+
+
+def test_a_dimmer_without_the_attribute_is_not_reported_as_missing_it(ds, indigo_env):
+    ds.create_from_raw(PLAIN_DIMMER_NODE, "Basic")
+    assert (0x0006, 0x4003) not in _unoffered(ds.survey_node(_parsed(PLAIN_DIMMER_NODE)))
+
+
 def test_the_relay_handler_no_longer_maps_onTime_to_a_STATE():
     """Pinned against the handler, not against a fixture.
 

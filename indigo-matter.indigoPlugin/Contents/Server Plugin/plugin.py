@@ -1564,7 +1564,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 self._has_matter_node(props)):
             if wanted and offer.setting.key != wanted:
                 continue
-            rows = offer.setting.option_rows(offer.bounds)
+            rows = offer.setting.option_rows(
+                offer.bounds, self._device_states(targetId).get(offer.setting.key))
             if rows is not None:
                 return rows
         return []
@@ -1681,10 +1682,12 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # re-seeds from state, so leaving the stale value would show the
             # user a setting the device never adopted, which is the divergence
             # this whole feature exists to prevent.
+            # observed == [None] is a read-back of NULL — a real answer for a
+            # setting that declares a null state, so that is what is recorded
+            # (neither the stale value nor the one asked for).
             actual = observed[0] if observed else None
-            if actual is not None:
-                self.device_sync.apply_states(
-                    dev_id, [{"key": plan.setting.key, "value": actual}])
+            if actual is not None or (observed and plan.setting.null_state is not None):
+                self.device_sync.apply_states(dev_id, [plan.setting.state_entry(actual)])
         except KeyError:
             # The device was deleted between the dialog closing and this
             # running on the loop — routine, and there is nothing left to

@@ -347,17 +347,61 @@ class DeviceSetting:
     #: depend on what the device reported (sensitivity's level count). An
     #: EnumValues bounds carries its own labels and needs nothing here.
     options: Optional[Callable[[Bounds], list[tuple[str, str]]]] = None
+    #: For a NULLABLE attribute whose null is a real, meaningful answer (e.g.
+    #: StartUpOnOff null = "restore the previous state"): the state value that
+    #: records a null reading, the dialog row label shown while the device holds
+    #: it, and the state's display string. The value MUST lie outside the
+    #: bounds, so it can never validate into a write — null cannot be written
+    #: yet (#360). None = this setting records no null (a null reading is
+    #: ignored, as before).
+    null_state: Optional[int] = None
+    null_label: str = ""
+    null_ui: str = ""
 
     def resolve_bounds(self, limits: Callable) -> Optional[Bounds]:
         """The permitted values for this setting on one device, or None."""
         return self.bounds.resolve(self.cluster, limits)
 
-    def option_rows(self, bounds: Bounds) -> Optional[list]:
-        """Picker rows, or None when this renders as a numeric field."""
+    def option_rows(self, bounds: Bounds, current: Any = None) -> Optional[list]:
+        """Picker rows, or None when this renders as a numeric field.
+
+        While the device holds null (``current == null_state``) one extra row
+        stands for it, first, so the seeded value always matches a row. It is
+        offered ONLY then: it cannot be written, so listing it otherwise would
+        offer a choice that does nothing.
+        """
         if self.options is not None:
-            return self.options(bounds)
-        builder = getattr(self.bounds, "options", None)
-        return builder(bounds) if builder is not None else None
+            rows = self.options(bounds)
+        else:
+            builder = getattr(self.bounds, "options", None)
+            rows = builder(bounds) if builder is not None else None
+        if (rows is not None and self.null_state is not None
+                and _as_state_int(current) == self.null_state):
+            rows = [(str(self.null_state), self.null_label), *rows]
+        return rows
+
+    def value_text(self, value: Any) -> str:
+        """A value as the user should read it in a log line: the option's label
+        for a choice ("On"), the null's display string, else value plus unit."""
+        number = _as_state_int(value)
+        if number is not None and number == self.null_state:
+            return self.null_ui
+        for known, label in getattr(self.bounds, "values", ()):
+            if number is not None and int(known) == number:
+                return label
+        return f"{value}{self.unit}"
+
+    def state_entry(self, value: Any) -> dict:
+        """The ``updateStatesOnServer`` entry recording *value* for this setting.
+
+        None (a null reading) becomes ``null_state`` with its display string
+        when the setting declares one."""
+        if value is None and self.null_state is not None:
+            value = self.null_state
+        entry = {"key": self.key, "value": value}
+        if self.null_state is not None and _as_state_int(value) == self.null_state:
+            entry["uiValue"] = self.null_ui
+        return entry
 
     @property
     def is_choice(self) -> bool:
@@ -367,6 +411,16 @@ class DeviceSetting:
     def describe_range(self, bounds: Bounds) -> str:
         """Human range hint, e.g. ``1-300 seconds``."""
         return f"{bounds.describe()}{self.unit}"
+
+
+def _as_state_int(value: Any) -> Optional[int]:
+    """int(value), or None for None, bools and anything not a whole number."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 #: Every writable setting the plugin knows how to offer. See the module
@@ -410,12 +464,18 @@ SETTINGS: tuple = (
         cluster=CLUSTER_ON_OFF,
         attribute=ATTR_START_UP_ON_OFF,
         # StartUpOnOffEnum: spec-fixed values, spec-fixed meanings. The spec
-        # also allows null ("restore the previous state"), which is deliberately
-        # NOT offered: null is a distinct wire value this write path has no way
-        # to express, and silently mapping it to something else would misreport
-        # what the device is set to.
+        # also allows null ("restore the previous state") — the usual factory
+        # default. Null cannot be WRITTEN (no write-null path yet, #360), so it
+        # is not an allowed value; but it is RECORDED, as 255 (the wire
+        # encoding of a null enum8), because Indigo's state default of 0 is
+        # itself a valid value ("Off") and would otherwise be shown for it.
         bounds=EnumValues(((0, "Off"), (1, "On"), (2, "Toggle (opposite of before)"))),
-        device_types=frozenset({"matterRelay"}),
+        null_state=255,
+        null_label="Previous state (device default; cannot be chosen from Indigo)",
+        null_ui="previous state",
+        # Dimmers carry the same cluster with the same attribute (#360), so the
+        # one declaration serves all three Lighting-capable types.
+        device_types=frozenset({"matterRelay", "matterDimmer", "matterColorDimmer"}),
     ),
 )
 
@@ -513,7 +573,7 @@ def verify_write(setting: DeviceSetting, intended: int, read_back: Any) -> tuple
                        f"the read-back. The setting may or may not have been applied.")
     if read_back is None:
         return False, (f"{setting.label} was NOT applied — the device answered the read-back "
-                       f"with no value (null) after being asked for {intended}{setting.unit}.")
+                       f"with no value (null) after being asked for {setting.value_text(intended)}.")
     try:
         actual = int(read_back)
     except (TypeError, ValueError):
@@ -521,6 +581,7 @@ def verify_write(setting: DeviceSetting, intended: int, read_back: Any) -> tuple
                        f"read-back with {read_back!r}, which is not a value.")
     if actual != intended:
         return False, (f"{setting.label} was NOT applied — the device still reports "
-                       f"{actual}{setting.unit} after being asked for {intended}{setting.unit}. "
+                       f"{setting.value_text(actual)} after being asked for "
+                       f"{setting.value_text(intended)}. "
                        f"Some firmware acknowledges a write and ignores it.")
     return True, ""
