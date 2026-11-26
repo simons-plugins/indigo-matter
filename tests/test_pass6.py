@@ -73,15 +73,6 @@ def test_an_exception_raised_outside_every_guard_is_logged_by_the_done_callback(
     assert any(dev.name in e and "Auto-relock time" in e and "unguarded line" in e for e in errors)
 
 
-def test_a_cancelled_or_clean_future_logs_nothing(plugin_cls, ds, indigo_env, mock_logger):
-    _i, devices = indigo_env
-    dev = _lock(ds, devices)
-    stub, values, fut = _closing_stub(plugin_cls, ds, mock_logger, dev)
-    plugin_cls.closedDeviceConfigUi(stub, dict(values), False, "matterLock", dev.id)
-    fut.set_result(None)
-    assert not mock_logger.error.called
-
-
 # --- B: a stray KeyError must not skip recording the failure ---------------------------
 
 def test_a_keyerror_on_the_failure_path_still_records_settingsError(plugin_cls, ds, indigo_env, mock_logger):
@@ -286,3 +277,78 @@ def test_the_remaining_log_lines_name_the_device_not_the_bare_id(plugin_cls, ds,
     mock_logger.info.reset_mock()
     _open(plugin_cls, stub2, dev, "matterLock")
     assert any(dev.name in _text(c) for c in mock_logger.info.call_args_list if "not offered" in _text(c))
+
+
+# --- final pass: items 1, 3, 4 ----------------------------------------------------------
+
+def test_a_failure_recorded_while_a_clear_is_in_flight_keeps_its_remembered_request(ds, indigo_env):
+    import time
+    _i, devices = indigo_env
+    dev = _lock(ds, devices)
+    key = (int(dev.id), ARL.key)
+    ds.record_setting_failure(dev.id, ARL, 30, "old cause")
+    real = ds._edit_settings_error_locked
+    fired = {"done": False}
+    holder = {}
+
+    def wrapped(dev_id, setting, sentence):
+        ok = real(dev_id, setting, sentence)
+        if sentence is None and not fired["done"]:
+            fired["done"] = True
+            t = threading.Thread(target=ds.record_setting_failure, args=(dev.id, ARL, 99, "new cause"))
+            holder["t"] = t
+            t.start()
+            deadline = time.time() + 0.5
+            while ds._failed_requests.get(key) != 99 and time.time() < deadline:
+                time.sleep(0.01)
+        return ok
+
+    ds._edit_settings_error_locked = wrapped
+    ds.clear_setting_failure(dev.id, ARL)
+    holder["t"].join(2)
+    assert "new cause" in devices[dev.id].states["settingsError"]
+    assert ds._failed_requests.get(key) == 99
+
+
+def test_a_clean_future_logs_nothing(plugin_cls, ds, indigo_env, mock_logger):
+    _i, devices = indigo_env
+    dev = _lock(ds, devices)
+    stub, values, fut = _closing_stub(plugin_cls, ds, mock_logger, dev)
+    plugin_cls.closedDeviceConfigUi(stub, dict(values), False, "matterLock", dev.id)
+    fut.set_result(None)
+    assert not mock_logger.error.called and not mock_logger.warning.called
+
+
+def test_a_write_cancelled_by_shutdown_warns_naming_device_and_setting(
+        plugin_cls, ds, indigo_env, mock_logger):
+    _i, devices = indigo_env
+    dev = _lock(ds, devices)
+    stub, values, fut = _closing_stub(plugin_cls, ds, mock_logger, dev)
+    plugin_cls.closedDeviceConfigUi(stub, dict(values), False, "matterLock", dev.id)
+    assert fut.cancel()
+    warnings = [_text(c) for c in mock_logger.warning.call_args_list]
+    assert any(dev.name in w and "Auto-relock time" in w and "interrupted" in w for w in warnings)
+    assert not mock_logger.error.called
+
+
+def test_an_unexpected_error_pruning_failures_warns_and_the_dialog_still_opens(
+        plugin_cls, ds, indigo_env, mock_logger):
+    _i, devices = indigo_env
+    dev = _lock(ds, devices)
+    stub = _stub(plugin_cls, ds, mock_logger, matter=CONNECTED)
+
+    real = stub._setting_attribute_list_lookup
+    calls = []
+
+    def bug(props):
+        calls.append(1)
+        if len(calls) == 1:                                    # the prune is the first caller
+            raise TypeError("a programming error")
+        return real(props)
+
+    stub._setting_attribute_list_lookup = bug
+    mock_logger.warning.reset_mock()
+    values = _open(plugin_cls, stub, dev, "matterLock")
+    assert values["autoRelockTime"] == "30"                    # the dialog opened and seeded
+    warnings = [_text(c) for c in mock_logger.warning.call_args_list]
+    assert any(dev.name in w and "prune" in w for w in warnings)

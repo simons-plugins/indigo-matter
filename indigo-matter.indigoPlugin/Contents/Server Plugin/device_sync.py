@@ -4365,10 +4365,13 @@ class DeviceSync:
         The device error flag is for reachability only, so a failed write never touches
         it. One sentence per setting, joined; recording again replaces that setting's.
         """
-        with self._lock:
-            if requested is not None:
-                self._failed_requests[(int(dev_id), setting.key)] = requested
-        self._edit_settings_error(dev_id, setting, f"{setting.label}: {cause}")
+        # Same lock order as clear_setting_failure (_error_edit_lock, then _lock), and the
+        # store + edit are one unit: a clear cannot pop this request between them.
+        with self._error_edit_lock:
+            with self._lock:
+                if requested is not None:
+                    self._failed_requests[(int(dev_id), setting.key)] = requested
+            self._edit_settings_error(dev_id, setting, f"{setting.label}: {cause}")
 
     def clear_setting_failure(self, dev_id: Any, setting: Any) -> None:
         """Drop this setting's failure text (and only its).

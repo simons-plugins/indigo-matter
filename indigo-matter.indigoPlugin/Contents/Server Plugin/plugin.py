@@ -153,6 +153,9 @@ def _submit_setting_write(plugin, node_id, endpoint_id, dev_id, plan) -> None:
 
     def log_escape(done) -> None:
         if done.cancelled():
+            plugin.logger.warning(
+                '%s: "%s" was interrupted because the plugin was stopping; check the device\'s value',
+                _device_log_name(dev_id), plan.setting.label)
             return
         exc = done.exception()
         if exc is not None:
@@ -185,8 +188,8 @@ def _prune_unoffered_failures(plugin, dev_id, typeId, props) -> None:
                 plugin.device_sync.clear_setting_failure(dev_id, setting)
     except Exception:  # pylint: disable=broad-except
         # housekeeping before opening a dialog: never blocks it
-        plugin.logger.debug("%s: could not prune old setting failures", _device_log_name(dev_id),
-                          exc_info=True)
+        plugin.logger.warning("%s: could not prune old setting failures", _device_log_name(dev_id),
+                              exc_info=True)
 
 
 def _matter_connected(plugin) -> bool:
@@ -194,6 +197,11 @@ def _matter_connected(plugin) -> bool:
     no ``connected`` attribute is NOT connected."""
     client = getattr(plugin, "matter", None)
     return client is not None and bool(getattr(client, "connected", False))
+
+
+def _matches_superseded(plan, values, superseded) -> bool:
+    """Is this planned write's field equal to an older dialog's seed?"""
+    return any(device_settings.matches_seed(plan.setting, values, old) for old in superseded)
 
 
 def _drop_superseded(plugin, dev_id, values, plans, superseded) -> list:
@@ -206,10 +214,10 @@ def _drop_superseded(plugin, dev_id, values, plans, superseded) -> list:
     """
     kept = []
     for plan in plans:
-        if any(device_settings.matches_seed(plan.setting, values, old) for old in superseded):
+        if _matches_superseded(plan, values, superseded):
             plugin.logger.warning(
-                "%s: %s was not written - the dialog it came from was opened before another "
-                "one on this device; please reopen the dialog and set it again",
+                "%s: %s was not written: the value matches what an older settings window for "
+                "this device started with; reopen the settings and set it again",
                 _device_log_name(dev_id), plan.setting.label)
         else:
             kept.append(plan)
@@ -1417,6 +1425,26 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             if reason:
                 for setting in edited:
                     setting_errors[setting.key] = reason
+        # A value equal to an OLDER dialog's seed cannot be told apart from that dialog
+        # saved untouched; closedDeviceConfigUi would drop it, so refuse it here instead.
+        slot = vars(self).get("_dialog_seeds", {}).get(devId)
+        superseded = [] if slot is None else slot.get("superseded", [])
+        if superseded:
+            try:
+                planned = device_settings.planned_writes(
+                    typeId, valuesDict, self._device_states(devId), limits, lists, known,
+                    primed=self._setting_primed_lookup(devId), seeds=seeds)
+            except Exception:  # pylint: disable=broad-except
+                # closedDeviceConfigUi's backstop still drops such a value, with a warning
+                self.logger.warning("%s: could not check the settings against older windows",
+                                    _device_log_name(devId), exc_info=True)
+                planned = []
+            for plan in planned:
+                if _matches_superseded(plan, valuesDict, superseded):
+                    setting_errors.setdefault(plan.setting.key, (
+                        "This value matches what an older settings window for this device "
+                        "started with, so it cannot be told apart from a stale save. Close this "
+                        "window, reopen the settings and set it again."))
         if setting_errors:
             errors = indigo.Dict()
             for field, message in setting_errors.items():

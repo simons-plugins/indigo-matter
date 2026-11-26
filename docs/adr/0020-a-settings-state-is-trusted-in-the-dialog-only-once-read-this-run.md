@@ -67,8 +67,10 @@ A remembered seed older than ten minutes, found when another dialog opens on the
 device, is treated as abandoned (the client crashed before the close callback) and replaced,
 with an INFO line; a younger one still makes the slot ambiguous. The replaced slot's seeds
 are kept on the new one as superseded (at most three): the old dialog may still be open, and a
-field of it saved untouched still equals its old seed, so it is not written (the log names the
-device and setting and asks the user to reopen). A value that differs from every seed is a
+field of it saved untouched still equals its old seed, so it is not written. Validation refuses
+such a value with a field error (the newest dialog's deliberate choice of it is indistinguishable
+from a stale save); closing still drops it as a backstop, and the log names the device and
+setting and asks the user to reopen). A value that differs from every seed is a
 real edit and is written. Expiry is judged only at
 open, never on save, so one dialog left open for an hour still saves.
 

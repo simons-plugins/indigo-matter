@@ -162,3 +162,54 @@ def test_the_superseded_list_is_bounded(plugin_cls, ds, indigo_env, mock_logger)
         _live(ds, 100 + n)
         clock.now += LIMIT + 1
     assert len(vars(stub)["_dialog_seeds"][dev.id]["superseded"]) <= 3
+
+
+# --- validation refuses a value that cannot be told apart from a stale save ------------
+
+_OLDER_WINDOW = "older settings window"
+
+
+def _validate(plugin_cls, stub, dev, values):
+    return plugin_cls.validateDeviceConfigUi(stub, dict(values), "matterLock", dev.id)
+
+
+def test_validation_refuses_the_old_dialog_saved_untouched(plugin_cls, ds, indigo_env, mock_logger):
+    dev, stub, a, _b = _stale_scenario(plugin_cls, ds, indigo_env, mock_logger)
+    ok, _values, errors = _validate(plugin_cls, stub, dev, a)
+    assert ok is False
+    assert _OLDER_WINDOW in errors["autoRelockTime"] and "reopen" in errors["autoRelockTime"]
+
+
+def test_validation_refuses_the_newest_dialog_deliberately_set_to_a_superseded_seed(
+        plugin_cls, ds, indigo_env, mock_logger):
+    dev, stub, _a, b = _stale_scenario(plugin_cls, ds, indigo_env, mock_logger)
+    b["autoRelockTime"] = "30"                                   # the user's own choice in B
+    ok, _values, errors = _validate(plugin_cls, stub, dev, b)
+    assert ok is False
+    assert _OLDER_WINDOW in errors["autoRelockTime"]
+
+
+def test_validation_does_not_refuse_a_field_equal_to_the_current_seed(
+        plugin_cls, ds, indigo_env, mock_logger):
+    dev, stub, _a, b = _stale_scenario(plugin_cls, ds, indigo_env, mock_logger)
+    result = _validate(plugin_cls, stub, dev, b)                 # B untouched: 77, the current seed
+    assert result[0] is True
+
+
+def test_validation_does_not_refuse_a_real_third_value(plugin_cls, ds, indigo_env, mock_logger):
+    dev, stub, _a, b = _stale_scenario(plugin_cls, ds, indigo_env, mock_logger)
+    b["autoRelockTime"] = "55"
+    assert _validate(plugin_cls, stub, dev, b)[0] is True
+
+
+def test_a_dialog_two_replacements_old_saved_untouched_is_still_not_written(
+        plugin_cls, ds, indigo_env, mock_logger):
+    from test_pass4 import _live
+    dev, stub, clock = _setup(plugin_cls, ds, indigo_env, mock_logger)
+    a = _open(plugin_cls, stub, dev, "matterLock")              # seed 30, left open
+    _live(ds, 77); clock.now += LIMIT + 1
+    _open(plugin_cls, stub, dev, "matterLock")                  # B replaces A, abandoned
+    _live(ds, 88); clock.now += LIMIT + 1
+    _open(plugin_cls, stub, dev, "matterLock")                  # C replaces B
+    assert _save(plugin_cls, stub, dev, a) == 0                 # A's 30 is two slots back
+    assert any("reopen" in str(c) for c in mock_logger.warning.call_args_list)
