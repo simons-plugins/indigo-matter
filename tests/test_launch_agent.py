@@ -861,7 +861,7 @@ def test_a_respawn_loop_is_a_report_in_every_phase_with_the_fatal_cause(tmp_path
     report = agent.port_conflict_report()
     assert report is not None
     assert "keeps failing to start" in report and "restart" in report
-    assert "storage lock" in report
+    assert "Storage is locked by another process" in report     # the cause, from the err log
 
 
 def test_a_respawn_loop_report_is_the_same_text_whichever_attempt_is_sampled(tmp_path, mock_logger):

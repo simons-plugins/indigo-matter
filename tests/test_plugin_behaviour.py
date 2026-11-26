@@ -2396,7 +2396,7 @@ def test_a_respawn_loop_of_short_lived_pids_is_reported_not_abandoned(plug, tmp_
         clock["t"] += 15
     errors = [t for t in _texts(plug.logger.error) if "keeps failing to start" in t]
     assert len(errors) == 1, _texts(plug.logger.error)
-    assert fatal.split("]")[-1].strip()[:20] in errors[0] or "storage lock" in errors[0]
+    assert fatal.split("] ")[-1] in errors[0]              # the cause, from the err log
     assert not [t for t in _texts(plug.logger.warning) if "abandoned" in t]
     assert not [t for t in _texts(plug.logger.info) if "resolved" in t]
     assert agent.due_for_bootstrap_verification() is None   # a verdict was reached and cleared

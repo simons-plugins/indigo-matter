@@ -90,6 +90,13 @@ STARTUP_GRACE_SECONDS = 120
 VERDICT_DEAD = "dead"
 VERDICT_CONFLICT_FREE = "conflict_free"
 VERDICT_PENDING = "pending"
+# Issue #374: the job keeps failing to start and launchd keeps restarting it (see
+# LaunchAgent._respawn_loop_report). A verdict, unlike PENDING: waiting cannot end it.
+VERDICT_RESPAWNING = "respawning"
+# How many launchd runs since the job was loaded, the last one exiting non-zero, make a
+# respawn LOOP rather than one crash and a restart (runs = 2). launchd's `runs` counter
+# restarts at 1 on every bootstrap, and a loop reaches 3 within ~20 s of one.
+RESPAWN_LOOP_MIN_RUNS = 3
 
 # LaunchAgent._stale_reason_for_live_pid() outcomes (stale-lock review). Collapsing
 # LIVE_PID_OURS and LIVE_PID_UNDECIDED into the same (False, "") is what let the
@@ -1139,11 +1146,13 @@ class LaunchAgent:
         * :data:`NOT_LOADED` — launchd has no such label.
         * :data:`RUNNING` — loaded, with a pid we parsed. The ONLY positive
           signal; nothing may claim the process is up without it.
-        * :data:`LOADED_NOT_RUNNING` — loaded with no ``pid =`` line at all.
-          launchd reports ``state = not running`` and, under our ``KeepAlive
-          {SuccessfulExit: false}``, has decided not to respawn it (a node that
-          exits 0 on a fatal startup error reads as a clean exit). Loaded and
-          dead, indefinitely.
+        * :data:`LOADED_NOT_RUNNING` — loaded with no ``pid =`` line at all. Two
+          cases. ``state = not running``: under our ``KeepAlive {SuccessfulExit:
+          false}`` launchd has decided not to respawn it (a server that exits 0 on a
+          fatal startup error, such as matter-server 0.6.x, reads as a clean exit) —
+          loaded and dead, indefinitely. ``state = spawn scheduled``: it exited
+          non-zero and launchd will start it again in a few seconds (matter-server
+          1.6.1 failing to start, issue #374) — the gap between respawns.
         * :data:`UNKNOWN` — a ``pid =`` line we could not parse. The job may
           well be alive and we cannot prove it either way, so callers must
           neither claim success nor report a failure.
@@ -1870,10 +1879,18 @@ class LaunchAgent:
         subsequent startup for ever — the log can establish that a conflict happened
         once, never that one is happening now.
 
+        **Respawn loop (issue #374) comes first.** matter-server 1.6.1 exits 1 when it
+        cannot start, and launchd restarts it about every 10 s. Every attempt is
+        younger than the grace window and the gap between attempts has no pid, so none
+        of the signals below can see it, and the conflict message would name a
+        different pid of ours on every respawn. :meth:`_respawn_loop_report` returns
+        one message that reads the same in every phase of that loop.
+
         Returns a message for the caller to log, or None when nothing is wrong.
         """
-        if self.spec.port is None:
-            return None
+        respawning = self._respawn_loop_report() if self.spec.port is not None else None
+        if self.spec.port is None or respawning:
+            return respawning
         if managed_pid is None:
             managed_pid = self._managed_job()["pid"]
         if managed_pid is None:
@@ -1923,9 +1940,9 @@ class LaunchAgent:
             message = (
                 f"{self.spec.package} (pid {managed_pid}) has been running for {age}s "
                 f"but NOTHING is listening on port {self.spec.port}, so the plugin "
-                f"cannot reach it. This is what a lost port race leaves behind: "
-                f"{self.spec.package} logs a fatal '{EADDRINUSE_MARKER}' and keeps "
-                f"running without its WebSocket server. Restart it from "
+                f"cannot reach it. Older versions of {self.spec.package} do this after "
+                f"losing a port race: they log a fatal '{EADDRINUSE_MARKER}' and keep "
+                f"running without a connection. Restart it from "
                 f"Plugins ▸ Matter, and see "
                 f"{os.path.join(self.log_dir, self.spec.err_log)}."
             )
@@ -1982,11 +1999,16 @@ class LaunchAgent:
         still inside (or unknowably within) the startup grace window, or the
         managed job has no pid at all. That last one is the #187 fault itself:
         bootstrap succeeded, but the process then lost the port bind race, logged
-        EADDRINUSE, and exited — and ``KeepAlive {SuccessfulExit: False}`` never
-        respawns it (see :meth:`_apply_plist`'s "loaded but not running" branch).
-        It is exactly the case ``port_conflict_report`` deliberately declines to
-        call a conflict, because calling it one would send a caller hunting for a
+        EADDRINUSE, and exited 0 — and ``KeepAlive {SuccessfulExit: False}`` never
+        respawns an exit 0 (see :meth:`_apply_plist`'s "loaded but not running"
+        branch). It is exactly the case ``port_conflict_report`` deliberately declines
+        to call a conflict, because calling it one would send a caller hunting for a
         rival process that does not exist.
+
+        A server that exits NON-zero instead (matter-server 1.6.1, issue #374) is
+        respawned by launchd about every 10 s, so "no pid" and "young pid" alternate
+        and neither DEAD nor PENDING is true; that is :data:`VERDICT_RESPAWNING`,
+        checked first. ``port_conflict_report`` normally reports it before this runs.
 
         Returns one of:
 
@@ -1997,10 +2019,11 @@ class LaunchAgent:
           * :data:`VERDICT_PENDING` — a pid is present but its age is still
             inside the grace window, or unknowable. NOT a verdict — the caller
             must leave the verification armed and let the next tick retry.
-
-        Reuses :meth:`_managed_job` rather than re-parsing ``launchctl print`` a
-        second time in the same tick.
+          * :data:`VERDICT_RESPAWNING` — launchd keeps restarting a job that keeps
+            failing (:meth:`_respawn_facts`). A verdict: waiting cannot end it.
         """
+        if self._respawn_facts()["looping"]:
+            return VERDICT_RESPAWNING
         pid = self._managed_job()["pid"]
         if pid is None:
             return VERDICT_DEAD
@@ -2051,7 +2074,7 @@ class LaunchAgent:
           difference between "loaded but NOT running" (no such line; launchd reports
           ``state = not running``) and "running, but we could not parse the pid", and
           the two must not be conflated. #104's fault 2 lives in that gap: matter-server
-          exits 0 on the ``EADDRINUSE`` FATAL, so launchd's ``KeepAlive
+          0.6.x exits 0 on the ``EADDRINUSE`` FATAL, so launchd's ``KeepAlive
           {SuccessfulExit: false}`` policy classes it a clean exit and deliberately
           never respawns it — the job sits loaded-and-dead indefinitely. Treating that
           as "healthy, hands off" is why a plugin reload could not recover it either.
@@ -2062,8 +2085,9 @@ class LaunchAgent:
           server is reachable" — :meth:`port_conflict_report` answers that second
           question. 1.6.1 is a third case (issue #374): it exits 1, which this
           KeepAlive policy DOES respawn, so the job alternates between a short-lived
-          pid and "spawn scheduled" with no pid line. All three behaviours are in the
-          wild, so none may be assumed.
+          pid and ``state = spawn scheduled`` with no pid line (see
+          :meth:`_respawn_facts`, which reads that state). All three behaviours are in
+          the wild, so none may be assumed.
         * ``arguments`` — the ProgramArguments launchd actually cached at bootstrap,
           which is NOT necessarily what the plist on disk now says (fault 3).
         """
@@ -2090,6 +2114,75 @@ class LaunchAgent:
                 except (ValueError, IndexError):
                     job["pid"] = None
         return job
+
+    def _respawn_facts(self) -> dict:
+        """Read launchd's own restart record for the job, from one ``launchctl print``.
+
+        ``looping`` is True when launchd keeps restarting a job that keeps failing:
+        ``runs`` >= :data:`RESPAWN_LOOP_MIN_RUNS` since it was loaded, the last run
+        exited non-zero, and right now it is either ``state = spawn scheduled`` (between
+        attempts, no pid) or running a process younger than
+        :data:`STARTUP_GRACE_SECONDS`. Field names are as real ``launchctl print``
+        prints them (fixtures in tests/fixtures/launchctl_print). Anything missing or
+        unparseable reads as NOT looping: this only ever adds a report, so "could not
+        tell" falls back to the checks that existed before it.
+
+        None of the older behaviours match: a healthy server has never exited
+        (``last exit code = (never exited)``); a server that exits 0 on a fatal error
+        (0.6.x) is not restarted and shows ``last exit code = 0``; 1.2.2 stays running.
+        """
+        facts = {"looping": False, "runs": None, "last_exit": None, "state": None, "pid": None}
+        result = self._launchctl("print", f"gui/{os.getuid()}/{self.spec.label}")
+        if result is None or result.returncode != 0:
+            return facts
+        for line in (result.stdout or "").splitlines():
+            key, sep, value = line.strip().partition(" = ")
+            if not sep or (key in facts and facts[key] is not None):
+                continue                    # nested blocks repeat "state"; keep the first
+            if key == "state":
+                facts["state"] = value
+            elif key in ("runs", "pid", "last exit code"):
+                try:
+                    facts["last_exit" if key == "last exit code" else key] = int(value)
+                except ValueError:
+                    pass                    # "(never exited)", a signal description, …
+        if not facts["last_exit"] or (facts["runs"] or 0) < RESPAWN_LOOP_MIN_RUNS:
+            return facts
+        if facts["pid"] is None:
+            facts["looping"] = facts["state"] == "spawn scheduled"
+        else:
+            age = self._process_age_seconds(facts["pid"])
+            facts["looping"] = age is not None and age < STARTUP_GRACE_SECONDS
+        return facts
+
+    def _respawn_loop_report(self) -> Optional[str]:
+        """The message for a job launchd keeps restarting (issue #374), else None.
+
+        Deliberately the SAME text in every phase of the loop and on every attempt, so
+        the plugin's "log only when the report changes" logs it once: it never names
+        our own pid (new on every respawn), and the FATAL line's own timestamp is
+        dropped. A rival holding the port is named, since its pid is stable.
+        """
+        facts = self._respawn_facts()
+        if not facts["looping"]:
+            return None
+        cause = self.describe_fatal_cause()
+        if cause is None:
+            why = "Its error log does not say why"
+        else:
+            why = "The last error it logged: " + _FATAL_TIMESTAMP_RE.sub("", cause.message, count=1).strip()
+        message = (
+            f"{self.spec.package} keeps failing to start: it exits with code "
+            f"{facts['last_exit']} and macOS restarts it about every 10 seconds. "
+            f"{why.rstrip('.')}."
+        )
+        holders = self._port_listener_pids()
+        if holders:
+            procs = self._ps_map()
+            others = ", ".join(f"pid {pid} ({procs.get(pid, 'unknown command')})" for pid in holders)
+            message += (f" Port {self.spec.port} is held by {others}; stop that process "
+                        f"(or its LaunchAgent).")
+        return f"{message} See {os.path.join(self.log_dir, self.spec.err_log)}."
 
     def _managed_pid(self) -> Optional[int]:
         """The pid of the LaunchAgent's currently-running job, or None if not running.

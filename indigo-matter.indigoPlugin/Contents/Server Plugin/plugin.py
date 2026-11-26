@@ -52,7 +52,7 @@ from export_recovery_menu_mixin import ExportRecoveryMenuMixin
 from export_store import ExportStore
 from http_api_mixin import HttpApiMixin
 from http_handlers import HttpApi
-from launch_agent import STARTUP_GRACE_SECONDS, VERDICT_CONFLICT_FREE, VERDICT_DEAD
+from launch_agent import STARTUP_GRACE_SECONDS, VERDICT_CONFLICT_FREE, VERDICT_DEAD, VERDICT_RESPAWNING
 from matter_client import MatterClient
 from matter_handlers.registry import HandlerRegistry
 from node_replace_menu_mixin import NodeReplaceMenuMixin
@@ -1160,7 +1160,11 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                         os.path.join(agent.log_dir, agent.spec.err_log),
                     )
                     agent.clear_bootstrap_verification(due_token)
-                elif verdict == VERDICT_CONFLICT_FREE:
+                elif verdict in (VERDICT_CONFLICT_FREE, VERDICT_RESPAWNING):
+                    # RESPAWNING (issue #374) is normally already the report above; if a
+                    # loop only showed up on this second launchd read, the next interval
+                    # check reports it. Either way waiting cannot end it, so never let it
+                    # run on into the "abandoned" warning.
                     agent.clear_bootstrap_verification(due_token)
                 # else VERDICT_PENDING: too young (or unknowable) to render a verdict yet —
                 # leave the flag armed so the next tick retries.
