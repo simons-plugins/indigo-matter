@@ -65,6 +65,8 @@ __all__ = [
     "CLUSTER_OCCUPANCY_SENSING", "ATTR_HOLD_TIME", "ATTR_HOLD_TIME_LIMITS",
     "CLUSTER_ON_OFF", "ATTR_START_UP_ON_OFF", "ATTR_ON_TIME", "ATTR_OFF_WAIT_TIME",
     "ATTR_ATTRIBUTE_LIST",
+    "CLUSTER_DOOR_LOCK", "ATTR_AUTO_RELOCK_TIME", "ATTR_WRONG_CODE_ENTRY_LIMIT",
+    "ATTR_USER_CODE_TEMPORARY_DISABLE_TIME",
 ]
 
 # OccupancySensing (0x0406) — HoldTime and its limits. Matter 1.4 (cluster
@@ -102,6 +104,31 @@ CLUSTER_ON_OFF = 0x0006
 ATTR_ON_TIME = 0x4001
 ATTR_OFF_WAIT_TIME = 0x4002
 ATTR_START_UP_ON_OFF = 0x4003
+
+# DoorLock (0x0101) — three of its writable settings (issue #368). Ranges are the
+# pinned @matter/model 0.17.8's own (door-lock-cluster.element.js), not guesses:
+#
+#   AutoRelockTime (0x0023)              uint32, NO constraint; spec text "0=disabled".
+#                                        We cap it at 86400 s (see its declaration)
+#   WrongCodeEntryLimit (0x0030)         uint8,  constraint "1 to 255" (a 0 write is a
+#                                        CONSTRAINT_ERROR per the spec text)
+#   UserCodeTemporaryDisableTime (0x0031) uint8, constraint "1 to 255", seconds
+#
+# Access is "R[W] VM" / "R[W] VA" — Manage / Administer privilege, NOT timed
+# writes (no T flag). The plugin's controller is an admin of its own fabric, and
+# the write is read back like every other setting, so a lock that refuses (the
+# "[W]" means a device may implement the attribute read-only) is reported, not
+# assumed.
+#
+# Deliberately NOT here: OperatingMode (0x0025) needs SupportedOperatingModes
+# handling, and RequirePinForRemoteOperation (0x0033) must never be offered —
+# the plugin locks and unlocks without a PIN, so turning it on would make the
+# lock refuse every command Indigo sends (see settings_report.
+# DELIBERATELY_NOT_OFFERED).
+CLUSTER_DOOR_LOCK = 0x0101
+ATTR_AUTO_RELOCK_TIME = 0x0023
+ATTR_WRONG_CODE_ENTRY_LIMIT = 0x0030
+ATTR_USER_CODE_TEMPORARY_DISABLE_TIME = 0x0031
 
 #: AttributeList (0xFFFB) — the device's own list of the attribute ids it
 #: implements on a cluster. THE capability check: it is what the device says it
@@ -380,15 +407,25 @@ class DeviceSetting:
             rows = [(str(self.null_state), self.null_label), *rows]
         return rows
 
-    def value_text(self, value: Any) -> str:
+    def value_text(self, value: Any, bounds: Optional["Bounds"] = None) -> str:
         """A value as the user should read it in a log line: the option's label
-        for a choice ("On"), the null's display string, else value plus unit."""
+        for a choice ("On", "High (most sensitive)"), the null's display string,
+        else value plus unit.
+
+        ``bounds`` (the device's resolved ones) is needed only for a picker whose
+        labels are BUILT from what the device reported - sensitivity's level count -
+        which a fixed enum cannot name. Without it that falls back to the number.
+        """
         number = _as_state_int(value)
         if number is not None and number == self.null_state:
             return self.null_ui
         for known, label in getattr(self.bounds, "values", ()):
             if number is not None and int(known) == number:
                 return label
+        if number is not None and bounds is not None and self.options is not None:
+            for row_id, label in self.options(bounds):
+                if row_id == str(number):
+                    return label
         return f"{value}{self.unit}"
 
     def state_entry(self, value: Any) -> dict:
@@ -477,6 +514,40 @@ SETTINGS: tuple = (
         # one declaration serves all three Lighting-capable types.
         device_types=frozenset({"matterRelay", "matterDimmer", "matterColorDimmer"}),
     ),
+    # --- DoorLock settings (issue #368) --------------------------------------
+    # Ranges: see the DoorLock block above.
+    DeviceSetting(
+        key="autoRelockTime",
+        label="Auto-relock time",
+        cluster=CLUSTER_DOOR_LOCK,
+        attribute=ATTR_AUTO_RELOCK_TIME,
+        # The spec sets no limit (uint32); the one-day cap on what a user may ENTER is
+        # ours, by choice. A separate guard (DeviceSync.apply_states) refuses to store
+        # any reading past 2**31-1 in a state, because an Indigo Integer state feeds
+        # SQL Logger's INT4 column, which overflows and silently stops that device's
+        # history. A lock already holding more than a day keeps it unless changed.
+        bounds=StaticRange(0, 86400),
+        device_types=frozenset({"matterLock"}),
+        unit=" seconds",
+    ),
+    DeviceSetting(
+        key="wrongCodeEntryLimit",
+        label="Wrong-code attempt limit",
+        cluster=CLUSTER_DOOR_LOCK,
+        attribute=ATTR_WRONG_CODE_ENTRY_LIMIT,
+        bounds=StaticRange(1, 255),
+        device_types=frozenset({"matterLock"}),
+        unit=" attempts",
+    ),
+    DeviceSetting(
+        key="userCodeTemporaryDisableTime",
+        label="Lockout time after wrong codes",
+        cluster=CLUSTER_DOOR_LOCK,
+        attribute=ATTR_USER_CODE_TEMPORARY_DISABLE_TIME,
+        bounds=StaticRange(1, 255),
+        device_types=frozenset({"matterLock"}),
+        unit=" seconds",
+    ),
 )
 
 
@@ -551,7 +622,8 @@ def coerce_value(setting: DeviceSetting, raw: Any, bounds: Bounds) -> tuple[Opti
     return value, ""
 
 
-def verify_write(setting: DeviceSetting, intended: int, read_back: Any) -> tuple[bool, str]:
+def verify_write(setting: DeviceSetting, intended: int, read_back: Any,
+                 bounds: Optional[Bounds] = None) -> tuple[bool, str]:
     """Did the write actually land? The single implementation of rule 1.
 
     A device that ACKs a write and silently ignores it is not a hypothetical:
@@ -571,9 +643,13 @@ def verify_write(setting: DeviceSetting, intended: int, read_back: Any) -> tuple
     if read_back is NO_ANSWER:
         return False, (f"{setting.label} could not be confirmed — the device did not answer "
                        f"the read-back. The setting may or may not have been applied.")
+    if read_back is None and setting.null_state is not None:
+        # For a setting whose null is a real answer, null is what the device holds.
+        return False, (f"{setting.label} was NOT applied — the device still reports "
+                       f"{setting.null_ui} after being asked for {setting.value_text(intended, bounds)}.")
     if read_back is None:
         return False, (f"{setting.label} was NOT applied — the device answered the read-back "
-                       f"with no value (null) after being asked for {setting.value_text(intended)}.")
+                       f"with no value (null) after being asked for {setting.value_text(intended, bounds)}.")
     try:
         actual = int(read_back)
     except (TypeError, ValueError):
@@ -581,7 +657,7 @@ def verify_write(setting: DeviceSetting, intended: int, read_back: Any) -> tuple
                        f"read-back with {read_back!r}, which is not a value.")
     if actual != intended:
         return False, (f"{setting.label} was NOT applied — the device still reports "
-                       f"{setting.value_text(actual)} after being asked for "
-                       f"{setting.value_text(intended)}. "
+                       f"{setting.value_text(actual, bounds)} after being asked for "
+                       f"{setting.value_text(intended, bounds)}. "
                        f"Some firmware acknowledges a write and ignores it.")
     return True, ""

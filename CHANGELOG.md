@@ -3,6 +3,63 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.38.0 — Door lock settings, and a restart hint when commissioning finds no device
+
+- New (issue #368): a Matter lock's **Edit Device** dialog now offers up to three
+  settings, each shown only if that lock says it implements it: **Auto-relock**
+  (seconds; 0 turns it off), **Wrong-code limit** (attempts, 1-255) and **Lockout
+  time** (seconds, 1-255; how long code entry is disabled after too many wrong
+  codes). Like other device settings they are stored on the lock itself, are read
+  back after a change, and each has a state you can use in triggers. Locks you
+  already have gain them on upgrade with no need to recreate the device.
+  Matter sets no upper limit on auto-relock; the plugin caps what you can enter at
+  86400 seconds (one day) by choice. Separately, a reading past 2,147,483,647 is never
+  stored in a state (it would overflow SQL Logger's integer column and stop that
+  device's history); the setting then shows as not read. A lock already holding more
+  than a day keeps its value unless you change it.
+- A setting whose value the device has not reported yet now shows blank in the dialog
+  (a picker leads with "Not read from the device yet (leave unchanged)"), and
+  "unknown" on the device, instead of Indigo's default 0 (which looked like a real
+  value; for auto-relock it read as "off"). Leaving it alone changes nothing; typing or
+  choosing a value, including 0, writes it. This applies to the existing sensor and relay
+  settings too. The values shown are the last the device reported, including for a
+  device that is currently unreachable. A save no longer refuses a value you did not
+  change. After a change the lock does not confirm, the setting is "not read" again the
+  next time you open it. Restarting a device in Indigo no longer overwrites a newer
+  value with an older one, and no longer clears its unreachable flag.
+- With the power-on behaviour setting for dimmers (2026.37.0): a device reporting "previous
+  state" counts as read. It shows the "Previous state" row (not "Not read from the device
+  yet"), and a write whose read-back comes back null is recorded as "previous state".
+- A setting edit that cannot be sent is now refused when you click Save, with a message on the
+  field: "Not connected to matter-server, so this cannot be written now" or "This device is
+  unreachable". Clear the field (or leave the picker as it was) to save the rest. An untouched
+  field is judged against the value the dialog opened with, so a change made by another app
+  while the dialog is open is not overwritten by saving. Only one settings dialog per device
+  can be used at a time; if the dialog's starting values are unavailable (it was reopened, or
+  the plugin restarted), nothing is written and the log says to reopen it. There is no way
+  to force a resend of the value the dialog opened with: change it and change it back.
+  A settings dialog that was never closed (a crash) stops blocking that device after ten minutes.
+  A value equal to what an older, replaced settings window started with is refused in the dialog (it cannot be told apart from a stale save): reopen the settings and set it again.
+  The dialog says why values may be out of date (device unreachable, or plugin not connected).
+- Fix: a Matter node device's own "reachable" state was written in a way that cleared its
+  "unreachable" flag the moment it was set, so a node going offline could show as fine.
+- A failed or unconfirmed setting write no longer marks the whole device as in error (a lock
+  keeps showing Locked/Unlocked, a relay on/off). The failure is recorded on a new text state,
+  **Settings Error**, on every device type that has settings, e.g. "Auto-relock time: the
+  device rejected 99999 seconds", shown in the Edit Device dialog and usable in triggers. It is
+  cleared per setting by the next successful write of that setting, or by the device later
+  reporting the value you asked for, and not by unrelated reports. The Event Log ERROR line is
+  unchanged. The device error flag now means "unreachable" only.
+- The existing sensor and relay setting states now carry a display value (the number with
+  its unit, or the option name, such as "Standard"), and while a state shows "unknown"
+  its numeric value, which triggers compare, is still the previous number.
+- Fix (issue #368): when matter-server reports "No commissionable device was
+  discovered", the error (Event Log, and the message dom.io shows) now
+  suggests Plugins ▸ Matter ▸ **Restart the Matter controller** and retrying with a
+  fresh pairing code (or, if you run matter-server yourself, restarting it there). That was the fix for the reporter's Aqara lock after a
+  long-running matter-server stopped hearing it. The cause is not confirmed, and
+  nothing is restarted automatically. Other commissioning errors are unchanged.
+
 ## 2026.37.0 — Power-on behaviour setting for dimmers and colour dimmers
 
 - New (issue #360): a dimmer or colour dimmer that implements the OnOff Lighting

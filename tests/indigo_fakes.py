@@ -39,6 +39,7 @@ _SUPPORTS_TO_STATE = {
 # BooleanStateConfigHandler's guard (issue #85 — "sensitivityLevel" not in
 # indigo_dev.states) needs this modelled; matterLock's lockState needs no
 # guard (door_lock.py writes it unconditionally) so it needs no seeding here.
+# (the DoorLock SETTING states are guarded, and are seeded below).
 _STATIC_DEVICE_TYPE_STATES = {
     # Mirrors the <States> each type declares in Devices.xml — real Indigo
     # creates a device with every declared state present, and the handlers'
@@ -46,6 +47,8 @@ _STATIC_DEVICE_TYPE_STATES = {
     "matterMotionSensor": {"sensitivityLevel", "holdTime"},
     "matterContactSensor": {"sensitivityLevel"},
     "matterRelay": {"startUpOnOff"},
+    # issue #368 — the three DoorLock settings' states, as Devices.xml declares them.
+    "matterLock": {"autoRelockTime", "wrongCodeEntryLimit", "userCodeTemporaryDisableTime"},
     "matterDimmer": {"startUpOnOff"},       # issue #360
     "matterColorDimmer": {"startUpOnOff"},
     # issue #204 / ADR-0008 — declared unconditionally in Devices.xml (no
@@ -62,6 +65,11 @@ _STATIC_DEVICE_TYPE_STATES = {
 }
 
 
+#: Device types whose Devices.xml declares the String state ``settingsError`` (#388).
+_SETTINGS_ERROR_TYPES = {"matterRelay", "matterDimmer", "matterColorDimmer", "matterMotionSensor",
+                         "matterContactSensor", "matterLock"}
+
+
 class FakeDev:
     def __init__(self, dev_id, name, device_type_id, props, initial_states=None):
         self.id = dev_id
@@ -74,11 +82,16 @@ class FakeDev:
                 self.states[state_key] = 0  # Indigo-style initial value
         for state_key in _STATIC_DEVICE_TYPE_STATES.get(device_type_id, ()):
             self.states.setdefault(state_key, 0)
+        # String states start empty in real Indigo (not 0). #388: every type that
+        # carries settings declares settingsError.
+        if device_type_id in _SETTINGS_ERROR_TYPES:
+            self.states.setdefault("settingsError", "")
         # Callers that need states Devices.xml wouldn't auto-derive here (e.g.
         # matterButton's lastButtonEvent/pressCount) seed them explicitly.
         self.states.update(dict(initial_states or {}))
         self.error = None
         self.errorState = ""
+        self.single_key_calls = []
         self.folderId = 0
         # See replaceOnServer: fail_replace models real Indigo's discard-on-
         # failure semantics; _name_on_server is the last name Indigo accepted.
@@ -116,16 +129,49 @@ class FakeDev:
         self.states["onOffState"] = value
 
     def updateStatesOnServer(self, kvlist):
+        # Real Indigo clears a device's error state on a state write unless told
+        # not to (the documented ``updateStateOnServer(key, value, clearErrorState)``
+        # defaults to True; the batch form is not documented as taking that
+        # argument, so the fake models the default and offers no way to opt out -
+        # a write that must NOT clear the error has to use the single-key call).
         for kv in kvlist:
-            self.states[kv["key"]] = kv["value"]
-            # Real Indigo's states dict answers a "key.ui" lookup with the
-            # display value from a uiValue-bearing write (used by both fix A's
-            # evidence check and fix D's reachable/unreachable column text).
-            if "uiValue" in kv:
-                self.states[f"{kv['key']}.ui"] = kv["uiValue"]
+            self._write_state(kv["key"], kv["value"], kv.get("uiValue"))
+        self.error = None
+        self.errorState = ""
+
+    # The REAL signature, read live from Indigo 2026.1 on 2026-11-26 with
+    # ``indigo.Device.updateStateOnServer.__doc__``:
+    #   updateStateOnServer(key, value [, decimalPlaces=-1 [, triggerEvents=True
+    #                       [, clearErrorState=True [, uiValue=None]]]])
+    # The third POSITIONAL is decimalPlaces - not clearErrorState. A version of this fake
+    # that put clearErrorState third hid a bug where every "keep the error" write
+    # cleared it. Do not reorder; tests/test_fake_signature.py pins it.
+    def updateStateOnServer(self, key, value, decimalPlaces=-1, triggerEvents=True,
+                            clearErrorState=True, uiValue=None):
+        """Records every call's arguments (as the real parameters) for tests to assert."""
+        self.single_key_calls.append({
+            "key": key, "value": value, "clearErrorState": clearErrorState, "uiValue": uiValue,
+            "decimalPlaces": decimalPlaces, "triggerEvents": triggerEvents})
+        self._write_state(key, value, uiValue)
+        if clearErrorState:
+            self.error = None
+            self.errorState = ""
+
+    def _write_state(self, key, value, ui_value):
+        self.states[key] = value
+        # Real Indigo's states dict answers a "key.ui" lookup with the display
+        # value from a uiValue-bearing write (used by both fix A's evidence check
+        # and fix D's reachable/unreachable column text). A write WITHOUT a uiValue
+        # leaves the old display string alone - the pessimistic case.
+        if ui_value is not None:
+            self.states[f"{key}.ui"] = ui_value
 
     def stateListOrDisplayStateIdChanged(self):
         self.state_list_rebuilds += 1
+        # Opt-in per test: set ``declared_on_refresh`` to the states a refresh adds (at
+        # Indigo's Integer default 0), as the real refresh does for a fielded device.
+        for key in getattr(self, "declared_on_refresh", ()):
+            self.states.setdefault(key, 0)
 
     def setErrorStateOnServer(self, value):
         self.error = value

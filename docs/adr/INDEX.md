@@ -37,4 +37,8 @@ chosen), see [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 
 * [ADR-0018](0018-a-re-paired-node-is-rebound-onto-its-existing-devices.md) - ADR-0018: A re-paired node is rebound onto its existing Indigo devices (accepted)
 
+* [ADR-0019](0019-a-real-setting-may-be-withheld-from-the-settings-report.md) - ADR-0019: A real setting may be withheld from the settings report when offering it would break the plugin's own control path (proposed; narrows ADR-0006)
+
+* [ADR-0020](0020-a-settings-state-is-trusted-in-the-dialog-only-once-read-this-run.md) - ADR-0020: A setting's state is trusted in the dialog only once it has been read from the device this run (proposed; narrows ADR-0002)
+
 <!-- adrlogstop -->

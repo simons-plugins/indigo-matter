@@ -47,7 +47,8 @@ __all__ = [
     "OfferedSetting", "PlannedWrite", "MARKER_YES", "MARKER_NO",
     "offered_settings", "unimplemented_states", "config_ui_values",
     "validate_settings", "planned_writes", "apply_setting",
-    "RemovedStateLog",
+    "RemovedStateLog", "PrimedLookup", "picker_rows", "edited_settings", "matches_seed", "candidate_edits", "NO_ATTRIBUTE_LIST_REASON",
+    "UNREAD_OPTION_ID", "UNREAD_OPTION_LABEL",
 ]
 
 #: Marker values for the ``hasX`` hidden ConfigUI fields that drive
@@ -60,6 +61,52 @@ MARKER_NO = "no"
 #: A limits lookup: ``(cluster, attribute) -> raw value or None``. Injected so
 #: this module never has to know about device_sync or a node id.
 LimitsLookup = Callable[[int, int], Any]
+
+#: Has this device's reading of the setting ``key`` landed this run? A new Integer
+#: state is initialised by Indigo to 0 (ADR-0003, #190), so until a reading has been
+#: written the state's "0" is Indigo's default and NOT what the device holds. ``None``
+#: (a caller that cannot say) means "treat everything as read" - the old behaviour.
+PrimedLookup = Callable[[str], bool]
+
+
+def _is_primed(primed: Optional[PrimedLookup], setting: DeviceSetting) -> bool:
+    return True if primed is None else bool(primed(setting.key))
+
+
+#: Start of the ``on_skip`` reason given when a device has no AttributeList cached for a
+#: setting's cluster - which usually means "no reconcile yet", not a fault of the device.
+NO_ATTRIBUTE_LIST_REASON = "the device has not reported an AttributeList"
+
+#: The picker row an UNREAD choice setting leads with, and the id that means "leave
+#: this alone". Not "" because Indigo rejects an empty list id ("UI dynamic list
+#: function returned illegal ID string"; see ``getDeviceFolders``) - so a blank value
+#: and this id are treated the same everywhere (:func:`_is_leave_alone`).
+UNREAD_OPTION_ID = "unread"
+UNREAD_OPTION_LABEL = "Not read from the device yet (leave unchanged)"
+
+
+def picker_rows(offer: "OfferedSetting", primed: Optional[PrimedLookup],
+                current: Any = None, state: Any = None) -> Optional[list]:
+    """A choice setting's picker rows, with at most ONE special leading row.
+
+    * unread (or the dialog was seeded with the unread row, even if a reading has
+      landed since - the field's own value must always be one of its rows): the
+      "not read yet (leave unchanged)" row leads;
+    * read and holding the setting's null state (#360, "previous state"): that row
+      leads, because it cannot be chosen but the seeded value must match a row;
+    * read and holding 0/1/2: neither.
+
+    Never both: a null is a device reading, so an unread setting is not "null". Both
+    special rows mean "leave alone". None for a setting that is not a picker.
+    """
+    seeded_unread = str(current or "").strip() == UNREAD_OPTION_ID
+    unread = not _is_primed(primed, offer.setting) or seeded_unread
+    rows = offer.setting.option_rows(offer.bounds, None if unread else state)
+    if rows is None:
+        return None
+    if unread:
+        return [(UNREAD_OPTION_ID, UNREAD_OPTION_LABEL), *rows]
+    return rows
 
 
 @dataclass(frozen=True)
@@ -137,7 +184,7 @@ def offered_settings(device_type_id: str, limits: LimitsLookup,
             # resolve unconditionally, so "unknown" would silently become
             # "offer it to everything" — including the plugs that demonstrably
             # do not implement it.
-            skip(setting, "the device has not reported an AttributeList for cluster "
+            skip(setting, f"{NO_ATTRIBUTE_LIST_REASON} for cluster "
                           f"0x{setting.cluster:04X}, so there is no evidence it "
                           "implements this")
             continue
@@ -184,7 +231,8 @@ def config_ui_values(device_type_id: str, states: dict, limits: LimitsLookup,
                      values: Optional[dict] = None,
                      attribute_list: Optional[Callable] = None,
                      device_known: bool = True,
-                     on_skip: Optional[Callable] = None) -> dict:
+                     on_skip: Optional[Callable] = None,
+                     primed: Optional[PrimedLookup] = None) -> dict:
     """Seed values for the dialog: markers, current values, range hints.
 
     Returns only the keys this module owns, for the caller to merge over the
@@ -198,16 +246,25 @@ def config_ui_values(device_type_id: str, states: dict, limits: LimitsLookup,
     by_key = {o.setting.key: o for o in offered}
 
     for setting in settings_for_type(device_type_id):
-        out[_marker_field(setting)] = MARKER_YES if setting.key in by_key else MARKER_NO
+        out[marker_field(setting)] = MARKER_YES if setting.key in by_key else MARKER_NO
+        # EVERY setting field is set explicitly. ``values`` starts from the device's
+        # saved props, so a field left unset here would carry a value saved by an
+        # earlier dialog session straight into this Save - and into a write.
+        out[setting.key] = ""
     out["hasAnySetting"] = MARKER_YES if offered else MARKER_NO
 
     for offer in offered:
         setting = offer.setting
         current = states.get(setting.key)
-        # A menu's value must be a string to match its option ids; a text field
-        # is a string either way. An unknown current value leaves the field
-        # blank rather than inventing a plausible one.
-        out[setting.key] = _seed_value(current)
+        if _is_primed(primed, setting):
+            # A menu's value must be a string to match its option ids; a text field
+            # is a string either way. An unknown current value leaves the field
+            # blank rather than inventing a plausible one.
+            out[setting.key] = _seed_value(current)
+        else:
+            # The state holds Indigo's default (0), which looks exactly like a real
+            # value. A number field is blank; a picker leads with its "not read" row.
+            out[setting.key] = UNREAD_OPTION_ID if setting.is_choice else ""
         if not setting.is_choice:
             out[f"{setting.key}Range"] = setting.describe_range(offer.bounds)
     return out
@@ -230,7 +287,7 @@ def _seed_value(current: Any) -> str:
     return str(current)
 
 
-def _marker_field(setting: DeviceSetting) -> str:
+def marker_field(setting: DeviceSetting) -> str:
     """The hidden ConfigUI field gating this setting's visibility.
 
     ``holdTime`` → ``hasHoldTime``. Mirrors the ids in Devices.xml; the two are
@@ -259,28 +316,50 @@ def _is_editing(setting, values: dict) -> bool:
     if setting.key not in values:
         return False
     text = str(values.get(setting.key, "")).strip()
-    # The null row ("previous state") means "leave this alone": it can never be
-    # written, so it is neither validated nor planned. Choosing a real value
-    # from it is a different string and IS a change.
-    if setting.null_state is not None and text == str(setting.null_state):
+    # Blank and the "not read yet" row mean "leave alone"; so does the null row
+    # ("previous state", #360): it can never be written, so it is neither validated
+    # nor planned. Choosing a real value from it is a different string and IS a change.
+    if is_leave_alone(text):
         return False
-    return bool(text)
+    return not (setting.null_state is not None and text == str(setting.null_state))
+
+
+def is_leave_alone(raw: Any) -> bool:
+    """Blank, or the "not read yet" picker row: neither is an edit."""
+    text = str(raw if raw is not None else "").strip()
+    return text in ("", UNREAD_OPTION_ID)
 
 
 def validate_settings(device_type_id: str, values: dict, limits: LimitsLookup,
                       attribute_list: Optional[Callable] = None,
-                      device_known: bool = True) -> dict:
+                      device_known: bool = True, *,
+                      states: Optional[dict] = None,
+                      primed: Optional[PrimedLookup] = None,
+                      seeds: Optional[dict] = None) -> dict:
     """Bounds-check every offered setting. Returns ``{field_id: message}``.
 
     Synchronous and cheap by design: it runs when the user clicks Save, on the
     Indigo UI thread, and touches nothing but the cached bounds. The actual
     write — which can take seconds against a sleepy device — is deliberately not
     done here; see :func:`apply_setting`.
+
+    A field equal to the value the dialog was seeded with (the device's own, read
+    value) is "leave alone", not an edit, and is never rejected: a lock holding a
+    value outside our range must not block a Save that changes something else.
+    ``seeds`` is what the dialog was seeded with when it opened; a field equal to its
+    seed is the user not touching it, even if the device's value has moved since.
+    Without a remembered seed the comparison falls back to the current state.
     """
     errors: dict = {}
     for offer in offered_settings(device_type_id, limits, attribute_list, device_known):
         setting = offer.setting
         if not _is_editing(setting, values):
+            continue
+        if _is_seed(seeds, setting, values):
+            continue
+        if (seeds is None or setting.key not in seeds) and states is not None \
+                and _is_primed(primed, setting) and _unchanged(
+                    setting, values.get(setting.key), states.get(setting.key)):
             continue
         value, reason = coerce_value(setting, values.get(setting.key), offer.bounds)
         if value is None:
@@ -291,7 +370,9 @@ def validate_settings(device_type_id: str, values: dict, limits: LimitsLookup,
 def planned_writes(device_type_id: str, values: dict, states: dict,
                    limits: LimitsLookup,
                    attribute_list: Optional[Callable] = None,
-                   device_known: bool = True) -> list[PlannedWrite]:
+                   device_known: bool = True,
+                   primed: Optional[PrimedLookup] = None,
+                   seeds: Optional[dict] = None) -> list[PlannedWrite]:
     """The settings whose value the user actually CHANGED.
 
     Only changed settings are written. Re-sending an unchanged value on every
@@ -307,11 +388,74 @@ def planned_writes(device_type_id: str, values: dict, states: dict,
         value, _reason = coerce_value(setting, values.get(setting.key), offer.bounds)
         if value is None:
             continue  # validate_settings already refused this; never send it
-        previous = _as_int(states.get(setting.key))
-        if previous is not None and previous == value:
+        # An unread setting's state is Indigo's default, so "previous" is UNKNOWN:
+        # any entered value - 0 included - is written and verified.
+        if _is_seed(seeds, setting, values):
+            continue            # untouched, whatever the device holds now
+        previous = _as_int(states.get(setting.key)) if _is_primed(primed, setting) else None
+        if (seeds is None or setting.key not in seeds) and previous is not None and previous == value:
             continue
         planned.append(PlannedWrite(setting, value, previous))
     return planned
+
+
+def _is_seed(seeds: Optional[dict], setting: DeviceSetting, values: dict) -> bool:
+    """Is the submitted field what the dialog was seeded with? Numerically for a
+    number field ("030" is the seed "30"), by text for a picker."""
+    if seeds is None or setting.key not in seeds:
+        return False
+    typed, seed = str(values.get(setting.key, "")).strip(), str(seeds[setting.key]).strip()
+    if typed == seed:
+        return True
+    if setting.is_choice:
+        return False
+    typed_int, seed_int = _as_int(typed), _as_int(seed)
+    return typed_int is not None and typed_int == seed_int
+
+
+def matches_seed(setting: DeviceSetting, values: dict, seeds: dict) -> bool:
+    """Is the submitted field equal to *seeds*' value for it (numerically for numbers)?"""
+    return _is_seed(seeds, setting, values)
+
+
+def candidate_edits(device_type_id: str, values: dict, limits: LimitsLookup,
+                    attribute_list: Optional[Callable], device_known: bool, states: dict) -> list:
+    """Offered settings whose submitted field is not blank/leave-alone AND differs from the
+    device's CURRENT state value (numerically for numbers): what MIGHT be an edit when no
+    seed says what the dialog opened with."""
+    return [offer.setting
+            for offer in offered_settings(device_type_id, limits, attribute_list, device_known)
+            if _is_editing(offer.setting, values)
+            and not _unchanged(offer.setting, values.get(offer.setting.key),
+                               states.get(offer.setting.key))]
+
+
+def edited_settings(device_type_id: str, values: dict, limits: LimitsLookup,
+                    attribute_list: Optional[Callable] = None, device_known: bool = True,
+                    seeds: Optional[dict] = None) -> list:
+    """The offered settings the user has really EDITED: not blank, not a leave-alone
+    row, and different from what the dialog was seeded with. With no seed nothing can
+    be called an edit - the dialog's starting values are unknown."""
+    if seeds is None:
+        return []
+    return [offer.setting
+            for offer in offered_settings(device_type_id, limits, attribute_list, device_known)
+            if _is_editing(offer.setting, values) and not _is_seed(seeds, offer.setting, values)]
+
+
+def _unchanged(setting: DeviceSetting, typed: Any, current: Any) -> bool:
+    """Is *typed* just the device's own current value, so not an edit at all?
+
+    Numerically for a number field ("00" and " 0 " are the 0 the device holds), by
+    text for a picker.
+    """
+    text = str(typed).strip()
+    if text == _seed_value(current):
+        return True
+    if setting.is_choice:
+        return False
+    typed_int, current_int = _as_int(text), _as_int(current)
+    return typed_int is not None and typed_int == current_int
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -328,7 +472,9 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
                         sleep: Callable = asyncio.sleep,
                         retry_delay: float = 2.0,
                         timeout: float = ATTRIBUTE_TIMEOUT,
-                        on_observed: Optional[Callable] = None) -> tuple[bool, str]:
+                        on_observed: Optional[Callable] = None,
+                        on_cause: Optional[Callable] = None,
+                        bounds: Optional[Bounds] = None) -> tuple[bool, str]:
     """Write a setting and PROVE it landed. Returns ``(ok, message)``.
 
     Success means one thing only: a subsequent read returns the value we asked
@@ -413,17 +559,27 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
         except (TypeError, ValueError):
             pass  # unreadable: verify_write below reports it; nothing to record
 
-    ok, reason = verify_write(setting, plan.value, read_back)
+    ok, reason = verify_write(setting, plan.value, read_back, bounds)
     if ok:
         if last_error is not None:
             # The send errored and the value is on the device anyway — exactly
             # the case that made "could not be sent" a lie.
-            return True, (f"{setting.label} is now {setting.value_text(plan.value)} "
+            return True, (f"{setting.label} is now {setting.value_text(plan.value, bounds)} "
                           f"(the send reported an error — {last_error} — but the "
                           f"device holds the new value).")
-        return True, reason or f"{setting.label} is now {setting.value_text(plan.value)}."
+        return True, reason or f"{setting.label} is now {setting.value_text(plan.value, bounds)}."
+    if on_cause is not None:
+        on_cause(_short_cause(setting, plan.value, read_back, last_error, bounds))
     if last_error is not None:
-        reason = f"{reason} The send also failed: {last_error}."
+        if _is_plain_mismatch(read_back, plan.value) and not isinstance(
+                last_error, (TimeoutError, asyncio.TimeoutError)):
+            # The send FAILED (not merely timed out) AND the device still holds its
+            # old value: that is a refusal, not firmware that acknowledges a write and ignores it.
+            reason = (f"{setting.label} was NOT applied - the device refused the value: "
+                      f"{last_error}. It still reports {setting.value_text(int(read_back), bounds)} "
+                      f"after being asked for {setting.value_text(plan.value, bounds)}.")
+        else:
+            reason = f"{reason} The send also failed: {last_error}."
     if read_error is not None:
         # The write leg names its error; this one used to discard the exception
         # entirely, so a timeout, a dead socket and a protocol error all read as
@@ -431,6 +587,36 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
         # really happened, that is self-defeating.
         reason = f"{reason} (read-back failed: {read_error})"
     return False, reason
+
+
+def _short_cause(setting: DeviceSetting, intended: int, read_back: Any, send_error: Any,
+                 bounds: Optional[Bounds] = None) -> str:
+    """One short phrase for why a write failed, for the ``settingsError`` state.
+
+    No ``;`` (the state joins several failures with it) and no newlines.
+    """
+    if read_back is NO_ANSWER:
+        cause = f"the device did not confirm {setting.value_text(intended, bounds)}"
+    elif read_back is None:
+        cause = f"the device answered with no value after {setting.value_text(intended, bounds)}"
+    elif _is_plain_mismatch(read_back, intended):
+        if send_error is not None and not isinstance(send_error, (TimeoutError, asyncio.TimeoutError)):
+            cause = f"the device rejected {setting.value_text(intended, bounds)}"
+        else:
+            cause = f"the device ignored the change (still {setting.value_text(int(read_back), bounds)})"
+    else:
+        cause = f"the device answered with something unreadable after {setting.value_text(intended, bounds)}"
+    return cause.replace(";", ",").replace("\n", " ")
+
+
+def _is_plain_mismatch(read_back: Any, intended: int) -> bool:
+    """A readable, numeric read-back that differs from what was asked for."""
+    if read_back is NO_ANSWER or read_back is None:
+        return False
+    try:
+        return int(read_back) != intended
+    except (TypeError, ValueError):
+        return False
 
 
 class RemovedStateLog:

@@ -40,6 +40,7 @@ from commission_jobs import CommissionJobs
 import ct_bounds
 from ct_calibration import CTCalibrationEngine
 import device_settings
+from device_names import device_log_name as _device_log_name
 from device_sync import DeviceSync, NodeDeviceTombstones
 from diagnostics_menu_mixin import DiagnosticsMenuMixin, MatterUnavailable
 import bridge_health
@@ -55,7 +56,7 @@ from launch_agent import STARTUP_GRACE_SECONDS, VERDICT_CONFLICT_FREE, VERDICT_D
 from matter_client import MatterClient
 from matter_handlers.registry import HandlerRegistry
 from node_replace_menu_mixin import NodeReplaceMenuMixin
-from matter_handlers.settings import settings_for_type
+from matter_handlers.settings import implements, settings_for_type
 import matter_server_menu_mixin  # noqa: F401 (tests patch ServerProcess)  # pylint: disable=unused-import
 from matter_server_menu_mixin import MatterServerMenuMixin
 from pairing_menu_mixin import PairingMenuMixin
@@ -114,6 +115,167 @@ def _dead_verdict_cause_text(agent) -> str:
     # always does — its remedy sentence). The caller's own template always appends
     # ". See <path>." after this text, so a trailing period here would double up.
     return cause.message.rstrip(".")
+
+
+
+def _unreachable_state(dev_id, logger=None):
+    """True/False: is this Indigo device flagged "unreachable"? None: could not tell.
+
+    A device that is gone (KeyError) is not unreachable; any OTHER failure to ask is
+    logged and answered None, so the caller can say "could not tell" rather than guess.
+    """
+    try:
+        return getattr(indigo.devices[dev_id], "errorState", "") == "unreachable"
+    except KeyError:
+        return False
+    except Exception as exc:  # pylint: disable=broad-except
+        if logger is not None:
+            logger.warning("%s: could not tell whether the device is reachable (%s); "
+                           "its settings may be out of date", _device_log_name(dev_id), exc)
+        return None
+
+
+def _is_flagged_unreachable(dev_id, logger=None) -> bool:
+    """For the stale NOTE: "could not tell" counts as possibly out of date."""
+    return _unreachable_state(dev_id, logger) is not False
+
+
+def _submit_setting_write(plugin, node_id, endpoint_id, dev_id, plan) -> None:
+    """Submit ``_apply_setting`` to the loop and LOG anything that escapes it.
+
+    ``runtime.submit`` returns a future nobody awaits, so an exception raised outside
+    every guard in the coroutine would otherwise vanish without a trace.
+    """
+    future = plugin.runtime.submit(plugin._apply_setting(node_id, endpoint_id, dev_id, plan))
+    add = getattr(future, "add_done_callback", None)
+    if add is None:
+        return
+
+    def log_escape(done) -> None:
+        if done.cancelled():
+            plugin.logger.warning(
+                '%s: "%s" was interrupted because the plugin was stopping; check the device\'s value',
+                _device_log_name(dev_id), plan.setting.label)
+            return
+        exc = done.exception()
+        if exc is not None:
+            plugin.logger.error('%s: "%s" failed unexpectedly: %s',
+                                _device_log_name(dev_id), plan.setting.label, exc)
+
+    add(log_escape)
+
+
+def _record_setting_outcome(plugin, dev_id, plan, cause) -> None:
+    """Record (cause given) or clear (None) the setting's failure text; never raises."""
+    try:
+        if cause is None:
+            plugin.device_sync.clear_setting_failure(dev_id, plan.setting)
+        else:
+            plugin.device_sync.record_setting_failure(dev_id, plan.setting, plan.value, cause)
+    except Exception as exc:  # pylint: disable=broad-except
+        # the ERROR line already said what failed; this says the state did not follow
+        plugin.logger.warning("%s: could not update the settings error (%s)",
+                              _device_log_name(dev_id), exc)
+
+
+def _prune_unoffered_failures(plugin, dev_id, typeId, props) -> None:
+    """Drop failure sentences for settings the device positively no longer implements
+    (``implements`` False; unknown is not False). Nothing could ever clear them."""
+    try:
+        lists = plugin._setting_attribute_list_lookup(props)
+        for setting in settings_for_type(typeId):
+            if implements(lists(setting.cluster), setting.attribute) is False:
+                plugin.device_sync.clear_setting_failure(dev_id, setting)
+    except Exception:  # pylint: disable=broad-except
+        # housekeeping before opening a dialog: never blocks it
+        plugin.logger.warning("%s: could not prune old setting failures", _device_log_name(dev_id),
+                              exc_info=True)
+
+
+def _matter_connected(plugin) -> bool:
+    """Is the plugin connected to matter-server? No permissive default: a client with
+    no ``connected`` attribute is NOT connected."""
+    client = getattr(plugin, "matter", None)
+    return client is not None and bool(getattr(client, "connected", False))
+
+
+def _matches_superseded(plan, values, superseded) -> bool:
+    """Is this planned write's field equal to an older dialog's seed?"""
+    return any(device_settings.matches_seed(plan.setting, values, old) for old in superseded)
+
+
+def _drop_superseded(plugin, dev_id, values, plans, superseded) -> list:
+    """Drop a planned write that is just an OLDER dialog's untouched seed.
+
+    When a stale-looking dialog record is replaced, the old dialog may still be open.
+    Saved untouched, its fields differ from the new slot's seeds (the device moved on)
+    and would count as edits. A field equal to a superseded seed is not a choice the
+    user made, so it is not written; the log says so.
+    """
+    kept = []
+    for plan in plans:
+        if _matches_superseded(plan, values, superseded):
+            plugin.logger.warning(
+                "%s: %s was not written: the value matches what an older settings window for "
+                "this device started with; reopen the settings and set it again",
+                _device_log_name(dev_id), plan.setting.label)
+        else:
+            kept.append(plan)
+    return kept
+
+
+def _connected_and_reconciled(plugin, dev_id) -> bool:
+    """Connected to matter-server AND this device's node read this run."""
+    if not _matter_connected(plugin):
+        return False
+    try:
+        node_id = indigo.devices[dev_id].pluginProps.get("nodeId")
+        return bool(plugin.device_sync.node_reconciled(int(node_id)))
+    except Exception:  # pylint: disable=broad-except
+        # cannot tell: treat as not yet reconciled (the harmless wording)
+        plugin.logger.debug("could not tell whether device %s's node was reconciled",
+                            dev_id, exc_info=True)
+        return False
+
+
+#: A remembered dialog seed older than this, found when another dialog opens on the same
+#: device, is treated as abandoned (the client crashed or dropped before closedDeviceConfigUi
+#: fired) and replaced. Judged ONLY at open: one dialog left open for an hour still saves.
+SEED_SLOT_MAX_AGE = 600.0
+
+#: How many replaced dialogs' seeds are remembered as superseded on a slot.
+SEED_SUPERSEDED_MAX = 3
+
+
+def _remember_seed(plugin, dev_id, seeds: dict) -> None:
+    """Remember what a dialog was seeded with, per device.
+
+    A SECOND open before the first closes makes the slot ambiguous - nobody can say
+    which dialog a Save is from, so neither may use the seed - unless the first is older
+    than ``SEED_SLOT_MAX_AGE``, which is taken as abandoned and replaced.
+    """
+    clock = getattr(plugin, "_seed_clock", time.monotonic)
+    now = clock()
+    slots = vars(plugin).setdefault("_dialog_seeds", {})
+    existing = slots.get(dev_id)
+    if existing is not None and now - existing["stamp"] <= SEED_SLOT_MAX_AGE:
+        existing["ambiguous"] = True
+        return
+    superseded: list = []
+    if existing is not None:
+        plugin.logger.info(
+            "%s: an unclosed settings dialog record from %.0f minutes ago was discarded",
+            _device_log_name(dev_id), (now - existing["stamp"]) / 60)
+        # The old dialog may still be open and may still be saved. Its seeds are kept
+        # (bounded) as SUPERSEDED: a field still equal to one of them is that old dialog
+        # untouched, and must not be written as if the user had chosen it.
+        superseded = [existing["seeds"], *existing.get("superseded", [])][:SEED_SUPERSEDED_MAX]
+    slots[dev_id] = {"seeds": seeds, "ambiguous": False, "stamp": now, "superseded": superseded}
+
+
+def _usable_seeds(plugin, dev_id):
+    slot = vars(plugin).get("_dialog_seeds", {}).get(dev_id)
+    return None if slot is None or slot["ambiguous"] else slot["seeds"]
 
 
 class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenuMixin,
@@ -314,11 +476,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # diagnostic below reads, rather than a second copy of the state.
             outage_expected=self._restart_expected,
         )
-        self.jobs = CommissionJobs(
-            self.matter, self.device_sync.create_from_raw, self.logger,
-            schedule=self.runtime.submit,
-            knows_node=self.device_sync.knows_node,
-        )
+        self.jobs = self._build_commission_jobs()
         self.http = HttpApi(
             self.jobs, self.logger,
             status_provider=self._status_body,
@@ -1197,6 +1355,10 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # indigo.Dict has no `pop` (issue #366)
             if "lastSurveySummary" in valuesDict:
                 del valuesDict["lastSurveySummary"]
+        # A dialog-only marker (#388), like lastSurveySummary: never a stored prop.
+        for dialog_only in ("settingsStale", "settingsErrorShown", "settingsErrorText"):
+            if dialog_only in valuesDict:
+                del valuesDict[dialog_only]
         created = ""
         try:
             created = indigo.devices[devId].pluginProps.get("createdTypeId", "")
@@ -1217,10 +1379,72 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         # sleepy Thread device is seconds and would freeze the dialog.
         if not settings_for_type(typeId):
             return (True, valuesDict)  # most types declare none — nothing to look up
+        seeds = _usable_seeds(self, devId)
+        limits = self._setting_limits_lookup(valuesDict)
+        lists = self._setting_attribute_list_lookup(valuesDict)
+        known = self._has_matter_node(valuesDict)
+        if seeds is None:
+            # The dialog's starting values are unknown (never opened since the plugin
+            # started, or two dialogs share the device): nothing can be called an
+            # edit, and closedDeviceConfigUi will write nothing. If a field looks edited
+            # while two dialogs are open, say so HERE, where the user can act on it.
+            slot = vars(self).get("_dialog_seeds", {}).get(devId)
+            if slot is not None and slot["ambiguous"]:
+                candidates = device_settings.candidate_edits(
+                    typeId, valuesDict, limits, lists, known, self._device_states(devId))
+                if candidates:
+                    errors = indigo.Dict()
+                    for setting in candidates:
+                        errors[setting.key] = (
+                            "This device's settings are open in another window, so this cannot "
+                            "be saved safely. Close both windows and reopen the device.")
+                    return (False, valuesDict, errors)
+            return (True, valuesDict)
         setting_errors = device_settings.validate_settings(
-            typeId, valuesDict, self._setting_limits_lookup(valuesDict),
-            self._setting_attribute_list_lookup(valuesDict),
-            self._has_matter_node(valuesDict))
+            typeId, valuesDict, limits, lists, known,
+            states=self._device_states(devId),
+            primed=self._setting_primed_lookup(devId), seeds=seeds)
+        # An edit that cannot be sent is refused HERE, where the user sees it, rather
+        # than failing after the dialog has closed.
+        edited = device_settings.edited_settings(typeId, valuesDict, limits, lists, known, seeds)
+        if edited:
+            if not _matter_connected(self):
+                reason = ("Not connected to matter-server, so this cannot be written now. "
+                          "Clear the field (or leave the picker as it was) to save the rest.")
+            else:
+                reachable = _unreachable_state(devId, self.logger)
+                if reachable is None:
+                    reason = ("Could not tell whether this device is reachable, so this cannot be "
+                              "written now. Clear the field (or leave the picker as it was) to "
+                              "save the rest.")
+                elif reachable:
+                    reason = ("This device is unreachable, so this cannot be written now. "
+                              "Clear the field (or leave the picker as it was) to save the rest.")
+                else:
+                    reason = ""
+            if reason:
+                for setting in edited:
+                    setting_errors[setting.key] = reason
+        # A value equal to an OLDER dialog's seed cannot be told apart from that dialog
+        # saved untouched; closedDeviceConfigUi would drop it, so refuse it here instead.
+        slot = vars(self).get("_dialog_seeds", {}).get(devId)
+        superseded = [] if slot is None else slot.get("superseded", [])
+        if superseded:
+            try:
+                planned = device_settings.planned_writes(
+                    typeId, valuesDict, self._device_states(devId), limits, lists, known,
+                    primed=self._setting_primed_lookup(devId), seeds=seeds)
+            except Exception:  # pylint: disable=broad-except
+                # closedDeviceConfigUi's backstop still drops such a value, with a warning
+                self.logger.warning("%s: could not check the settings against older windows",
+                                    _device_log_name(devId), exc_info=True)
+                planned = []
+            for plan in planned:
+                if _matches_superseded(plan, valuesDict, superseded):
+                    setting_errors.setdefault(plan.setting.key, (
+                        "This value matches what an older settings window for this device "
+                        "started with, so it cannot be told apart from a stale save. Close this "
+                        "window, reopen the settings and set it again."))
         if setting_errors:
             errors = indigo.Dict()
             for field, message in setting_errors.items():
@@ -1231,6 +1455,22 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
     # ------------------------------------------------------------------
     # Writable device settings — the Edit Device dialog (issue #186)
     # ------------------------------------------------------------------
+
+    def _setting_primed_lookup(self, dev_id):
+        """``key -> has this device's reading of that setting landed this run?``
+
+        Fails SAFE: if the answer cannot be had, a setting reads as not-yet-read
+        (blank field, nothing assumed), never as a trusted value.
+        """
+        def primed(key) -> bool:
+            try:
+                return bool(self.device_sync.setting_primed(dev_id, key))
+            except Exception as exc:  # pylint: disable=broad-except
+                # not-read is the safe answer: a blank field, not a wrong number
+                self.logger.debug("could not tell whether %s of device %s was read: %s",
+                                  key, dev_id, exc)
+                return False
+        return primed
 
     @staticmethod
     def _has_matter_node(props) -> bool:
@@ -1278,8 +1518,23 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         does not have on.
         """
         def note(setting, reason):
-            self.logger.info('device %s: "%s" not offered — %s',
-                             dev_id, setting.label, reason)
+            if (reason.startswith(device_settings.NO_ATTRIBUTE_LIST_REASON)
+                    and not _connected_and_reconciled(self, dev_id)):
+                # No reconcile has cached this device's capabilities yet (the plugin
+                # is not connected, or has not read this node since it started): that
+                # says nothing about the DEVICE, so say it once rather than per
+                # setting. Once connected and reconciled the per-setting reason below
+                # applies, so a device that never reports an AttributeList is
+                # diagnosable.
+                told = vars(self).setdefault("_settings_pending_told", set())
+                if dev_id not in told:
+                    told.add(dev_id)
+                    self.logger.info(
+                        "%s: device settings will appear once the plugin has connected "
+                        "to matter-server and read the device", _device_log_name(dev_id))
+                return
+            self.logger.info('%s: "%s" not offered — %s',
+                             _device_log_name(dev_id), setting.label, reason)
         return note
 
     def _setting_limits_lookup(self, props):
@@ -1484,13 +1739,29 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         # and no node, so device_known below is False and the section is hidden.
         # That is an explicit gate, not an emergent one — spec-bounded settings
         # resolve with no device at all and used to be offered regardless.
+        _prune_unoffered_failures(self, devId, typeId, values)
         states = self._device_states(devId)
         try:
             values.update(device_settings.config_ui_values(
                 typeId, states, self._setting_limits_lookup(values),
                 attribute_list=self._setting_attribute_list_lookup(values),
                 device_known=self._has_matter_node(values),
-                on_skip=self._log_setting_skips(devId)))
+                on_skip=self._log_setting_skips(devId),
+                primed=self._setting_primed_lookup(devId)))
+            # What this dialog was SEEDED with, remembered until it closes: a field
+            # equal to its seed is "untouched" even if the device's value moves while
+            # the dialog is open (another app), so an untouched Save never overwrites it.
+            _remember_seed(self, devId, {
+                setting.key: values.get(setting.key, "") for setting in settings_for_type(typeId)})
+            failure = str(states.get("settingsError") or "")
+            values["settingsErrorShown"] = "yes" if failure else "no"
+            values["settingsErrorText"] = failure
+            values["settingsStale"] = "no"
+            if values.get("hasAnySetting") == "yes":
+                if not _matter_connected(self):
+                    values["settingsStale"] = "server"
+                elif _is_flagged_unreachable(devId, self.logger):
+                    values["settingsStale"] = "device"
             if typeId == "matterNode":
                 # Display-only summary of settings_report's SurveyLog for THIS
                 # node (issue #204): the store stays in pluginPrefs (see
@@ -1505,6 +1776,16 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         except Exception as exc:  # pylint: disable=broad-except
             # never block the dialog over the settings section
             self.logger.exception("could not build device settings for %s: %s", devId, exc)
+            # ...and never leave an old saved value in a field an untouched Save could
+            # write: blank every setting field, hide the section, forget the seed.
+            for setting in settings_for_type(typeId):
+                values[setting.key] = ""
+                values[device_settings.marker_field(setting)] = device_settings.MARKER_NO
+            values["hasAnySetting"] = device_settings.MARKER_NO
+            values["settingsStale"] = "no"
+            values["settingsErrorShown"] = "no"
+            values["settingsErrorText"] = ""
+            vars(self).get("_dialog_seeds", {}).pop(devId, None)
         # MUST be indigo.Dict, not a plain dict — the same shape
         # getPrefsConfigUiValues returns. Returning a plain dict fails INSIDE
         # Indigo's C++ bridge, which logs
@@ -1545,9 +1826,9 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         picker) because the two degrade differently, and deliberately so. The
         action's list must always offer something — it is building an automation
         that may run long before the device is ever reachable. This one is
-        backed by the same bounds that gate the field's visibility, so when the
-        device's values are unknown the field is not shown at all and there is
-        nothing to guess about.
+        backed by the same bounds that gate the field's visibility, and while the
+        device's value has not been read it leads with a "not read yet (leave
+        unchanged)" row, so the field is never hidden and never guesses.
         """
         props = dict(valuesDict or {})
         try:
@@ -1564,8 +1845,10 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                 self._has_matter_node(props)):
             if wanted and offer.setting.key != wanted:
                 continue
-            rows = offer.setting.option_rows(
-                offer.bounds, self._device_states(targetId).get(offer.setting.key))
+            rows = device_settings.picker_rows(
+                offer, self._setting_primed_lookup(targetId),
+                current=(valuesDict or {}).get(offer.setting.key),
+                state=self._device_states(targetId).get(offer.setting.key))
             if rows is not None:
                 return rows
         return []
@@ -1578,21 +1861,41 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         that inside validateDeviceConfigUi would freeze the Indigo UI with no
         way out. By the time this runs the dialog is gone, so the round trip
         goes onto the asyncio loop and reports through the event log and the
-        device's error state instead of a dialog.
+        device's ``settingsError`` state instead of a dialog (never the device error
+        flag, which means "unreachable" and nothing else).
 
         The consequence worth knowing: a failure surfaces AFTER the dialog has
-        closed. It is logged as an error, the device is marked in error, and
-        because the dialog re-seeds from device state on every open, reopening
-        it shows what the device actually holds — never the value that failed.
+        closed. It is logged as an error, recorded in ``settingsError`` (shown when the
+        dialog next opens), and because the dialog re-seeds from device state on every
+        open, reopening it shows what the device actually holds — never the value that
+        failed.
         """
+        # The remembered seed is spent either way (Save or Cancel).
+        slot = vars(self).get("_dialog_seeds", {}).pop(devId, None)
+        seeds = None if slot is None or slot["ambiguous"] else slot["seeds"]
+        superseded = [] if slot is None else slot.get("superseded", [])
         if userCancelled or not settings_for_type(typeId):
+            return
+        if seeds is None:
+            # Nothing can be called an edit without the values the dialog started
+            # with: planning against the device's state or saved props could write a
+            # value the user never chose. Say so only if a setting field has content.
+            if device_settings.candidate_edits(
+                    typeId, valuesDict, self._setting_limits_lookup(valuesDict),
+                    self._setting_attribute_list_lookup(valuesDict),
+                    self._has_matter_node(valuesDict), self._device_states(devId)):
+                self.logger.warning(
+                    "%s: the dialog's starting values were not available (it was reopened "
+                    "or the plugin restarted), so no setting was written - please reopen the dialog "
+                    "and change the setting again", _device_log_name(devId))
             return
         try:
             plans = device_settings.planned_writes(
                 typeId, valuesDict, self._device_states(devId),
                 self._setting_limits_lookup(valuesDict),
                 self._setting_attribute_list_lookup(valuesDict),
-                self._has_matter_node(valuesDict))
+                self._has_matter_node(valuesDict),
+                primed=self._setting_primed_lookup(devId), seeds=seeds)
         except Exception as exc:  # pylint: disable=broad-except
             # Absorbing: anything planned_writes() raises while working out what the
             # dialog changed. Safe because it aborts having submitted NOTHING, which is
@@ -1600,14 +1903,20 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # become a burst of writes to a possibly battery-powered device (the
             # failure _device_states' docstring describes). No test drives this arm
             # (#310 audit).
-            self.logger.exception("could not work out device setting changes: %s", exc)
+            self.logger.exception("%s: could not work out device setting changes: %s",
+                                  _device_log_name(devId), exc)
             return
+        plans = _drop_superseded(self, devId, valuesDict, plans, superseded)
         if not plans:
             return
-        if self.runtime is None or self.matter is None:
+        if self.runtime is None or not _matter_connected(self):
+            # Refused up front: a write that can only fail would also replace the
+            # device's "unreachable" flag with "setting failed". (Validation refuses
+            # an unsendable edit first; this is the backstop.)
             self.logger.error(
-                "cannot apply device settings — the Matter connection is not running; "
-                "no setting was changed")
+                "%s: cannot apply device settings (%s) — the plugin is NOT connected to "
+                "matter-server (the Matter connection is not running); nothing was written",
+                _device_log_name(devId), ", ".join(plan.setting.label for plan in plans))
             return
         if not self._has_matter_node(valuesDict):
             # Belt-and-braces: planned_writes is already gated on the same
@@ -1616,12 +1925,12 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # callback, with no user-facing message and the remaining plans
             # abandoned.
             self.logger.error(
-                "cannot apply device settings — device %s has no Matter node yet", devId)
+                "%s: cannot apply device settings — it has no Matter node yet", _device_log_name(devId))
             return
         node_id = int(valuesDict.get("nodeId"))
         endpoint_id = int(valuesDict.get("endpointId"))
         for plan in plans:
-            self.runtime.submit(self._apply_setting(node_id, endpoint_id, int(devId), plan))
+            _submit_setting_write(self, node_id, endpoint_id, int(devId), plan)
 
     def _device_states(self, dev_id) -> dict:
         """This device's states, or {} if it has none we can read.
@@ -1650,33 +1959,61 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
 
         Runs on the asyncio loop, so the STATE write goes through
         ``device_sync.apply_states`` — the same discipline the attribute
-        firehose and the export bridge's command dispatch already use. The error
-        flag is set directly, as ``device_sync``'s own ``_safe_unreachable`` /
-        ``_clear_error`` do from the same thread; the seam rule covers
-        ``updateStatesOnServer``, not every Indigo call.
+        firehose and the export bridge's command dispatch already use. The device
+        error flag is NEVER set here: it means "unreachable" and nothing else, so a
+        failure is recorded on the ``settingsError`` state instead.
         """
         label = plan.setting.label
         observed: list = []
+        cause: list = []
+        who = _device_log_name(dev_id)
+        try:
+            # The device's own resolved bounds name a picker's options in the log line
+            # ("High (most sensitive)", not "2"); unknown bounds fall back to the number.
+            bounds = plan.setting.resolve_bounds(
+                lambda cluster, attribute: self.device_sync.setting_limits(
+                    node_id, endpoint_id, cluster, attribute))
+        except Exception:  # pylint: disable=broad-except
+            # a display nicety: never stops the write
+            self.logger.debug("%s: could not resolve bounds for %s's log text", who, label,
+                              exc_info=True)
+            bounds = None
         try:
             ok, message = await device_settings.apply_setting(
                 self.matter, node_id, endpoint_id, plan,
-                on_observed=observed.append)
+                on_observed=observed.append, on_cause=cause.append, bounds=bounds)
         except Exception as exc:  # pylint: disable=broad-except
             # a crash here must not kill the loop
-            self.logger.exception('"%s" could not be applied: %s', label, exc)
+            self.logger.exception('%s: "%s" could not be applied: %s', who, label, exc)
+            # The user asked for a change and nothing says it did not happen: record it,
+            # and since we do not know what the device holds, the setting is unread again.
+            try:
+                self.device_sync.mark_setting_unread(dev_id, plan.setting.key)
+            except Exception as inner:  # pylint: disable=broad-except
+                # bookkeeping after a crash must not itself escape
+                self.logger.warning("%s: could not mark %s unread (%s)", who, label, inner)
+            _record_setting_outcome(self, dev_id, plan, "the write failed unexpectedly, see the event log")
             return
         if ok:
-            self.logger.info("%s", message)
+            self.logger.info("%s: %s", who, message)
             # The read-back already proved this value is on the device, so this
             # is a confirmed write-through, not the optimistic echo the #85
             # action does. apply_states also clears any stale error flag.
-            self.device_sync.apply_states(dev_id, [{"key": plan.setting.key,
-                                                    "value": plan.value}])
+            try:
+                self.device_sync.apply_states(dev_id, [{"key": plan.setting.key,
+                                                        "value": plan.value}])
+            except Exception as exc:  # pylint: disable=broad-except
+                # the write succeeded on the DEVICE; only Indigo's state could not follow
+                self.logger.error(
+                    '%s: "%s" took the value on the device, but Indigo\'s state could not be '
+                    "updated (%s) - it will correct itself at the next report", who, label, exc)
+            # the device holds the value, so an older failure sentence is out of date
+            _record_setting_outcome(self, dev_id, plan, None)
             return
-        self.logger.error("%s", message)
+        self.logger.error("%s: %s", who, message)
+        # The device error flag is for REACHABILITY ONLY: a failed setting write never sets
+        # (or replaces) it. The failure is recorded on the setting's own settingsError state.
         try:
-            dev = indigo.devices[dev_id]
-            dev.setErrorStateOnServer("setting failed")
             # A mismatch means the read-back told us what the device ACTUALLY
             # holds. Recording it keeps the dialog honest on next open — it
             # re-seeds from state, so leaving the stale value would show the
@@ -1687,21 +2024,40 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # (neither the stale value nor the one asked for).
             actual = observed[0] if observed else None
             if actual is not None or (observed and plan.setting.null_state is not None):
-                self.device_sync.apply_states(dev_id, [plan.setting.state_entry(actual)])
-        except KeyError:
-            # The device was deleted between the dialog closing and this
-            # running on the loop — routine, and there is nothing left to
-            # flag or to keep honest.
-            self.logger.debug("could not flag failed setting: device %s is gone", dev_id)
+                # Written without clearing the error: whatever flag the device has
+                # (reachability) is not ours to clear.
+                self.device_sync.apply_states(
+                    dev_id, [plan.setting.state_entry(actual)], clear_error=False)
+            else:
+                # No answer at all, or a null for a setting with no null state: the state
+                # still holds the old value and nothing confirms it, so it is unread again.
+                self.device_sync.mark_setting_unread(dev_id, plan.setting.key)
         except Exception as exc:  # pylint: disable=broad-except
-            # NOT gone: the device exists and the flag/state write failed, so
+            # (A genuinely deleted device is handled inside the state writers; a KeyError
+            # reaching here is a bug and must not skip recording the failure.)
+            # The state write failed, so
             # the dialog will re-seed from state and show a setting the device
-            # never adopted — the exact divergence the comment above says this
-            # write exists to prevent. The write failure was already reported
+            # never adopted. The write failure was already reported
             # to the user at ERROR; this says the record of it did not stick.
             self.logger.warning(
-                "the setting failure on device %s could not be recorded (%s) — the device's "
-                "settings dialog may show a value the device never adopted", dev_id, exc)
+                "%s: the setting failure could not be recorded (%s) — the device's "
+                "settings dialog may show a value the device never adopted", who, exc)
+        _record_setting_outcome(self, dev_id, plan, cause[0] if cause else "the write failed")
+
+    def _server_is_managed(self) -> bool:
+        """Does this plugin run matter-server itself? (``server_process`` None = it
+        does not: LaunchAgent management is off.) Asked at failure time, not at
+        construction, so switching management off later is honoured."""
+        return self.server_process is not None
+
+    def _build_commission_jobs(self):
+        """The commissioning job table, wired to this plugin's own collaborators."""
+        return CommissionJobs(
+            self.matter, self.device_sync.create_from_raw, self.logger,
+            schedule=self.runtime.submit,
+            knows_node=self.device_sync.knows_node,
+            managed=self._server_is_managed,
+        )
 
     def deviceStartComm(self, dev):  # noqa: N802
         # Indigo builds a device's state list at creation and does NOT re-read
@@ -1734,6 +2090,24 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             )
         self.device_sync.note_device(dev)
         self.device_sync.set_active(dev.id, True)
+        # The state list was refreshed above, so any setting state a release
+        # introduced exists now - but a reconcile may already have tried to prime it
+        # and been dropped by the handler's "state exists?" guard. Re-prime from the
+        # cached readings, then show "unknown" for whatever is still unread (Indigo's
+        # bare 0 would look like a value; ADR-0007's uiValue convention). A cosmetic,
+        # self-healing step: it must never stop a device starting.
+        try:
+            self.device_sync.reprime_settings(dev)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning(
+                "could not re-prime the setting states of device %s (%s)", dev.id, exc,
+                exc_info=True)
+        try:
+            self.device_sync.flag_unread_settings(dev)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning(
+                "could not flag the unread setting states of device %s (%s)", dev.id, exc,
+                exc_info=True)
         if dev.deviceTypeId == "matterRelay":
             self._prime_retired_on_time_state(dev)
         if dev.deviceTypeId == "matterNode":
@@ -2060,7 +2434,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         except (TypeError, ValueError):
             pass
         plan = device_settings.PlannedWrite(_SENSITIVITY_SETTING, level, previous)
-        self.runtime.submit(self._apply_setting(int(node_id), int(endpoint_id), dev.id, plan))
+        _submit_setting_write(self, int(node_id), int(endpoint_id), dev.id, plan)
 
     def actionReportNodeSettings(self, action, dev):  # noqa: N802, ARG002
         """Device-targeted twin of the "Report settable Matter settings…" menu

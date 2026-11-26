@@ -1132,3 +1132,71 @@ def test_the_settings_registry_agrees_with_the_generated_table():
         assert attribute in table.WRITABLE_ATTRIBUTES.get(cluster, frozenset()), (
             f"{attribute_label(cluster, attribute)} on {cluster_label(cluster)} is declared "
             f"as a DeviceSetting but the Matter data model does not call it writable")
+
+
+# ---------------------------------------------------------------------------
+# DoorLock settings — issue #368
+# ---------------------------------------------------------------------------
+
+#: The Aqara U500's settable DoorLock attributes, as its reporter dumped them.
+_LOCK_LIST = [0x0000, 0x0023, 0x0025, 0x0030, 0x0031, 0x0033, ATTR_ATTRIBUTE_LIST]
+_LOCK_SETTINGS = {(CLUSTER_DOOR_LOCK, 0x0023), (CLUSTER_DOOR_LOCK, 0x0030),
+                  (CLUSTER_DOOR_LOCK, 0x0031)}
+_REQUIRE_PIN = (CLUSTER_DOOR_LOCK, 0x0033)
+
+
+def lock_node(listed=None, **kwargs) -> NodeInfo:
+    return node({
+        (1, CLUSTER_DOOR_LOCK, 0x0000): 1,
+        (1, CLUSTER_DOOR_LOCK, ATTR_ATTRIBUTE_LIST): list(_LOCK_LIST if listed is None else listed),
+    }, vendor="Aqara", product="Smart Gate Lock U500", **kwargs)
+
+
+def test_the_three_offered_lock_settings_are_no_longer_reported_as_gaps():
+    survey = survey_node(lock_node(), lambda ep: _LOCK_SETTINGS)
+    assert not (reported(survey) & _LOCK_SETTINGS)
+
+
+def test_operating_mode_is_still_reported_as_a_gap():
+    """Separate work (needs SupportedOperatingModes) — the report keeps saying so."""
+    survey = survey_node(lock_node(), lambda ep: _LOCK_SETTINGS)
+    assert (CLUSTER_DOOR_LOCK, ATTR_OPERATING_MODE) in reported(survey)
+
+
+def test_require_pin_for_remote_operation_is_never_reported_so_nobody_is_invited_to_ask():
+    """The plugin locks/unlocks without a PIN: enabling this would cut Indigo off
+    from the lock. The report must not list it, whether or not anything is offered."""
+    for offered in (None, lambda ep: _LOCK_SETTINGS):
+        survey = survey_node(lock_node(), offered)
+        assert _REQUIRE_PIN not in reported(survey)
+        text = "\n".join(report_lines(survey))
+        assert "RequirePinForRemoteOperation" not in text
+        assert "0x0033" not in text
+
+
+def test_a_lock_with_only_the_excluded_attribute_reports_nothing_at_all():
+    survey = survey_node(lock_node([0x0000, 0x0033, ATTR_ATTRIBUTE_LIST]))
+    assert survey.endpoints == ()
+    assert report_lines(survey) == []
+
+
+def test_the_exclusion_list_is_reasoned_and_does_not_overlap_the_other_filters():
+    excluded = settings_report.DELIBERATELY_NOT_OFFERED
+    assert _REQUIRE_PIN in excluded
+    assert all(isinstance(reason, str) and len(reason) > 40 for reason in excluded.values())
+    assert not (set(excluded) & set(settings_report.NOT_SETTINGS))
+    assert not (set(excluded) & set(settings_report.REVIEWED_COMMAND_FIELD_COLLISIONS))
+    from matter_handlers.settings import SETTINGS
+    assert not (set(excluded) & {(s.cluster, s.attribute) for s in SETTINGS})
+    # …and each one is a real, writable attribute — not a typo that excludes nothing.
+    from matter_handlers.writable_attributes import WRITABLE_ATTRIBUTES
+    for cluster, attribute in excluded:
+        assert attribute in WRITABLE_ATTRIBUTES[cluster]
+
+
+def test_the_explorer_still_shows_the_excluded_attribute():
+    """The report is quiet by design; the explorer is complete (ADR-0004)."""
+    held = lock_node()
+    held.attributes[(1, CLUSTER_DOOR_LOCK, 0x0033)] = False
+    text = "\n".join(explore_lines(held))
+    assert "RequirePinForRemoteOperation (0x0033) [writable] = false" in text

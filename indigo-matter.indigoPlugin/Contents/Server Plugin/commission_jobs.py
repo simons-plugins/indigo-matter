@@ -62,6 +62,44 @@ RETENTION = timedelta(minutes=15)
 # jobs. Must be < RETENTION or the job may be reaped before it can reconcile.
 RECONCILE_WINDOW = timedelta(minutes=5)
 
+#: matter-server's wording when its mDNS discovery heard nothing (issue #368).
+#: Matched case-insensitively and as a substring: matter-server wraps it in
+#: "Commission failed: discovery of node with discriminator N failed: …" and gives
+#: the error an ordinary code (1) that other failures share, so the phrase is the
+#: only thing that tells this failure apart.
+NO_DEVICE_DISCOVERED_PHRASE = "no commissionable device was discovered"
+
+#: The Plugins menu item the hint points at — must match MenuItems.xml's <Name>
+#: for restartMatterServer exactly (a test pins that).
+RESTART_MENU_ITEM = "Restart the Matter controller"
+
+NO_DEVICE_DISCOVERED_HINT = (
+    " Hint: if the device is powered and reachable on this network, a long-running "
+    "matter-server may have stopped hearing it. Restart it with Plugins \u25b8 Matter "
+    f"\u25b8 {RESTART_MENU_ITEM}, then retry with a fresh pairing code."
+)
+
+#: The same hint when the plugin does NOT manage matter-server (LaunchAgent management
+#: off / remote): that menu item only logs a warning there, so point at the real act.
+NO_DEVICE_DISCOVERED_HINT_REMOTE = (
+    " Hint: if the device is powered and reachable on this network, a long-running "
+    "matter-server may have stopped hearing it; restart matter-server on the machine "
+    "that runs it (this plugin does not manage it), then retry with a fresh pairing code."
+)
+
+
+def with_discovery_hint(message: str, managed: bool = True) -> str:
+    """*message*, plus the restart hint when it is the "no device discovered" failure.
+
+    ``managed`` is whether this plugin runs matter-server (the menu item only works
+    then). Every other commissioning failure is returned untouched. Only advice is
+    added - nothing is restarted automatically.
+    """
+    if NO_DEVICE_DISCOVERED_PHRASE in message.lower():
+        return message + (NO_DEVICE_DISCOVERED_HINT if managed else NO_DEVICE_DISCOVERED_HINT_REMOTE)
+    return message
+
+
 TIMEOUT_MESSAGE = (
     f"matter-server did not finish commissioning within {COMMISSION_TIMEOUT:.0f}s; "
     "the device may still join — check Indigo before retrying. Common causes: the "
@@ -283,6 +321,7 @@ class CommissionJobs:
         uuid_factory: Callable[[], str] = lambda: str(uuid.uuid4()),
         knows_node: Optional[Callable[[Any], bool]] = None,
         sleep: Callable[[float], Awaitable] = asyncio.sleep,
+        managed: Callable[[], bool] = lambda: True,
     ) -> None:
         self.matter = matter
         self._create_devices = create_devices
@@ -292,6 +331,8 @@ class CommissionJobs:
         self._uuid = uuid_factory
         self._knows_node = knows_node
         self._sleep = sleep
+        # Whether the plugin runs matter-server itself (decides which restart hint is true).
+        self._managed = managed
         self._lock = threading.Lock()
         self._jobs: dict[str, Job] = {}
         self._by_code: dict[str, str] = {}
@@ -689,9 +730,9 @@ class CommissionJobs:
             # what it reports about WHY changes.
             new_error = {
                 "code": "commissioning_failed",
-                "message": (
+                "message": with_discovery_hint(
                     "matter-server reported the commission failed after the "
-                    f"plugin stopped waiting: {details}"
+                    f"plugin stopped waiting: {details}", self._managed()
                 ),
             }
             matter_error_code = opt_int(code)
@@ -702,7 +743,7 @@ class CommissionJobs:
                 "commission job %s: matter-server's late answer says the "
                 "commission actually failed (%s: %s) — the recorded error has "
                 "been updated even though the job already timed out",
-                job.job_id, code, details,
+                job.job_id, code, new_error["message"],
             )
         elif job.status is SUCCESS:
             # The job already reached success by another path (a timely commission,
@@ -868,6 +909,7 @@ class CommissionJobs:
             finally:
                 with self._lock:
                     self._removing.discard(_node_key(node_id))
+        message = with_discovery_hint(message, self._managed())
         error = {"code": code, "message": message}
         if matter_error_code is not None:
             error["matterErrorCode"] = matter_error_code

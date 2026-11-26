@@ -628,3 +628,13 @@ def test_delete_node_of_the_old_node_deletes_nothing_afterwards(ds, coffee):
     assert asked == []
     assert coffee.old_node.id in coffee.devices._by_id
     assert coffee.old_relay.id in coffee.devices._by_id
+
+
+def test_replace_drops_the_rebound_devices_primed_entries(ds, coffee):
+    """Issue #368 (PR #388): a setting read from the OLD node must not stay "read"
+    after the device is rebound onto the new one - the new node's readings are the
+    ones to trust."""
+    ds._settings_primed.add((coffee.old_relay.id, "startUpOnOff"))
+    ds._settings_primed.add((coffee.new_relay.id, "startUpOnOff"))     # the deleted duplicate's
+    ds.replace_node(coffee.plan)
+    assert not ds.setting_primed(coffee.old_relay.id, "startUpOnOff")
