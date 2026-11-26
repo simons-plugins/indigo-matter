@@ -3,6 +3,7 @@
  * the real ws-server with the Matter node stubbed out.
  */
 
+import { matterJsVersion } from "../src/node.js";
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 
@@ -12,7 +13,7 @@ import { TestClient } from "./client.js";
 import { golden, StubBridge } from "./stub-bridge.js";
 
 const BRIDGE_VERSION = "0.1.0-test";
-const MATTER_JS_VERSION = "0.17.8";
+const MATTER_JS_VERSION = matterJsVersion; // echoed through the stub; tracks the installed matter.js
 
 /** The paired ecosystem the populated golden statuses assume. */
 const APPLE_HOME = { fabricIndex: 1, label: "Apple Home", vendorId: 4937 };
