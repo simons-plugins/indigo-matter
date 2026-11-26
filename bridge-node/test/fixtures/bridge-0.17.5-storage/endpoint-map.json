@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "endpoints": {
+    "indigo-111": {
+      "number": 2,
+      "role": "onOffLight",
+      "label": "Fixture Lamp",
+      "deviceId": 111
+    },
+    "indigo-222": {
+      "number": 3,
+      "role": "dimmableLight",
+      "label": "Fixture Dimmer",
+      "deviceId": 222
+    }
+  }
+}

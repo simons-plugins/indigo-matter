@@ -1050,6 +1050,31 @@ class TestIncrementalCrud:
         h.bridge.upsert(102)
         assert "not exported until the next reconnect/attach" in warnings_of(mock_logger)
 
+    def test_a_failed_upsert_forgets_what_was_recorded_as_pushed(self, bridge_mod, mock_logger, devices):
+        """The spec built for the upsert seeded `_pushed`; if it never landed, the next
+        diff must measure from nothing so it re-sends the lot instead of a delta."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        h.start()
+        assert 102 in h.bridge._pushed
+        h.client.fail["upsert_endpoint"] = ConnectionError("socket died mid-write")
+        h.bridge.upsert(102)
+        assert 102 not in h.bridge._pushed
+
+    def test_an_upsert_whose_endpoint_went_live_does_not_claim_it_is_not_exported(
+            self, bridge_mod, mock_logger, devices):
+        """#355: the node creates the endpoint, then fails applying its states. The
+        accessory EXISTS — "not exported until the next reconnect" is false there."""
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(102, "dimmableLight")])
+        h.start()
+        h.client.fail["upsert_endpoint"] = bridge_protocol.BridgeProtocolError(
+            bridge_protocol.ERR_INTERNAL,
+            f"device 102 (dimmableLight): {bridge_protocol.STATE_NOT_APPLIED_PHRASE} and it may show stale state")
+        h.bridge.upsert(102)
+        warned = warnings_of(mock_logger)
+        assert "not exported until the next reconnect/attach" not in warned
+        assert "may be live" in warned and "stale" in warned
+        assert 102 not in h.bridge._pushed, "the next diff must re-send the state that did not land"
+
     def test_upsert_of_an_unbridgeable_export_sends_nothing(self, bridge_mod, mock_logger,
                                                             devices, unbridgeable_role):
         h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(101, unbridgeable_role)])
@@ -1150,6 +1175,69 @@ def _attached_status():
         "commissioned": True, "fabrics": [], "endpointCount": 0,
         "endpoints": [], "drift": [], "driftChecked": True,
     })
+
+
+class TestBridgeVersionDrift:
+    """The running bridge node vs the pin in `bridge_agent.DEFAULT_INSTALL_SPEC` (like #75 for matter-server)."""
+
+    def _attach(self, h, version):
+        h.client.hello = None if version is None else bridge_protocol.Hello(
+            protocol_version=bridge_protocol.PROTOCOL_VERSION, bridge_version=version,
+            matter_js_version="0.18.0")
+        h.bridge._on_attached(_attached_status())
+
+    def _pinned(self, bridge_mod):
+        import bridge_agent
+        return bridge_agent.DEFAULT_INSTALL_SPEC.split("@", 1)[1]
+
+    def test_an_older_bridge_warns_naming_the_menu_item_that_updates_it(
+            self, bridge_mod, mock_logger, devices):
+        import bridge_agent
+        h = Harness(bridge_mod, mock_logger, devices)
+        h.start()
+        self._attach(h, "0.0.1")
+        said = warnings_of(mock_logger)
+        assert "0.0.1" in said and self._pinned(bridge_mod) in said
+        assert bridge_agent.BRIDGE_INSTALL_MENU in said
+
+    def test_it_warns_once_per_streak_not_once_per_attach(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices)
+        h.start()
+        self._attach(h, "0.0.1")
+        self._attach(h, "0.0.1")
+        assert mock_logger.warning.call_count == 1
+
+    def test_a_new_connection_streak_warns_again(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices)
+        h.start()
+        self._attach(h, "0.0.1")
+        h.bridge._on_unreachable(5)
+        mock_logger.warning.reset_mock()
+        self._attach(h, "0.0.1")
+        assert "0.0.1" in warnings_of(mock_logger)
+
+    def test_an_equal_bridge_says_nothing(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices)
+        h.start()
+        self._attach(h, self._pinned(bridge_mod))
+        assert "bridge node is" not in warnings_of(mock_logger) + infos_of(mock_logger)
+        assert mock_logger.warning.call_count == 0
+
+    def test_a_newer_bridge_is_one_info_not_a_warning(self, bridge_mod, mock_logger, devices):
+        h = Harness(bridge_mod, mock_logger, devices)
+        h.start()
+        self._attach(h, "99.0.0")
+        assert mock_logger.warning.call_count == 0
+        assert "99.0.0" in infos_of(mock_logger)
+
+    @pytest.mark.parametrize("version", [None, "", "garbage"])
+    def test_a_missing_or_malformed_version_is_a_debug_line_not_a_warning_or_a_crash(
+            self, bridge_mod, mock_logger, devices, version):
+        h = Harness(bridge_mod, mock_logger, devices)
+        h.start()
+        self._attach(h, version)
+        assert mock_logger.warning.call_count == 0
+        assert "version" in debugs_of(mock_logger)
 
 
 class TestConfirmedDeletedSweep:
@@ -1371,6 +1459,26 @@ class TestOnCommand:
                     [ExportEntry(123456789, "onOffLight")])
         self._deliver(h, "command_on_off")
         mock_indigo_base.device.turnOn.assert_called_once_with(devices[123456789])
+
+    def test_a_node_raised_off_for_a_lost_countdown_is_executed_and_named_in_the_indigo_log(
+            self, bridge_mod, mock_logger, devices, mock_indigo_base):
+        """#203/D: nobody could tell why a light went off — the reason lived in the node log."""
+        devices.add(RelayDevice(123456789, "Golden Plug"))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(123456789, "onOffLight")])
+        self._deliver(h, "command_on_off_countdown_lost")
+        mock_indigo_base.device.turnOff.assert_called_once_with(devices[123456789])
+        said = infos_of(mock_logger)
+        assert 'turning "Golden Plug" off' in said
+        assert "timed-on countdown was lost when the bridge node restarted" in said
+
+    def test_an_ordinary_off_command_says_nothing_extra(self, bridge_mod, mock_logger, devices,
+                                                        mock_indigo_base):
+        devices.add(RelayDevice(123456789, "Golden Plug"))
+        h = Harness(bridge_mod, mock_logger, devices, [ExportEntry(123456789, "onOffLight")])
+        h.bridge.on_command(bridge_protocol.BridgeCommand(
+            indigo_device_id=123456789, command="onOff", args={"value": False}))
+        mock_indigo_base.device.turnOff.assert_called_once_with(devices[123456789])
+        assert "countdown" not in infos_of(mock_logger)
 
     def test_a_set_level_command_reaches_the_device(self, bridge_mod, mock_logger, devices,
                                                     mock_indigo_base):
@@ -1904,6 +2012,18 @@ class TestSilentFailures:
         for _ in range(10):
             h.bridge._on_attach_refused(bridge_protocol.ERR_INTERNAL, "node is confused")
         assert mock_logger.error.call_count == 1
+
+    def test_a_refused_attach_whose_endpoints_went_live_does_not_say_nothing_is_exported(
+            self, bridge_mod, mock_logger, devices):
+        """#355: an `internal` attach error from a create-time applyStates failure is
+        raised AFTER the endpoint was added and without rolling it back."""
+        h = self._bridge(bridge_mod, mock_logger, devices)
+        h.bridge._on_attach_refused(
+            bridge_protocol.ERR_INTERNAL,
+            f"device 7 (onOffLight): {bridge_protocol.STATE_NOT_APPLIED_PHRASE} and it may show stale state")
+        said = errors_of(mock_logger)
+        assert "Nothing is being exported" not in said
+        assert "may be live" in said and "stale" in said and "device 7" in said
 
     def test_a_terminal_refusal_is_still_said_every_time(self, bridge_mod, mock_logger, devices):
         """Terminal refusals do not loop, and each one is a distinct decision."""

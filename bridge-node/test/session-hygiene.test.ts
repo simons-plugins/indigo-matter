@@ -59,6 +59,19 @@ describe("supersededSessions (issue #283, the superseded sweep)", () => {
         assert.equal(closure!.ageMs, 30_000);
     });
 
+    it("reports a whole-millisecond age from matter.js 0.18's fractional monotonic timestamps", () => {
+        // `Session.createdAt` is `Time.nowUs`: a monotonic, sub-millisecond
+        // value (performance.now() + timeOrigin), not whole epoch ms. Only
+        // the DIFFERENCE is meaningful, and it is logged as "<n>ms old".
+        const peerSessions = [
+            session({ sessionId: 1, createdAt: NOW + 0.25 }),
+            session({ sessionId: 2, createdAt: NOW + 30_000.75 }),
+        ];
+        const [closure] = supersededSessions(peerSessions, 2);
+        assert.equal(closure!.ageMs, 30_001);
+        assert.ok(Number.isInteger(closure!.ageMs));
+    });
+
     it("returns nothing when the just-opened session is not in the array", () => {
         // The caller-side inconsistency case: the event fired for a session
         // that has since closed. Must degrade to "nothing to sweep", not throw.

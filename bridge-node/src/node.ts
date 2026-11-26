@@ -23,19 +23,24 @@
 import { join } from "node:path";
 
 import {
+    CommissioningServer,
     Endpoint,
     Environment,
+    Lifecycle,
+    Seconds,
     ServerNode,
     UninitializedDependencyError,
     VendorId,
     version as matterJsVersion,
 } from "@matter/main";
 import { BasicInformationServer } from "@matter/main/behaviors/basic-information";
+import { AdministratorCommissioning } from "@matter/main/clusters/administrator-commissioning";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
 import { Crypto } from "@matter/main";
 import {
     DeviceCommissioner,
     FabricManager,
+    FailsafeContext,
     type NodeSession,
     PaseClient,
     PaseServer,
@@ -50,6 +55,7 @@ import {
 
 import { ChurnDetector, churnWarning } from "./churn.js";
 import type { BridgeConfig } from "./config.js";
+import { CountdownStore } from "./countdowns.js";
 import { ENDPOINT_MAP_FILE, EndpointMapStore, type LiveEndpointNumber, refuseReasonFor } from "./endpoint-map.js";
 import { type BridgedIdentity, isSupportedRole } from "./endpoints.js";
 import {
@@ -242,6 +248,11 @@ export async function settlePairingRead(
 
 export { matterJsVersion };
 
+/** `AdministratorCommissioning.CommissioningWindowStatus.WindowNotOpen`. */
+const WINDOW_NOT_OPEN = AdministratorCommissioning.CommissioningWindowStatus.WindowNotOpen;
+/** How often an uncommissioned node checks it is still advertising (see {@link BridgeNode.ensureCommissionable}). */
+const COMMISSIONABLE_CHECK_MS = 60_000;
+
 export class BridgeNode implements BridgeFacade {
     #server?: ServerNode;
     #registry?: EndpointRegistry;
@@ -253,7 +264,10 @@ export class BridgeNode implements BridgeFacade {
     /** Last observed fabric count — what turns a change into a §5 transition. */
     #fabricCount = 0;
     readonly #window: CommissioningWindow;
+    #reopening = false;
+    #commissionableCheck?: NodeJS.Timeout;
     readonly #endpointMap: EndpointMapStore;
+    readonly #countdowns: CountdownStore;
     /** The identity, rebound by {@link markCommissioned}/{@link clearCommissioned}. */
     #identity: BridgeIdentity;
     /** Why we are refusing everything but the §1.1 recovery trio, if we are. */
@@ -355,6 +369,7 @@ export class BridgeNode implements BridgeFacade {
         this.#identity = identity;
         this.#refusal = initialRefusal;
         this.#endpointMap = new EndpointMapStore(config.storagePath, message => this.log(message));
+        this.#countdowns = new CountdownStore(config.storagePath, message => this.log(message));
         this.#window = new CommissioningWindow({
             log: message => this.log(message),
             onExpire: () => this.endMatterCommissioning(),
@@ -426,6 +441,12 @@ export class BridgeNode implements BridgeFacade {
         // teardown is wrong in either order, hence opting out rather than
         // relying on the sequence.
         environment.vars.set("runtime.signals", false);
+        // matter.js 0.18 validates every endpoint's device type against its conformance rules,
+        // in the mode `endpoint.validation` names ("warn" by default, "strict" refuses). Pinned
+        // here rather than inherited: the mains smoke/CO endpoint is built without Power Source
+        // and is logged, not refused, ONLY in "warn" — a strict default (or a stray
+        // MATTER_ENDPOINT_VALIDATION) would fail it, and with it every attach.
+        environment.vars.set("endpoint.validation", "warn");
 
         const server = await ServerNode.create({
             id: "indigo-matter-bridge",
@@ -465,6 +486,16 @@ export class BridgeNode implements BridgeFacade {
             bridgeIdentity: this.bridgedIdentity,
             log: message => this.log(message),
             emit: data => this.#command?.(data),
+            // #203 — markers live in their own `countdowns.json`, deliberately NOT in the
+            // endpoint map (the identity witness), and a failed recovery goes out through `warnings`.
+            countdowns: this.#countdowns,
+            warn: (key, message) => {
+                if (message === undefined) {
+                    this.#warnings.delete(key);
+                } else {
+                    this.#warnings.set(key, message);
+                }
+            },
             onConfigurationChange: () => this.bumpConfigurationVersion(),
         });
 
@@ -488,6 +519,12 @@ export class BridgeNode implements BridgeFacade {
         // Before the stack goes online, so the answer is available the moment a
         // client can ask — and so the log reads in the order things happened.
         this.#endpointMap.load();
+        this.#countdowns.load();
+        // An unreadable map loads as EMPTY and says nothing about which endpoints exist, so pruning against it
+        // would wipe every marker.
+        if (this.#endpointMap.problem === undefined) {
+            this.#countdowns.prune(this.#endpointMap.uniqueIds());
+        }
 
         // …and before `server.start()`, which is the whole of issue #141: the
         // aggregator must already have its children the first time a controller
@@ -495,6 +532,12 @@ export class BridgeNode implements BridgeFacade {
         await this.restoreEndpoints();
 
         await server.start();
+
+        this.#commissionableCheck = setInterval(
+            () => void this.ensureCommissionable(),
+            this.config.commissionableCheckMs ?? COMMISSIONABLE_CHECK_MS,
+        );
+        this.#commissionableCheck.unref?.();
 
         // After `start()`: SessionManager is only in the environment once the
         // node is online, and a detector wired before it would be born broken.
@@ -1645,6 +1688,96 @@ export class BridgeNode implements BridgeFacade {
     }
 
     /**
+     * The node's DeviceCommissioner, if one exists right now — NEVER constructing one. `env.get` on a
+     * missing service builds a fresh instance (or throws UnsupportedDependencyError), and during `erase()`
+     * matter.js tears the commissioner down and rebuilds it, so a read that went through `get` there either
+     * threw an error `settlePairingRead` does not retry or manufactured a stray commissioner and answered
+     * "closed" (#133). `#server`, not the `server` getter: a plain read of the live node, and a subclass that
+     * narrows `server` (the churn-wiring test double) is about the session layer, not this.
+     */
+    private commissioner(): DeviceCommissioner | undefined {
+        const server = this.#server;
+        if (server === undefined || !server.lifecycle.isOnline) {
+            return undefined;
+        }
+        return server.env.maybeGet(DeviceCommissioner);
+    }
+
+    /**
+     * Whether matter.js's commissioning window is open right now (any kind, whoever opened it). Throws the
+     * retryable {@link UninitializedDependencyError} when the node is offline or has no commissioner (an erase
+     * in progress), exactly as the state read here did before 0.18.
+     */
+    private windowOpen(): boolean {
+        const commissioner = this.commissioner();
+        if (commissioner === undefined) {
+            throw new UninitializedDependencyError("indigo-matter-bridge", "is not initialized");
+        }
+        return commissioner.windowStatus !== WINDOW_NOT_OPEN;
+    }
+
+    /**
+     * Keep an UNCOMMISSIONED bridge pairable. matter.js 0.18 actually starts the timer on the basic
+     * window a node opens itself (0.17.8 built it and never started it), and for a node with no
+     * fabric that timer is `MAXIMUM_COMMISSIONING_TIMEOUT`, 48 hours: after that it stops advertising
+     * and nothing reopens it, so a bridge left unpaired for two days (or two days after a factory
+     * reset or the last fabric leaving) cannot be found by an ecosystem. `enterCommissionableMode()`
+     * restarts the window; the passcode and discriminator come from persisted commissioning state, so the
+     * QR/manual codes do not change.
+     *
+     * Does nothing for a commissioned node (its window is deliberately closed), while offline (mid
+     * erase), or while a window is open. Returns whether it reopened one. Never throws.
+     */
+    async ensureCommissionable(): Promise<boolean> {
+        const server = this.#server;
+        if (server === undefined || this.#reopening) {
+            return false;
+        }
+        this.#reopening = true;
+        try {
+            if (!server.lifecycle.isOnline || server.lifecycle.isCommissioned || this.#window.isOpen) {
+                return false;
+            }
+            const commissioner = this.commissioner();
+            if (commissioner === undefined || commissioner.windowStatus !== WINDOW_NOT_OPEN) {
+                return false;
+            }
+            // `isCommissioned` lags the fabric: on a pairing, matter.js adds the fabric and closes the window
+            // when the commissioning completes, but flips `isCommissioned` only after the fail-safe is torn
+            // down (CommissioningServer `#failsafeChanged` -> `handleFabricChange` -> `#syncCommissioned`),
+            // and on the last fabric leaving there is a gap before the erase. Reopening a basic window in
+            // either gap would make the user's Enhanced window fail with MatterFlowError. So also require
+            // that the FabricManager — the table matter.js's own `#enterOnlineMode`/`#resetWhenIdle` gate on,
+            // populated before `commissioned` fires — is empty, and that no fail-safe is armed. Both are
+            // read with `has`/`maybeGet`, never constructed.
+            const fabrics = server.env.maybeGet(FabricManager);
+            if (fabrics === undefined || fabrics.length > 0) {
+                return false;
+            }
+            const failsafe = server.env.maybeGet(FailsafeContext);
+            if (failsafe !== undefined && failsafe.construction.status !== Lifecycle.Status.Destroyed) {
+                return false;
+            }
+            await server.act(agent => agent.get(CommissioningServer).enterCommissionableMode());
+            this.log(
+                "The uncommissioned bridge's commissioning window had closed (matter.js ends it after 48 hours); " +
+                    "re-entering commissionable mode with the same pairing codes so an ecosystem can still pair",
+            );
+            return true;
+        } catch (error) {
+            this.log(`Could not re-enter commissionable mode: ${describeError(error)}`);
+            return false;
+        } finally {
+            this.#reopening = false;
+        }
+    }
+
+    /** #203 — see {@link BridgeFacade.afterAttach}. */
+    async afterAttach(): Promise<void> {
+        await this.registry.sweepCountdowns();
+    }
+
+    /**
      * §3.2
      *
      * The {@link noteSupersessionIfPaired} check runs only after a SUCCESSFUL
@@ -1866,6 +1999,7 @@ export class BridgeNode implements BridgeFacade {
                 `${preserveEndpointNumbers ? "preserved" : "DISCARDED"})`,
         );
         await this.server.erase();
+        this.#countdowns.clearAll();
         this.applyWitness(
             WARN_IDENTITY_WRITE,
             clearCommissioned(this.config.storagePath, this.identity, message => this.log(message)),
@@ -2052,15 +2186,17 @@ export class BridgeNode implements BridgeFacade {
         }
 
         if (!commissioned) {
-            // The never-commissioned initial state: the basic window is open and
-            // its codes are the persisted originals (§3.7).
+            // The never-commissioned state: the node's own basic window, with the persisted
+            // original codes (§3.7). Whether it is OPEN is read, not assumed: matter.js 0.18 closes it
+            // after 48 hours, and {@link ensureCommissionable} reopens it within a minute.
+            const open = this.windowOpen();
             const codes = this.server.state.commissioning.pairingCodes;
             return {
                 commissioned: false,
-                windowOpen: true,
+                windowOpen: open,
                 windowExpiresAt: null,
-                manualPairingCode: codes.manualPairingCode,
-                qrPairingCode: codes.qrPairingCode,
+                manualPairingCode: open ? codes.manualPairingCode : null,
+                qrPairingCode: open ? codes.qrPairingCode : null,
                 fabrics: this.fabrics(),
             };
         }
@@ -2086,6 +2222,9 @@ export class BridgeNode implements BridgeFacade {
      * already up and the race cannot occur.
      */
     async getPairingSettled(): Promise<PairingReport> {
+        // Belt and braces: a pairing request that finds an uncommissioned node with its window closed
+        // reopens it rather than reporting (or claiming) a window that is not there.
+        await this.ensureCommissionable();
         return settlePairingRead(() => this.getPairing());
     }
 
@@ -2125,8 +2264,15 @@ export class BridgeNode implements BridgeFacade {
                 iterations: PBKDF_ITERATIONS,
                 salt,
             });
-            await server.env.get(DeviceCommissioner).allowEnhancedCommissioning(discriminator, paseServer, () => {
-                this.#window.noteEnded();
+            await server.env.get(DeviceCommissioner).allowEnhancedCommissioning(discriminator, paseServer, {
+                // matter.js 0.18 starts its own window timer (0.17.8 built one and never
+                // started it), defaulting to 15 minutes on a commissioned node. Our duration, so
+                // the two agree; `CommissioningWindow.noteEnded` treats an end at that deadline
+                // as the expiry it is.
+                timeout: Seconds(durationSeconds),
+                onClose: () => {
+                    this.#window.noteEnded();
+                },
             });
         } catch (error) {
             this.log(`Failed to open commissioning window: ${describeErrorWithStack(error)}`);
@@ -2146,12 +2292,10 @@ export class BridgeNode implements BridgeFacade {
             },
         ]);
 
-        // DeviceCommissioner *does* build a STANDARD_COMMISSIONING_TIMEOUT timer
-        // in `#enterCommissioningMode`, but never calls `.start()` on it — a
-        // matter.js 0.17.8 bug — so nothing on the Matter side would ever close
-        // this window. Ours is the only timer. If upstream fixes that, the two
-        // race, which is why we cap durationSeconds at Matter's own 900s maximum:
-        // whichever fires first, the outcome is the same.
+        // Two timers now run, ours and matter.js 0.18's (started above with the same
+        // `timeout`, a few ms earlier). Whichever fires first the outcome is the same: ours
+        // reports "expired" and ends the Matter window; matter.js's calls `onClose`, which
+        // `CommissioningWindow.noteEnded` also reports as "expired" when it lands at the deadline.
         const expiresAt = this.#window.open(durationSeconds, manualPairingCode, qrPairingCode);
         return { manualPairingCode, qrPairingCode, windowExpiresAt: expiresAt.toISOString() };
     }
@@ -2169,6 +2313,7 @@ export class BridgeNode implements BridgeFacade {
     }
 
     async close(): Promise<void> {
+        clearInterval(this.#commissionableCheck);
         this.#window.clear();
         const server = this.#server;
         this.#server = undefined;

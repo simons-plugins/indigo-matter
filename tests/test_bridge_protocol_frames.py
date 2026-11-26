@@ -11,6 +11,7 @@ References to ``§N`` are BRIDGE_PROTOCOL.md sections.
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 
@@ -407,6 +408,20 @@ class TestEvents:
             command = bridge_protocol.parse_command(EVENTS[key]["data"])
             assert (command.command, command.args) == expected
             assert command.indigo_device_id == EVENTS[key]["data"]["indigoDeviceId"]
+
+    def test_a_node_raised_off_carries_its_reason_in_args(self):
+        """#203: `reason` is an additive, ignorable args key — protocolVersion stays 2."""
+        data = EVENTS["command_on_off_countdown_lost"]["data"]
+        command = bridge_protocol.parse_command(data)
+        assert command.command == "onOff"
+        assert command.args == {"value": False, "reason": bridge_protocol.COUNTDOWN_LOST_REASON}
+        assert bridge_protocol.PROTOCOL_VERSION == 2
+
+    def test_the_two_sides_agree_on_the_strings_they_match_on(self):
+        """Python matches on these; the node (TypeScript) writes them. Pin the pair."""
+        source = (pathlib.Path(__file__).parent.parent / "bridge-node" / "src" / "protocol.ts").read_text()
+        assert f'"{bridge_protocol.COUNTDOWN_LOST_REASON}"' in source
+        assert f'"{bridge_protocol.STATE_NOT_APPLIED_PHRASE}"' in source
 
     def test_fabrics_changed_normalises(self):
         data = EVENTS["fabrics_changed_added"]["data"]

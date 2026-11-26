@@ -1264,7 +1264,7 @@ function fakeSession(options: {
         isPeerActive: true,
         isInitiator: true,
         isClosing: false,
-        closing: { on: () => {}, off: () => {} },
+        closing: { on: () => {}, once: () => {}, off: () => {} },
         timestamp: 0,
         activeTimestamp: 0,
         subscriptions: fakeSubscriptionSet(),
