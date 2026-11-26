@@ -3,6 +3,27 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.35.2 — Toggle follows what Indigo shows, not what the bulb believes
+
+- Fix (issue #367): Indigo's Toggle on a light (relay, dimmer or colour dimmer)
+  was sent to the device as Matter's own `Toggle`, which flips the device's idea
+  of its state. When that differs from what Indigo shows (IKEA KAJPLATS bulbs keep
+  reporting "on" while dark after a power cut) you got the opposite of what the
+  screen promised. Toggle now sends `Off` if Indigo shows the light on and `On` if
+  it shows it off, the same way the plugin's locks, valves and thermostats already
+  behave. It falls back to Matter `Toggle` only when Indigo has no usable on/off
+  state for the device. Dimmers are judged by their on/off state, not brightness.
+- User-visible consequences. If Indigo shows a light as off while it is actually
+  lit, Toggle sends `On` and nothing visible happens; a second Toggle then turns
+  it off. Two Toggles sent before the device has reported back used to return the
+  light to where it started (Matter `Toggle` twice); now both read the same shown
+  state and send the same command, so it ends in that state.
+- Explicit On/Off is also safer when a command times out and is retried: a late
+  command plus its retry give the same end state, where two Toggles would cancel.
+- The Matter `Toggle` fallback is defensive and not expected on real devices
+  (relays and dimmers always have an on/off state). If it is ever used, one
+  warning per device per plugin run names the device and the value.
+
 ## 2026.35.1 — A null attribute update no longer turns an on/off device off
 
 - Fix (issue #374): matter-server 1.5.0 and later report an attribute that has been
