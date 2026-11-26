@@ -3,6 +3,19 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.38.1 — Documentation: two decision records accepted, bridge restart note
+
+No code change.
+
+- ADR-0019 (a real setting may be withheld from the settings report) and ADR-0020 (a
+  setting's state is trusted in the dialog only once read this run) are now Accepted;
+  both describe what 2026.38.0 shipped.
+- Known issue (issue #393): after the Matter bridge restarts (an update or a reboot),
+  exported accessories can be unavailable for 60 to 90 seconds while the bridge restores
+  each ecosystem's subscriptions, and the log may show "bridge node is not responding"
+  and "still not attached" warnings meanwhile. It recovers on its own.
+- The 2026.35.0 entry no longer says the bridge is unsoaked against Apple Home and Alexa.
+
 ## 2026.38.0 — Door lock settings, and a restart hint when commissioning finds no device
 
 - New (issue #368): a Matter lock's **Edit Device** dialog now offers up to three
@@ -161,8 +174,8 @@ check moves.
 
 - Upgrade (issue #375): the bridge node now runs on matter.js 0.18.0 (was 0.17.8). A
   bridge commissioned on 0.17.8 starts on 0.18.0 with the same fabric and endpoints in
-  a matter.js test controller; **not yet soaked against real Apple Home and Alexa**, so
-  expect to watch the first days. matter.js 0.18 now also publishes a Groupcast cluster
+  a matter.js test controller, and has since run against real Apple Home and Alexa
+  (see 2026.38.1 for the one thing that showed up). matter.js 0.18 now also publishes a Groupcast cluster
   and the Auxiliary ACL on the bridge's root endpoint, and logs a device-type warning
   for a smoke or CO alarm exported without a battery (it always lacked the Power Source
   cluster its device type calls for; 0.18 is just the first version to say so).

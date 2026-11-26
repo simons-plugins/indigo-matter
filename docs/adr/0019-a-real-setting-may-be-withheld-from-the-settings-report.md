@@ -3,7 +3,7 @@ parent: Decisions
 nav_order: 19
 title: "ADR-0019: A real setting may be withheld from the settings report when offering it would break the plugin's own control path"
 
-status: "proposed"
+status: "accepted"
 date: 2026-11-25
 decision-makers: solo (Simon)
 consulted: none

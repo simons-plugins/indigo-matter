@@ -3,7 +3,7 @@ parent: Decisions
 nav_order: 20
 title: "ADR-0020: A setting's state is trusted in the dialog only once it has been read from the device this run"
 
-status: "proposed"
+status: "accepted"
 date: 2026-11-25
 decision-makers: solo (Simon)
 consulted: none
@@ -70,7 +70,7 @@ are kept on the new one as superseded (at most three): the old dialog may still 
 field of it saved untouched still equals its old seed, so it is not written. Validation refuses
 such a value with a field error (the newest dialog's deliberate choice of it is indistinguishable
 from a stale save); closing still drops it as a backstop, and the log names the device and
-setting and asks the user to reopen). A value that differs from every seed is a
+setting and asks the user to reopen. A value that differs from every seed is a
 real edit and is written. Expiry is judged only at
 open, never on save, so one dialog left open for an hour still saves.
 
@@ -100,7 +100,8 @@ does.
 
 ### Confirmation
 
-`tests/test_unread_settings.py`, `tests/test_lock_settings.py`, `tests/test_device_sync.py`.
+`tests/test_unread_settings.py`, `tests/test_lock_settings.py`, `tests/test_device_sync.py`,
+`tests/test_settings_error.py`, `tests/test_seed_expiry.py`.
 
 ## More Information
 
