@@ -86,8 +86,9 @@ reached over the Reflector with the same Bearer API key Domio already uses — *
 standalone server (aiohttp is absent from Indigo's framework Python). See `docs/API.md` v1.1.
 
 **matter-server:** npm package `matter-server` (GitHub `matter-js/matterjs-server`),
-**Beta**, exact-pinned to **1.2.2** (`DEFAULT_INSTALL_SPEC`; the Install menu action installs
-this; requires Node ≥ 22.13.0). jarvis field-validated 1.1.2 and 1.2.2. Its
+**Beta**, exact-pinned to **1.6.1** (`DEFAULT_INSTALL_SPEC`; the Install menu action installs
+this; requires Node ≥ 22.13.0). jarvis field-validated 1.1.2 and 1.2.2; 1.6.1 (issue #374)
+was checked against its source and a local test instance, not yet on jarvis. Its
 one Thread gap is *first-admin* commissioning (provisioning Thread
 credentials over BLE) — which the share model never does. **Wi-Fi and Thread both
 validated with real hardware** (Tapo P110M over Wi-Fi; Aqara FP300 over Thread via a

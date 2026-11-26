@@ -75,7 +75,7 @@ Health check. Domio calls this at the start of every commissioning flow as a pre
   "nodeCount": 7,
   "bleAvailable": false,
   "uptime": 14523,
-  "matterServerPinnedVersion": "1.2.2",
+  "matterServerPinnedVersion": "1.6.1",
   "matterServerVersionStatus": "current"
 }
 ```

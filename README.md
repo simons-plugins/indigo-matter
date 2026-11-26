@@ -190,7 +190,7 @@ install guide.
 
 - Indigo 2025.2+ on macOS.
 - **Node.js ≥ 22.13.0** (Homebrew is the paved road; nvm works too) and the `matter-server`
-  npm package — Beta, **exact-pinned to 1.2.2** (`DEFAULT_INSTALL_SPEC`; the Install action
+  npm package — Beta, **exact-pinned to 1.6.1** (`DEFAULT_INSTALL_SPEC`; the Install action
   uses this).
 - For export only: a second npm package, `indigo-matter-bridge` — on the npm registry
   (0.5.0 onward), exact-pinned to **0.8.0** (`DEFAULT_INSTALL_SPEC`) — installed by its

@@ -3,6 +3,30 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.39.0 — The Matter controller moves to matter-server 1.6.1
+
+- The Matter controller this release installs moves from matter-server 1.2.2 to
+  **1.6.1** (issue #374). It still needs Node.js 22.13.0 or later.
+- **Existing installs are not upgraded automatically.** Updating the plugin leaves the
+  matter-server you already have running, and the plugin logs a warning that it is older
+  than 1.6.1. To upgrade, run **Plugins ▸ Matter ▸ Back up the Matter fabric…** first,
+  then **Plugins ▸ Matter ▸ Install/update the Matter controller (matter-server)**.
+- Make the backup first. matter-server 1.6 rewrites its stored device records when it
+  first starts, so going back to 1.2.2 means restoring that backup with **Restore a
+  fabric backup…**, not installing 1.2.2 again over the same storage.
+- A device's availability may change more often than before. The controller no longer
+  waits three minutes after losing a device before reporting it unavailable, so a device
+  that drops off briefly is now shown as unreachable for that time.
+- What the new controller fixes that matters here, from its own release notes: a device
+  that changed its IP address is found again sooner; a broken device subscription is set
+  up again sooner, and lost message confirmations no longer make a device drop its
+  connection; the controller notices when this Mac's network addresses change; and it
+  no longer needs minutes to start or stop after running for a long time.
+- If a second copy of matter-server is holding the controller's port, 1.6.1 stops and is
+  restarted by macOS every few seconds until the port is free, instead of staying
+  running without a connection as 1.2.2 did. The plugin's existing port-conflict
+  messages still report it.
+
 ## 2026.38.1 — Documentation: two decision records accepted, bridge restart note
 
 No code change.

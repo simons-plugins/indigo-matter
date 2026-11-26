@@ -58,7 +58,7 @@ running but matter-server is not.
 The `indigo-matter` plugin does not speak Matter directly. It manages a separate
 Node.js process — **matter-server** (npm package
 [`matter-server`](https://github.com/matter-js/matterjs-server), currently **Beta
-1.2.2**) — which holds the Indigo-owned Matter **fabric** and exposes a WebSocket control
+1.6.1**) — which holds the Indigo-owned Matter **fabric** and exposes a WebSocket control
 API. The plugin connects to that WebSocket and translates Matter clusters into
 first-class Indigo devices.
 
@@ -124,7 +124,7 @@ and double-click it), then:
 - **macOS** running your Indigo Server.
 - **Indigo 2025.2+** with the `indigo-matter` plugin installed (≥ **2026.0.6** — earlier
   builds launched matter-server via `npx` and no longer work; see Troubleshooting).
-- **Node.js ≥ 22.13.0** (required by matter-server 1.2.2), via **Homebrew** or nvm (Step 1).
+- **Node.js ≥ 22.13.0** (required by matter-server 1.6.1), via **Homebrew** or nvm (Step 1).
 - Network: the Indigo Server on the same LAN as your Matter devices — Wi-Fi ones
   directly, Thread ones via their border router.
 
@@ -187,19 +187,19 @@ Step 3.
 
 ```bash
 mkdir -p ~/indigo-matter
-npm install --prefix ~/indigo-matter matter-server@1.2.2
+npm install --prefix ~/indigo-matter matter-server@1.6.1
 ```
 
-This creates `~/indigo-matter/package.json` with `"matter-server": "1.2.2"` — an **exact
+This creates `~/indigo-matter/package.json` with `"matter-server": "1.6.1"` — an **exact
 pin** (no caret). The package is fast-moving Beta, so the plugin pins a specific
 validated version rather than floating; the menu install action uses this same version.
 Don't install globally — a project-local install keeps the version controlled.
-**matter-server 1.2.2 requires Node ≥ 22.13.0** (Step 1). To move to a newer server later,
+**matter-server 1.6.1 requires Node ≥ 22.13.0** (Step 1). To move to a newer server later,
 bump the version deliberately and re-validate.
 
-> **Note — there is no `matter-server` command.** The npm package has no `bin`
-> (`"bin": null`); its entry point is `dist/esm/MatterServer.js`. matter-server must be
-> launched as
+> **Note — launch the entry point directly.** Up to at least 1.2.2 the npm package had no
+> `bin` (`"bin": null`), so there was no `matter-server` command; 1.6.1 adds one, but it
+> only imports the same entry point, `dist/esm/MatterServer.js`. Launch it as
 > `node ~/indigo-matter/node_modules/matter-server/dist/esm/MatterServer.js …`. The
 > plugin (≥ 2026.0.6) does exactly this in its managed LaunchAgent — you do not need to
 > remember it unless you run matter-server manually (Step 3, Mode B).
