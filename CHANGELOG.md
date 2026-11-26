@@ -38,6 +38,7 @@ current version is `Info.plist`'s `PluginVersion`.
   can be used at a time; if the dialog's starting values are unavailable (it was reopened, or
   the plugin restarted), nothing is written and the log says to reopen it. There is no way
   to force a resend of the value the dialog opened with: change it and change it back.
+  A settings dialog that was never closed (a crash) stops blocking that device after ten minutes.
   The dialog says why values may be out of date (device unreachable, or plugin not connected).
 - Fix: a Matter node device's own "reachable" state was written in a way that cleared its
   "unreachable" flag the moment it was set, so a node going offline could show as fine.

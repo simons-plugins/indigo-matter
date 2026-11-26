@@ -63,6 +63,11 @@ nothing is called an edit: no setting is written, validation does not judge the 
 and the log asks the user to reopen the dialog. The consequence is that a user cannot force
 a resend of the value the dialog opened with; they change it and change it back.
 
+A remembered seed older than ten minutes, found when another dialog opens on the same
+device, is treated as abandoned (the client crashed before the close callback) and replaced,
+with an INFO line; a younger one still makes the slot ambiguous. Expiry is judged only at
+open, never on save, so one dialog left open for an hour still saves.
+
 An edit that cannot be sent (plugin not connected, or the device flagged unreachable) is
 refused in validation with a field error rather than failing after the dialog has closed.
 

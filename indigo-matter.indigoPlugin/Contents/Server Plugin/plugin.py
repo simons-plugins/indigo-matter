@@ -166,15 +166,31 @@ def _connected_and_reconciled(plugin, dev_id) -> bool:
         return False
 
 
+#: A remembered dialog seed older than this, found when another dialog opens on the same
+#: device, is treated as abandoned (the client crashed or dropped before closedDeviceConfigUi
+#: fired) and replaced. Judged ONLY at open: one dialog left open for an hour still saves.
+SEED_SLOT_MAX_AGE = 600.0
+
+
 def _remember_seed(plugin, dev_id, seeds: dict) -> None:
-    """Remember what a dialog was seeded with, per device. A SECOND open before the
-    first closes makes the slot ambiguous: nobody can say which dialog a Save is
-    from, so neither may use the seed."""
+    """Remember what a dialog was seeded with, per device.
+
+    A SECOND open before the first closes makes the slot ambiguous - nobody can say
+    which dialog a Save is from, so neither may use the seed - unless the first is older
+    than ``SEED_SLOT_MAX_AGE``, which is taken as abandoned and replaced.
+    """
+    clock = getattr(plugin, "_seed_clock", time.monotonic)
+    now = clock()
     slots = vars(plugin).setdefault("_dialog_seeds", {})
-    if dev_id in slots:
-        slots[dev_id]["ambiguous"] = True
-    else:
-        slots[dev_id] = {"seeds": seeds, "ambiguous": False}
+    existing = slots.get(dev_id)
+    if existing is not None and now - existing["stamp"] <= SEED_SLOT_MAX_AGE:
+        existing["ambiguous"] = True
+        return
+    if existing is not None:
+        plugin.logger.info(
+            "device %s: an unclosed settings dialog record from %.0f minutes ago was discarded",
+            dev_id, (now - existing["stamp"]) / 60)
+    slots[dev_id] = {"seeds": seeds, "ambiguous": False, "stamp": now}
 
 
 def _usable_seeds(plugin, dev_id):
