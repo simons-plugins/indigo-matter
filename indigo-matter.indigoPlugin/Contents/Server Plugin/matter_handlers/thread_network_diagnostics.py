@@ -55,7 +55,7 @@ never do (#334 post-review, B2.6 — this module used to carry its own
 parse; both are gone, on purpose, not an oversight).
 
 **Which attributes are subscribed.** Only what the four states actually consume,
-per ``thread_mesh.health_flags``: RoutingRole (role_name, detached, is_router,
+per ``thread_mesh.health_flags``: RoutingRole (role_name, detached, unreachable, is_router,
 single_neighbour), NeighborTable (neighbour count, weak_link, high_frame_error,
 the parent for a non-router's ``threadLinkRssi``), RouteTable + LeaderRouterId
 (far_from_leader — the one health check that needs a second attribute pair beyond
@@ -116,6 +116,10 @@ class ThreadNetworkDiagnosticsHandler(ClusterHandler):
     cluster_name = "ThreadNetworkDiagnostics"
     device_type_id = "matterNode"
     node_scoped = False
+    # Null is information here: a NeighborTable of None is "seen, reading
+    # unknown" and opens the priming-order gate (#334 B2.1/B2.8). Without this
+    # device_sync's null skip (#374) would starve the gate.
+    accepts_null = True
 
     def __init__(self) -> None:
         # node_id -> {attribute_id: last-seen raw value}. See the module

@@ -111,6 +111,20 @@ ERR_ENDPOINT_MAP_INVALID = "endpoint_map_invalid"
 ERR_COMMISSIONING_WINDOW_FAILED = "commissioning_window_failed"
 ERR_INTERNAL = "internal"
 
+KEY_REASON = "reason"
+
+#: #203 — the ``reason`` in the ``args`` of an ``onOff`` command the NODE raises itself
+#: (not an ecosystem) to end a timed-on countdown a node restart lost. Additive and
+#: ignorable: ``protocolVersion`` stays 2 and a handler that never reads it still works.
+COUNTDOWN_LOST_REASON = "countdown_lost_on_restart"
+
+#: #355 — the phrase in an ``internal`` error's details meaning "the endpoint WAS
+#: created and is live, but the state it was exported with did not land". The node
+#: raises this AFTER adding the endpoint and does not roll it back, so "nothing is
+#: exported" would be false. Must equal ``STATE_NOT_APPLIED_PHRASE`` in
+#: ``bridge-node/src/protocol.ts`` (a test pins the pair).
+STATE_NOT_APPLIED_PHRASE = "the endpoint is live, but its exported state could not be applied"
+
 ERROR_CODES = frozenset({
     ERR_UNKNOWN_COMMAND, ERR_MALFORMED_ARGS, ERR_VERSION_MISMATCH, ERR_NOT_ATTACHED,
     ERR_UNKNOWN_DEVICE, ERR_UNKNOWN_ROLE, ERR_ROLE_CHANGE, ERR_MASS_REMOVAL_REFUSED,

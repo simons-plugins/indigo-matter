@@ -114,6 +114,20 @@ class FakeDev:
         else:
             self.displayStateId = "onOffState"
 
+    @property
+    def onState(self):  # noqa: N802
+        """Real Indigo's relay/dimmer ``onState`` is ``states["onOffState"]``.
+        AttributeError when the state does not exist, like a device type
+        without one (issue #367: the handlers' Toggle reads this)."""
+        try:
+            return self.states["onOffState"]
+        except KeyError:
+            raise AttributeError("onState") from None
+
+    @onState.setter
+    def onState(self, value):  # noqa: N802
+        self.states["onOffState"] = value
+
     def updateStatesOnServer(self, kvlist):
         # Real Indigo clears a device's error state on a state write unless told
         # not to (the documented ``updateStateOnServer(key, value, clearErrorState)``

@@ -383,6 +383,12 @@ export class StubBridge implements BridgeFacade {
     #commissioned?: () => void;
     #decommissioned?: () => void;
 
+    /** How many times the post-attach step ran (#203). */
+    afterAttachCalls = 0;
+    async afterAttach(): Promise<void> {
+        this.afterAttachCalls += 1;
+    }
+
     async reconcile(endpoints: readonly EndpointSpec[], replaceAll: boolean): Promise<StatusReport> {
         this.model.reconcile(endpoints, replaceAll);
         return this.getStatus();

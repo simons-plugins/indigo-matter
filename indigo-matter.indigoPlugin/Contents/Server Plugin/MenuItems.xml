@@ -243,11 +243,11 @@ A Matter pairing code is not durable: once used, or once the window expires (up 
             <Field id="threadMeshReadOnly" type="label">
                 <Label>Read-only — nothing is ever written to any device.</Label>
             </Field>
-            <Field id="liveReadSleepy" type="checkbox" defaultValue="true">
-                <Label>Live-read sleepy devices first:</Label>
+            <Field id="liveReadNodes" type="checkbox" defaultValue="true">
+                <Label>Live-read every node first:</Label>
             </Field>
-            <Field id="liveReadSleepyHelp" type="label" fontColor="darkgray">
-                <Label>Slower but accurate — the cache can be hours stale for battery devices.</Label>
+            <Field id="liveReadNodesHelp" type="label" fontColor="darkgray">
+                <Label>Slower but accurate — the cache can be hours stale, routers included.</Label>
             </Field>
             <Field id="threadMeshFooter" type="label">
                 <Label>The report ends with a link to the visual mesh map page.</Label>

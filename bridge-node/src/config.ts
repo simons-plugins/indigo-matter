@@ -32,6 +32,8 @@ export interface BridgeConfig {
     wsPort: number;
     /** Optional mDNS interface pin (maps to matter.js's `mdns.networkInterface`). */
     mdnsInterface?: string;
+    /** Test hook: how often an uncommissioned node checks that it is still advertising (default 60 s). */
+    commissionableCheckMs?: number;
 }
 
 const USAGE = `indigo-matter-bridge
