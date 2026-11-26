@@ -135,6 +135,16 @@ def _is_flagged_unreachable(dev_id, logger=None) -> bool:
         return True
 
 
+def _device_log_name(dev_id) -> str:
+    """How a log line names an Indigo device: ``"Name"`` (the plugin's own style), or
+    ``device <id>`` if the lookup fails - a line must still log."""
+    try:
+        return f'"{indigo.devices[int(dev_id)].name}"'
+    except Exception:  # pylint: disable=broad-except
+        # gone, or Indigo failed to answer: the id is all there is, and enough
+        return f"device {dev_id}"
+
+
 def _record_setting_outcome(plugin, dev_id, plan, cause) -> None:
     """Record (cause given) or clear (None) the setting's failure text; never raises."""
     try:
@@ -144,7 +154,8 @@ def _record_setting_outcome(plugin, dev_id, plan, cause) -> None:
             plugin.device_sync.record_setting_failure(dev_id, plan.setting, plan.value, cause)
     except Exception as exc:  # pylint: disable=broad-except
         # the ERROR line already said what failed; this says the state did not follow
-        plugin.logger.warning("could not update the settings error of device %s (%s)", dev_id, exc)
+        plugin.logger.warning("%s: could not update the settings error (%s)",
+                              _device_log_name(dev_id), exc)
 
 
 def _matter_connected(plugin) -> bool:
@@ -1762,9 +1773,9 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # value the user never chose. Say so only if a setting field has content.
             if any(not device_settings.is_leave_alone(valuesDict.get(s.key)) for s in settings_for_type(typeId)):
                 self.logger.warning(
-                    'device %s: the dialog\'s starting values were not available (it was reopened '
+                    "%s: the dialog's starting values were not available (it was reopened "
                     "or the plugin restarted), so no setting was written - please reopen the dialog "
-                    "and change the setting again", devId)
+                    "and change the setting again", _device_log_name(devId))
             return
         try:
             plans = device_settings.planned_writes(
@@ -1780,7 +1791,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # become a burst of writes to a possibly battery-powered device (the
             # failure _device_states' docstring describes). No test drives this arm
             # (#310 audit).
-            self.logger.exception("could not work out device setting changes: %s", exc)
+            self.logger.exception("%s: could not work out device setting changes: %s",
+                                  _device_log_name(devId), exc)
             return
         if not plans:
             return
@@ -1788,14 +1800,10 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # Refused up front: a write that can only fail would also replace the
             # device's "unreachable" flag with "setting failed". (Validation refuses
             # an unsendable edit first; this is the backstop.)
-            try:
-                name = indigo.devices[devId].name
-            except Exception:  # pylint: disable=broad-except
-                name = f"id {devId}"
             self.logger.error(
-                'cannot apply device settings (%s) to "%s" — the plugin is NOT connected to '
+                "%s: cannot apply device settings (%s) — the plugin is NOT connected to "
                 "matter-server (the Matter connection is not running); nothing was written",
-                ", ".join(plan.setting.label for plan in plans), name)
+                _device_log_name(devId), ", ".join(plan.setting.label for plan in plans))
             return
         if not self._has_matter_node(valuesDict):
             # Belt-and-braces: planned_writes is already gated on the same
@@ -1804,7 +1812,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # callback, with no user-facing message and the remaining plans
             # abandoned.
             self.logger.error(
-                "cannot apply device settings — device %s has no Matter node yet", devId)
+                "%s: cannot apply device settings — it has no Matter node yet", _device_log_name(devId))
             return
         node_id = int(valuesDict.get("nodeId"))
         endpoint_id = int(valuesDict.get("endpointId"))
@@ -1845,24 +1853,34 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         label = plan.setting.label
         observed: list = []
         cause: list = []
+        who = _device_log_name(dev_id)
+        try:
+            # The device's own resolved bounds name a picker's options in the log line
+            # ("High (most sensitive)", not "2"); unknown bounds fall back to the number.
+            bounds = plan.setting.resolve_bounds(
+                lambda cluster, attribute: self.device_sync.setting_limits(
+                    node_id, endpoint_id, cluster, attribute))
+        except Exception:  # pylint: disable=broad-except
+            # a display nicety: never stops the write
+            bounds = None
         try:
             ok, message = await device_settings.apply_setting(
                 self.matter, node_id, endpoint_id, plan,
-                on_observed=observed.append, on_cause=cause.append)
+                on_observed=observed.append, on_cause=cause.append, bounds=bounds)
         except Exception as exc:  # pylint: disable=broad-except
             # a crash here must not kill the loop
-            self.logger.exception('"%s" could not be applied: %s', label, exc)
+            self.logger.exception('%s: "%s" could not be applied: %s', who, label, exc)
             # The user asked for a change and nothing says it did not happen: record it,
             # and since we do not know what the device holds, the setting is unread again.
             try:
                 self.device_sync.mark_setting_unread(dev_id, plan.setting.key)
             except Exception as inner:  # pylint: disable=broad-except
                 # bookkeeping after a crash must not itself escape
-                self.logger.warning("could not mark %s unread on device %s (%s)", label, dev_id, inner)
+                self.logger.warning("%s: could not mark %s unread (%s)", who, label, inner)
             _record_setting_outcome(self, dev_id, plan, "the write failed unexpectedly, see the event log")
             return
         if ok:
-            self.logger.info("%s", message)
+            self.logger.info("%s: %s", who, message)
             # The read-back already proved this value is on the device, so this
             # is a confirmed write-through, not the optimistic echo the #85
             # action does. apply_states also clears any stale error flag.
@@ -1870,7 +1888,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                                                     "value": plan.value}])
             _record_setting_outcome(self, dev_id, plan, None)
             return
-        self.logger.error("%s", message)
+        self.logger.error("%s: %s", who, message)
         # The device error flag is for REACHABILITY ONLY: a failed setting write never sets
         # (or replaces) it. The failure is recorded on the setting's own settingsError state.
         try:
@@ -1895,7 +1913,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         except KeyError:
             # The device was deleted between the dialog closing and this
             # running on the loop — routine, and there is nothing left to record.
-            self.logger.debug("could not record failed setting: device %s is gone", dev_id)
+            self.logger.debug("could not record failed setting: %s is gone", who)
             return
         except Exception as exc:  # pylint: disable=broad-except
             # NOT gone: the device exists and the state write failed, so
@@ -1903,8 +1921,8 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # never adopted. The write failure was already reported
             # to the user at ERROR; this says the record of it did not stick.
             self.logger.warning(
-                "the setting failure on device %s could not be recorded (%s) — the device's "
-                "settings dialog may show a value the device never adopted", dev_id, exc)
+                "%s: the setting failure could not be recorded (%s) — the device's "
+                "settings dialog may show a value the device never adopted", who, exc)
         _record_setting_outcome(self, dev_id, plan, cause[0] if cause else "the write failed")
 
     def _server_is_managed(self) -> bool:

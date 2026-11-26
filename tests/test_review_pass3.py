@@ -112,7 +112,7 @@ def test_a_refused_write_says_so_instead_of_blaming_the_firmware(plugin_cls, ds,
     stub = _stub(plugin_cls, ds, mock_logger,
                  matter=_Matter(write=RuntimeError("Write failed: CONSTRAINT_ERROR (0x87)"), read=5))
     _run_apply(plugin_cls, stub, dev, device_settings.PlannedWrite(WCL, 3, 5))
-    message = mock_logger.error.call_args[0][1]
+    message = mock_logger.error.call_args[0][2]
     assert "the device refused the value" in message
     assert "CONSTRAINT_ERROR" in message
     assert "acknowledges a write and ignores it" not in message

@@ -456,7 +456,8 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
                         retry_delay: float = 2.0,
                         timeout: float = ATTRIBUTE_TIMEOUT,
                         on_observed: Optional[Callable] = None,
-                        on_cause: Optional[Callable] = None) -> tuple[bool, str]:
+                        on_cause: Optional[Callable] = None,
+                        bounds: Optional[Bounds] = None) -> tuple[bool, str]:
     """Write a setting and PROVE it landed. Returns ``(ok, message)``.
 
     Success means one thing only: a subsequent read returns the value we asked
@@ -541,25 +542,25 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
         except (TypeError, ValueError):
             pass  # unreadable: verify_write below reports it; nothing to record
 
-    ok, reason = verify_write(setting, plan.value, read_back)
+    ok, reason = verify_write(setting, plan.value, read_back, bounds)
     if ok:
         if last_error is not None:
             # The send errored and the value is on the device anyway — exactly
             # the case that made "could not be sent" a lie.
-            return True, (f"{setting.label} is now {setting.value_text(plan.value)} "
+            return True, (f"{setting.label} is now {setting.value_text(plan.value, bounds)} "
                           f"(the send reported an error — {last_error} — but the "
                           f"device holds the new value).")
-        return True, reason or f"{setting.label} is now {setting.value_text(plan.value)}."
+        return True, reason or f"{setting.label} is now {setting.value_text(plan.value, bounds)}."
     if on_cause is not None:
-        on_cause(_short_cause(setting, plan.value, read_back, last_error))
+        on_cause(_short_cause(setting, plan.value, read_back, last_error, bounds))
     if last_error is not None:
         if _is_plain_mismatch(read_back, plan.value) and not isinstance(
                 last_error, (TimeoutError, asyncio.TimeoutError)):
             # The send FAILED (not merely timed out) AND the device still holds its
             # old value: that is a refusal, not firmware that acknowledges a write and ignores it.
             reason = (f"{setting.label} was NOT applied - the device refused the value: "
-                      f"{last_error}. It still reports {int(read_back)}{setting.unit} "
-                      f"after being asked for {plan.value}{setting.unit}.")
+                      f"{last_error}. It still reports {setting.value_text(int(read_back), bounds)} "
+                      f"after being asked for {setting.value_text(plan.value, bounds)}.")
         else:
             reason = f"{reason} The send also failed: {last_error}."
     if read_error is not None:
@@ -571,22 +572,23 @@ async def apply_setting(client: Any, node_id: int, endpoint: int,
     return False, reason
 
 
-def _short_cause(setting: DeviceSetting, intended: int, read_back: Any, send_error: Any) -> str:
+def _short_cause(setting: DeviceSetting, intended: int, read_back: Any, send_error: Any,
+                 bounds: Optional[Bounds] = None) -> str:
     """One short phrase for why a write failed, for the ``settingsError`` state.
 
     No ``;`` (the state joins several failures with it) and no newlines.
     """
     if read_back is NO_ANSWER:
-        cause = f"the device did not confirm {setting.value_text(intended)}"
+        cause = f"the device did not confirm {setting.value_text(intended, bounds)}"
     elif read_back is None:
-        cause = f"the device answered with no value after {setting.value_text(intended)}"
+        cause = f"the device answered with no value after {setting.value_text(intended, bounds)}"
     elif _is_plain_mismatch(read_back, intended):
         if send_error is not None and not isinstance(send_error, (TimeoutError, asyncio.TimeoutError)):
-            cause = f"the device rejected {setting.value_text(intended)}"
+            cause = f"the device rejected {setting.value_text(intended, bounds)}"
         else:
-            cause = f"the device ignored the change (still {setting.value_text(int(read_back))})"
+            cause = f"the device ignored the change (still {setting.value_text(int(read_back), bounds)})"
     else:
-        cause = f"the device answered with something unreadable after {setting.value_text(intended)}"
+        cause = f"the device answered with something unreadable after {setting.value_text(intended, bounds)}"
     return cause.replace(";", ",").replace("\n", " ")
 
 

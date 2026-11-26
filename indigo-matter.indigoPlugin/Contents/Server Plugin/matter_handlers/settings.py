@@ -407,15 +407,25 @@ class DeviceSetting:
             rows = [(str(self.null_state), self.null_label), *rows]
         return rows
 
-    def value_text(self, value: Any) -> str:
+    def value_text(self, value: Any, bounds: Optional["Bounds"] = None) -> str:
         """A value as the user should read it in a log line: the option's label
-        for a choice ("On"), the null's display string, else value plus unit."""
+        for a choice ("On", "High (most sensitive)"), the null's display string,
+        else value plus unit.
+
+        ``bounds`` (the device's resolved ones) is needed only for a picker whose
+        labels are BUILT from what the device reported - sensitivity's level count -
+        which a fixed enum cannot name. Without it that falls back to the number.
+        """
         number = _as_state_int(value)
         if number is not None and number == self.null_state:
             return self.null_ui
         for known, label in getattr(self.bounds, "values", ()):
             if number is not None and int(known) == number:
                 return label
+        if number is not None and bounds is not None and self.options is not None:
+            for row_id, label in self.options(bounds):
+                if row_id == str(number):
+                    return label
         return f"{value}{self.unit}"
 
     def state_entry(self, value: Any) -> dict:
@@ -612,7 +622,8 @@ def coerce_value(setting: DeviceSetting, raw: Any, bounds: Bounds) -> tuple[Opti
     return value, ""
 
 
-def verify_write(setting: DeviceSetting, intended: int, read_back: Any) -> tuple[bool, str]:
+def verify_write(setting: DeviceSetting, intended: int, read_back: Any,
+                 bounds: Optional[Bounds] = None) -> tuple[bool, str]:
     """Did the write actually land? The single implementation of rule 1.
 
     A device that ACKs a write and silently ignores it is not a hypothetical:
@@ -635,10 +646,10 @@ def verify_write(setting: DeviceSetting, intended: int, read_back: Any) -> tuple
     if read_back is None and setting.null_state is not None:
         # For a setting whose null is a real answer, null is what the device holds.
         return False, (f"{setting.label} was NOT applied — the device still reports "
-                       f"{setting.null_ui} after being asked for {setting.value_text(intended)}.")
+                       f"{setting.null_ui} after being asked for {setting.value_text(intended, bounds)}.")
     if read_back is None:
         return False, (f"{setting.label} was NOT applied — the device answered the read-back "
-                       f"with no value (null) after being asked for {setting.value_text(intended)}.")
+                       f"with no value (null) after being asked for {setting.value_text(intended, bounds)}.")
     try:
         actual = int(read_back)
     except (TypeError, ValueError):
@@ -646,7 +657,7 @@ def verify_write(setting: DeviceSetting, intended: int, read_back: Any) -> tuple
                        f"read-back with {read_back!r}, which is not a value.")
     if actual != intended:
         return False, (f"{setting.label} was NOT applied — the device still reports "
-                       f"{setting.value_text(actual)} after being asked for "
-                       f"{setting.value_text(intended)}. "
+                       f"{setting.value_text(actual, bounds)} after being asked for "
+                       f"{setting.value_text(intended, bounds)}. "
                        f"Some firmware acknowledges a write and ignores it.")
     return True, ""
