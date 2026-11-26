@@ -212,12 +212,13 @@ def test_a_dialog_build_failure_blanks_everything_and_an_untouched_save_writes_n
     dev = _lock(ds, devices)
     stub = _stub(plugin_cls, ds, mock_logger, matter=CONNECTED)
     dev.pluginProps.update({"autoRelockTime": "60", "hasAutoRelockTime": "yes"})   # an earlier Save
+    original = device_settings.config_ui_values
     monkeypatch.setattr(device_settings, "config_ui_values",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     values = _open(plugin_cls, stub, dev, "matterLock")
     assert values["autoRelockTime"] == "" and values["hasAutoRelockTime"] == "no"
     assert values["hasAnySetting"] == "no"
-    monkeypatch.undo()
+    monkeypatch.setattr(device_settings, "config_ui_values", original)
     runtime = _close(plugin_cls, stub, dev, dict(values))
     runtime.submit.assert_not_called()
     # and even a SAVED prop riding in with no remembered seed is not written
@@ -407,6 +408,7 @@ def test_an_ambiguous_slot_refuses_even_a_real_edit_and_says_to_reopen(plugin_cl
     first = _open(plugin_cls, stub, dev, "matterLock")
     _open(plugin_cls, stub, dev, "matterLock")                 # a second dialog on the same device
     first["autoRelockTime"] = "60"
-    assert _validate(plugin_cls, stub, dev, first)[0] is True      # nothing can be called an edit
+    result = _validate(plugin_cls, stub, dev, first)           # refused where the user can see it
+    assert result[0] is False and "another window" in result[2]["autoRelockTime"]
     assert _close(plugin_cls, stub, dev, first).submit.call_count == 0
     assert any("starting values" in str(c) for c in mock_logger.warning.call_args_list)

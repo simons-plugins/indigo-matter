@@ -74,6 +74,7 @@ from matter_handlers.power_source import (
     resolve_power_coverage,
 )
 import settings_report
+from device_names import device_log_name
 from protocol import MatterCommand
 
 # Device type ids for which SupportsPowerMeter/SupportsEnergyMeter are meaningful.
@@ -496,6 +497,11 @@ class DeviceSync:
         # In memory only: after a restart the settingsError state (kept by Indigo) stays
         # until a good write of that setting clears it.
         self._failed_requests: dict[tuple[int, str], int] = {}
+        # Serialises the read-modify-write of a device's settingsError text: it is edited
+        # from the asyncio loop (a failed write) and from Indigo's thread (the deviceStartComm
+        # replay clears). NOT self._lock, which apply_states-adjacent code takes.
+        self._error_edit_lock = threading.RLock()
+        self._missing_error_state_told: set[int] = set()
         # Every node id matter-server has told us about this session, whether or
         # not it produced any Indigo device. `_index` cannot serve this purpose:
         # it is keyed by endpoints that HAVE an Indigo device (however the entry
@@ -4302,8 +4308,8 @@ class DeviceSync:
             except Exception as exc:  # pylint: disable=broad-except
                 # one refused state write must not stop the others; named and counted
                 failed.add(kv["key"])
-                self.logger.warning("could not write state %r of device %s: %s",
-                                    kv["key"], getattr(dev, "id", "?"), exc)
+                self.logger.warning("%s: could not write state %r: %s",
+                                    device_log_name(getattr(dev, "id", "?")), kv["key"], exc)
         return failed
 
     # ------------------------------------------------------------------
@@ -4382,8 +4388,8 @@ class DeviceSync:
         except Exception as exc:  # pylint: disable=broad-except
             # the report's own states are already written; losing the clear costs one
             # stale sentence, whereas escaping would skip the stale error-flag clear
-            self.logger.warning("could not clear the settings error of device %s (%s)",
-                                getattr(dev, "id", "?"), exc)
+            self.logger.warning("%s: could not clear the settings error (%s)",
+                                device_log_name(getattr(dev, "id", "?")), exc)
 
     def _clear_satisfied_failures_unguarded(self, dev: Any, kvlist: list) -> None:
         settings = {s.key: s for s in settings_for_type(getattr(dev, "deviceTypeId", "") or "")}
@@ -4397,14 +4403,23 @@ class DeviceSync:
                 self.clear_setting_failure(dev.id, setting)
 
     def _edit_settings_error(self, dev_id: Any, setting: Any, sentence: Optional[str]) -> None:
+        with self._error_edit_lock:
+            self._edit_settings_error_locked(dev_id, setting, sentence)
+
+    def _edit_settings_error_locked(self, dev_id: Any, setting: Any, sentence: Optional[str]) -> None:
         try:
-            dev = indigo.devices[int(dev_id)]
+            dev = indigo.devices[int(dev_id)]       # fresh, inside the lock: never a stale read
         except KeyError:
             return
         current = getattr(dev, "states", {})
         if self.ERROR_STATE not in current:
-            # A device fielded before this state existed, not yet rebuilt: nothing to write to.
-            self.logger.debug("device %s has no %s state yet", dev_id, self.ERROR_STATE)
+            # A device fielded before this state existed, not yet rebuilt: nothing to write
+            # to - but a failure that cannot be recorded should be said once.
+            if sentence and int(dev_id) not in self._missing_error_state_told:
+                self._missing_error_state_told.add(int(dev_id))
+                self.logger.warning(
+                    "%s: has no %s state yet (its state list has not been rebuilt), so a setting "
+                    "failure is only in the Event Log", device_log_name(dev_id), self.ERROR_STATE)
             return
         prefix = f"{setting.label}: "
         parts = [part for part in str(current.get(self.ERROR_STATE) or "").split(self._SEPARATOR)
@@ -4481,6 +4496,10 @@ class DeviceSync:
             self._settings_primed -= {(int(dev.id), key) for key in keys}
             for key in keys:
                 self._failed_requests.pop((int(dev.id), key), None)
+        # The text names a failure on the node the device is leaving; nothing would ever
+        # clear it on the new one.
+        for setting in settings_for_type(getattr(dev, "deviceTypeId", "") or ""):
+            self.clear_setting_failure(dev.id, setting)
 
     def node_reconciled(self, node_id: Any) -> bool:
         """Has an informative snapshot of this node been cached this run?"""

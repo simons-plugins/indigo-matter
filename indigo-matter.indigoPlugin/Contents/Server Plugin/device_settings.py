@@ -47,7 +47,7 @@ __all__ = [
     "OfferedSetting", "PlannedWrite", "MARKER_YES", "MARKER_NO",
     "offered_settings", "unimplemented_states", "config_ui_values",
     "validate_settings", "planned_writes", "apply_setting",
-    "RemovedStateLog", "PrimedLookup", "picker_rows", "edited_settings", "matches_seed", "NO_ATTRIBUTE_LIST_REASON",
+    "RemovedStateLog", "PrimedLookup", "picker_rows", "edited_settings", "matches_seed", "candidate_edits", "NO_ATTRIBUTE_LIST_REASON",
     "UNREAD_OPTION_ID", "UNREAD_OPTION_LABEL",
 ]
 
@@ -416,6 +416,18 @@ def _is_seed(seeds: Optional[dict], setting: DeviceSetting, values: dict) -> boo
 def matches_seed(setting: DeviceSetting, values: dict, seeds: dict) -> bool:
     """Is the submitted field equal to *seeds*' value for it (numerically for numbers)?"""
     return _is_seed(seeds, setting, values)
+
+
+def candidate_edits(device_type_id: str, values: dict, limits: LimitsLookup,
+                    attribute_list: Optional[Callable], device_known: bool, states: dict) -> list:
+    """Offered settings whose submitted field is not blank/leave-alone AND differs from the
+    device's CURRENT state value (numerically for numbers): what MIGHT be an edit when no
+    seed says what the dialog opened with."""
+    return [offer.setting
+            for offer in offered_settings(device_type_id, limits, attribute_list, device_known)
+            if _is_editing(offer.setting, values)
+            and not _unchanged(offer.setting, values.get(offer.setting.key),
+                               states.get(offer.setting.key))]
 
 
 def edited_settings(device_type_id: str, values: dict, limits: LimitsLookup,
