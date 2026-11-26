@@ -10,8 +10,9 @@ VERIFIED wire shapes (ws-controller v0.6.2):
   Both ids are plain integers (TypeScript NodeId / EndpointNumber).
 
   A node_updated carrying the new endpoint is always sent for the structure
-  change: after endpoint_added up to matter-server 1.2.2, before it from 1.5.0
-  (pinned 1.6.1). endpoint_added itself is only logged, so either order works.
+  change: after endpoint_added up to matter-server 1.4.0 (1.2.2 included), before
+  it from 1.5.0 (pinned 1.6.1). endpoint_added itself is only logged, so either
+  order works.
 """
 from __future__ import annotations
 

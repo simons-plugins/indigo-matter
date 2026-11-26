@@ -83,8 +83,8 @@ CMD_SET_FABRIC_LABEL = "set_default_fabric_label"  # persists + pushes UpdateFab
 # (@matter-server/ws-controller/src/types/WebSocketMessageTypes.ts: UnknownError 0,
 # NodeCommissionFailed 1, NodeInterviewFailed 2, NodeNotReady 3, NodeNotResolving 4,
 # NodeNotExists 5, VersionMismatch 6, SDKStackError 7, InvalidArguments 8,
-# InvalidCommand 9, UpdateCheckError 10, UpdateError 11, IcdMultiAdmin 100; 1.6.1 adds
-# OtaUploadError 101 and camera codes 102-106, none of which this plugin can trigger).
+# InvalidCommand 9, UpdateCheckError 10, UpdateError 11, IcdMultiAdmin 100; OtaUploadError
+# 101 came in 1.4.0 and camera codes 102-106 in 1.5.0, none of which this plugin can trigger).
 # Live-checked against 1.6.1 (issue #374): get_node, read_attribute, remove_node,
 # device_command, write_attribute, interview_node and open_commissioning_window on a
 # node that does not exist all answer {message_id, error_code: 5, details: "Node N
@@ -115,8 +115,9 @@ ARG_PAYLOAD = "payload"                  # IMPLEMENTATION.md used "args"
 # the length of the commissioning window in SECONDS, not an RPC deadline —
 # do not wire this to matter_client.request()'s same-named "timeout" kwarg,
 # which means the opposite thing on the same call. Omitted entirely, the
-# window defaults to 900s (matter.js PairedNode.openEnhancedCommissioningWindow's
-# own default). 1.2.2's (and 1.6.1's) handler also accepts iteration/option/discriminator in
+# window defaults to 900s (matter.js's own default: PairedNode.openEnhancedCommissioningWindow
+# in 1.2.2, CommissioningClient.openEnhancedCommissioningWindow in @matter/node for 1.6.1).
+# 1.2.2's (and 1.6.1's) handler also accepts iteration/option/discriminator in
 # its arg type, but has them commented out of the destructure, so every window
 # this plugin opens is an Enhanced window — there is no basic-window toggle to
 # build against this version.
@@ -148,9 +149,9 @@ EVT_NODE_EVENT = "node_event"
 #     endpoint_added:   {event: "endpoint_added",   data: {node_id, endpoint_id}}
 #     endpoint_removed: {event: "endpoint_removed",  data: {node_id, endpoint_id}}
 #   Both ids are the raw TypeScript NodeId/EndpointNumber values (integers).
-#   Ordering is version-dependent. Up to 1.2.2 the node_updated carrying the new
-#   endpoint was deferred (setImmediate) and so arrived AFTER endpoint_added. From
-#   1.5.0 (and in the pinned 1.6.1) the server flushes that pending node_updated
+#   Ordering is version-dependent. Up to 1.4.0 (1.2.2 included) the node_updated
+#   carrying the new endpoint was deferred (setImmediate) and so arrived AFTER
+#   endpoint_added. From 1.5.0 (pinned 1.6.1) the server flushes that pending node_updated
 #   BEFORE sending endpoint_added (ws-controller WebSocketControllerHandler.ts,
 #   flushNodeUpdatedFor). Either way a node_updated with the full snapshot is
 #   sent for the structure change, and that snapshot is what device_sync acts on;

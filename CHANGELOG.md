@@ -8,26 +8,41 @@ current version is `Info.plist`'s `PluginVersion`.
 - The Matter controller this release installs moves from matter-server 1.2.2 to
   **1.6.1** (issue #374). It still needs Node.js 22.13.0 or later.
 - **Existing installs are not upgraded automatically.** Updating the plugin leaves the
-  matter-server you already have running, and the plugin logs a warning that it is older
-  than 1.6.1. To upgrade, run **Plugins ▸ Matter ▸ Back up the Matter fabric…** first,
+  matter-server you already have running. When the plugin manages matter-server it logs
+  a warning that it is older than 1.6.1 (for a matter-server you run yourself, an
+  information line instead). To upgrade, run **Plugins ▸ Matter ▸ Back up the Matter fabric…** first,
   then **Plugins ▸ Matter ▸ Install/update the Matter controller (matter-server)**.
 - Make the backup first, and treat the upgrade as one-way. matter-server 1.6 changes
   what it stores about each device, and running 1.2.2 again over storage that 1.6 has
   used is not tested with real devices. To go back, reinstall the previous plugin
-  release, run **Install/update the Matter controller (matter-server)** to get 1.2.2
-  back, then restore that backup with **Restore a fabric backup…**.
-- A device's availability may change more often than before. The controller no longer
-  waits three minutes after losing a device before reporting it unavailable, so a device
-  that drops off briefly is now shown as unreachable for that time.
+  release and run **Install/update the Matter controller (matter-server)** to get 1.2.2
+  back. That step starts 1.2.2 on the storage 1.6 has used, which is the untested part,
+  so straight away restore the backup you made before upgrading with **Restore a fabric
+  backup…**.
+- A device the controller cannot reach is shown as unreachable sooner. The controller no
+  longer adds three minutes of grace after it gives up reaching a device, so such a
+  device is shown as unreachable straight away instead of three minutes later. A brief
+  drop that the controller rides out still shows as available.
 - What the new controller fixes that matters here, from its own release notes: a device
   that changed its IP address is found again sooner; a broken device subscription is set
   up again sooner, and lost message confirmations no longer make a device drop its
   connection; the controller notices when this Mac's network addresses change; and it
   no longer needs minutes to start or stop after running for a long time.
-- If a second copy of matter-server is holding the controller's port, 1.6.1 stops and is
-  restarted by macOS every few seconds until the port is free, instead of staying
-  running without a connection as 1.2.2 did. The plugin's existing port-conflict
-  messages still report it.
+- When matter-server 1.6.1 cannot start (for example because another program holds its
+  port, or its storage is locked), it stops and macOS restarts it about every 10
+  seconds until the cause goes away, instead of staying running without a connection
+  as 1.2.2 did. The plugin now reports that once, as an error saying the controller
+  keeps failing to start and is being restarted, with the error matter-server logged
+  and, if another program holds the port, which one. Before this fix that loop could
+  go unreported, or the same port-conflict error could be repeated every few minutes
+  and followed by a wrong "resolved" line.
+- Commissioning: the hint to restart the controller when no device was discovered also
+  appears when matter-server 1.6.1 reports that failure in different words, using the
+  reason code it now sends with the error.
+- "Allow test/development device certificates" now says what it does with matter-server
+  1.6.0 and later: besides test/development certificates, it also accepts a device that
+  does not report the vendor or product ID its certification is checked against. The
+  log warning shown when it is on says the same.
 
 ## 2026.38.1 — Documentation: two decision records accepted, bridge restart note
 

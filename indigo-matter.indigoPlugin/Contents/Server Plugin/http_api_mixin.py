@@ -106,7 +106,8 @@ class HttpApiMixin:
 
     # ----- providers used by HttpApi (bridge into the loop where needed) -----
     def _status_body(self) -> dict:
-        # server_info fields (ws-controller 0.6.x-1.6.x): sdk_version (e.g. "matter-server/1.6.1 (matter.js/0.18.1)",
+        # server_info fields (checked on 0.6.x, 1.2.x and 1.6.1): sdk_version
+        # (e.g. "matter-server/1.6.1 (matter.js/0.18.1)",
         # parsed by server_process.version_drift), fabric_id, bluetooth_enabled; there is no plain "version" key.
         connected = bool(self.matter is not None and self.matter.connected)
         info = (self.matter.server_info if self.matter else None) or {}

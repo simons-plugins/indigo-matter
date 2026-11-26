@@ -1,11 +1,11 @@
 """matter-server process management — the controller LaunchAgent (PM-B).
 
 Manages a launchd LaunchAgent that runs matter-server, per IMPLEMENTATION.md §1.4.
-The ``matter-server`` npm package shipped ``"bin": null`` through at least 1.2.2
+The ``matter-server`` npm package shipped ``"bin": null`` up to 1.4.0
 — there was NO ``matter-server`` executable — so ``npx matter-server`` failed with
 "could not determine executable to run", and launchd KeepAlive-respawned it forever.
-1.6.1 does declare a bin (``dist/esm/bin.js``), but that file only enables source maps
-and imports ``MatterServer.js``, so nothing is lost by keeping the direct launch.
+From 1.5.0 it declares a bin (``dist/esm/bin.js``), which enables source maps and
+imports ``MatterServer.js``; the direct launch loses only source-mapped stack traces.
 We therefore launch node directly on the package main (``dist/esm/MatterServer.js``,
 read from the package's ``package.json``), exactly like the working hand-rolled
 run.sh. This is the recommended process-management approach because the server
@@ -179,9 +179,10 @@ def matter_server_arguments(agent: "ServerProcess") -> list[str]:
     ``--enable-test-net-dcl`` ordering hazard below cannot survive generalisation.
     """
     # node <package main> … — NOT `npx matter-server`: the matter-server npm
-    # package shipped "bin": null through at least 1.2.2, so npx could not resolve
-    # an executable and the LaunchAgent respawn-looped with "could not determine
-    # executable to run". (1.6.1 has a bin, which just imports the same main.)
+    # package shipped "bin": null up to 1.4.0, so npx could not resolve an
+    # executable and the LaunchAgent respawn-looped with "could not determine
+    # executable to run". (1.5.0+ has a bin, which imports the same main after
+    # turning on source maps; launching the main directly loses only those.)
     args = [
         agent.node_path,
         agent._server_entry(),  # pylint: disable=protected-access
@@ -313,8 +314,10 @@ class ServerProcess(LaunchAgent):
         self.logger.warning(
             "starting matter-server with RELAXED device attestation "
             "(--enable-test-net-dcl): it additionally trusts the Matter test-net "
-            "DCL, so devices with test/development certificates are accepted and "
-            "test-net OTA firmware may be offered to them. Untick 'Allow "
+            "DCL, so devices with test/development certificates are accepted, "
+            "devices that do not report the vendor or product ID their Certification "
+            "Declaration is checked against are accepted (matter-server 1.6.0 and later), "
+            "and test-net OTA firmware may be offered to them. Untick 'Allow "
             "test/development device certificates' in Configure… when you no "
             "longer need it."
         )

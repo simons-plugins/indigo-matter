@@ -4053,15 +4053,15 @@ class DeviceSync:
             self._forget_node_capabilities(evt.node_id)
         elif evt.kind == protocol.EVT_ENDPOINT_ADDED:
             # matter-server always sends a node_updated (via structureChanged) for the
-            # structure change that adds an endpoint: AFTER endpoint_added up to 1.2.2,
-            # BEFORE it from 1.5.0 on (pinned 1.6.1) — see the protocol.py note above
+            # structure change that adds an endpoint: AFTER endpoint_added up to 1.4.0
+            # (1.2.2 included), BEFORE it from 1.5.0 (pinned 1.6.1) — see the protocol.py note above
             # EVT_ENDPOINT_ADDED.  The full node-details object in node_updated
             # lets _on_node_added run create_devices (idempotent) to pick up the new
             # endpoint.  Here we just log at debug so the sequence is visible in the
             # event log, and avoid a redundant create pass with incomplete data.
             if evt.node_id is not None and evt.endpoint is not None:
                 self.logger.debug(
-                    "endpoint_added: node %s endpoint %s — picked up from node_updated",
+                    "endpoint_added: node %s endpoint %s — handled via node_updated",
                     evt.node_id, evt.endpoint,
                 )
             else:

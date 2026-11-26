@@ -53,8 +53,10 @@
         <Label>Allow test/development device certificates:</Label>
         <Description>Additionally trusts the Matter test-net DCL, so devices whose
             certificates chain to a test root are accepted — needed for dev bridges such
-            as Homebridge. Production verification is unchanged. It also allows
-            test-net OTA firmware to be offered to commissioned devices, so
+            as Homebridge. From matter-server 1.6.0 it also accepts a device that does
+            not report the vendor or product ID its Certification Declaration is checked
+            against, a check production verification would otherwise refuse it on. It
+            also allows test-net OTA firmware to be offered to commissioned devices, so
             leave it off unless a commissioning attempt fails on device attestation, and
             untick it once that device is paired. Applies to the managed server on this
             Mac; takes effect when the plugin reloads, or via Plugins ▸ Matter ▸ Restart
