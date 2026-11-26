@@ -37,9 +37,12 @@ import { ExtendedColorLightDevice } from "@matter/main/devices/extended-color-li
 import { OnOffLightDevice } from "@matter/main/devices/on-off-light";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
 
+import { COUNTDOWNS_FILE, CountdownStore } from "../src/countdowns.js";
+import { EndpointMapStore } from "../src/endpoint-map.js";
 import {
     applyStates,
     endpointIdFor,
+    IndigoOnOffServer,
     MIREDS_MAX,
     MIREDS_MIN,
     percentToBatteryRemaining,
@@ -58,6 +61,7 @@ import {
     type RoleValue,
 } from "../src/protocol.js";
 import { EndpointRegistry } from "../src/registry.js";
+import { golden } from "./stub-bridge.js";
 import { closeSharedMdns, LOOPBACK, settleMatterWrites } from "./loopback.js";
 
 const PRODUCT_NAME = "Indigo Matter Bridge";
@@ -114,6 +118,15 @@ interface Harness {
     commands: CommandEventData[];
     logs: string[];
     storagePath: string;
+    map: EndpointMapStore;
+    /** #203 — the real marker store (`countdowns.json`), loaded from `storagePath`. */
+    countdowns: CountdownStore;
+    /** #203 — the registry's wall clock; set `clock.now` to move it. */
+    clock: { now: number };
+    /** #203 — the §4.3 warnings the registry has raised, by key. */
+    warnings: Map<string, string>;
+    /** Record the live endpoints in the map, as the node's drift check does after every reconcile. */
+    recordIdentities: () => void;
     close: () => Promise<void>;
 }
 
@@ -124,7 +137,14 @@ interface Harness {
  * all assigned at `add()` time.
  */
 async function harness(
-    options: { storagePath?: string; removalPacingMs?: number; emitThrows?: boolean } = {},
+    options: {
+        storagePath?: string;
+        removalPacingMs?: number;
+        emitThrows?: boolean;
+        emitThrowsFor?: number;
+        /** #203 — drop every command, as `ws-server`'s `sendEvent` does with no client attached. */
+        emitDrops?: boolean;
+    } = {},
 ): Promise<Harness> {
     const storagePath = options.storagePath ?? mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-registry-"));
     if (options.storagePath === undefined) {
@@ -159,12 +179,24 @@ async function harness(
 
     const commands: CommandEventData[] = [];
     const logs: string[] = [];
+    const map = new EndpointMapStore(storagePath);
+    map.load();
+    const countdowns = new CountdownStore(storagePath);
+    countdowns.load();
+    const clock = { now: 1_000_000_000 };
+    const warnings = new Map<string, string>();
     const registry = new EndpointRegistry({
         aggregator,
         bridgeIdentity: BRIDGE_IDENTITY,
+        countdowns,
+        now: () => clock.now,
+        warn: (key, message) => (message === undefined ? warnings.delete(key) : warnings.set(key, message)),
         emit: data => {
+            if (options.emitDrops === true) {
+                return;
+            }
             commands.push(data);
-            if (options.emitThrows === true) {
+            if (options.emitThrows === true || options.emitThrowsFor === data.indigoDeviceId) {
                 throw new Error("the command sink blew up");
             }
         },
@@ -184,6 +216,22 @@ async function harness(
         commands,
         logs,
         storagePath,
+        map,
+        countdowns,
+        clock,
+        warnings,
+        recordIdentities: () => {
+            map.check(
+                registry.identities().map(identity => ({
+                    uniqueId: identity.publishedAs,
+                    endpointNumber: identity.endpointNumber,
+                    role: identity.role,
+                    label: identity.label,
+                    battery: identity.battery,
+                    deviceId: identity.indigoDeviceId,
+                })),
+            );
+        },
         close: async () => {
             registry.close();
             await node.close();
@@ -1437,7 +1485,7 @@ describe("currentLevel retention while off (#353)", () => {
         }
     });
 
-    it("(create-path persistence, issue #355) a fresh Registry against old storage still shows the persisted currentLevel, though applyStates never runs here", async () => {
+    it("(create-path persistence, issue #355) a fresh Registry against old storage keeps the persisted currentLevel under a level:0 create (ADR-0017 holds through create-time applyStates)", async () => {
         // NOT the normal bridge-node restart. That path is `restore.test.ts`'s
         // "issue #353: currentLevel retention over a REAL node restart" test:
         // a real `BridgeNode` restart runs `restoreEndpoints()` (issue #141)
@@ -1453,12 +1501,13 @@ describe("currentLevel retention while off (#353)", () => {
         // Production reaches this specific shape only for an endpoint
         // `restoreEndpoints()` did not rebuild while matter.js itself still
         // holds persisted state for it — a narrower, unverified-end-to-end
-        // gap tracked separately as issue #355, because `createEndpoint`'s
-        // construction patch carries `currentLevel: 1` and `applyStates`
-        // never runs at all on this path. What survives here is entirely
-        // matter.js's own restore beating that construction patch — #353's
-        // fix is not exercised, and does not need to be, for this test to
-        // pass.
+        // gap tracked separately as issue #355. Since #355's fix `create()`
+        // runs `applyStates` on this path, so `retainLevelWhileOff` (#353 /
+        // ADR-0017) IS exercised here: `createEndpoint`'s construction patch
+        // carries `currentLevel: 1`, matter.js's own restore beats it, and
+        // the create-time `level: 0` push must then leave that restored
+        // value alone. (Before #355's fix this test passed on matter.js's
+        // restore alone.)
         const storagePath = mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-353-restart-"));
         scratchRoots.push(storagePath);
 
@@ -3085,6 +3134,136 @@ describe("onOff commands (§4.2, §7, #143, #201)", () => {
         }
     });
 
+    it("an off push landing at any point in a running countdown always lands (#338)", async () => {
+        // `timedOnTick` is a `{lock: true}` callback: every 100 ms it holds the
+        // `onOff.state` lock across an ASYNC commit of `onTime`. The plugin's
+        // push used to write synchronously, and a synchronous write that meets
+        // a held lock throws `SynchronousTransactionConflictError` instead of
+        // waiting — Indigo then showed off while the ecosystem still showed on.
+        // The race is timing-dependent (measured ~16% of random offsets), so
+        // sweep many offsets across several tick periods: the odds of a
+        // pre-fix run passing every one are vanishing.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const endpoint = only(h);
+            await h.registry.setState(1, { onOff: true });
+            const failures: string[] = [];
+            for (let i = 0; i < 150; i++) {
+                // The test's own setup takes the lock asynchronously, so a
+                // leftover tick from a failed iteration cannot fail the SETUP
+                // and mask which push actually lost the race.
+                await endpoint.act(async agent => {
+                    const behavior = agent.get(OnOffLighting);
+                    await agent.context.transaction.addResources(behavior);
+                    await agent.context.transaction.begin();
+                    await behavior.onWithTimedOff({
+                        onOffControl: { acceptOnlyWhenOn: false },
+                        onTime: 6000,
+                        offWaitTime: 0,
+                    });
+                });
+                // 0..~99 ms into a tick, stepping by a prime so offsets spread.
+                await new Promise(resolve => setTimeout(resolve, (i * 37) % 100));
+                try {
+                    await h.registry.setState(1, { onOff: false });
+                } catch (error) {
+                    failures.push(`#${i}: ${String(error)}`);
+                }
+                const state = endpoint.stateOf("onOff") as Record<string, unknown>;
+                if (state.onOff !== false) {
+                    failures.push(`#${i}: attribute still ${String(state.onOff)} after the off push`);
+                }
+                await h.registry.setState(1, { onOff: true });
+            }
+            assert.deepEqual(failures, [], "an off push lost the race against the countdown's tick lock");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("an ON push landing during a countdown the attribute has not yet confirmed also lands (#338)", async () => {
+        // The ON direction contends too: under no-auto-confirm an ecosystem
+        // `OnWithTimedOff` starts the timer while the attribute still reads
+        // false (the ON is only emitted), so Indigo's confirming ON push is a
+        // write racing the same `{lock: true}` tick.
+        const h = await harness();
+        try {
+            await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+            const endpoint = only(h);
+            const failures: string[] = [];
+            for (let i = 0; i < 100; i++) {
+                await endpoint.act(async agent => {
+                    const behavior = agent.get(OnOffLighting);
+                    await agent.context.transaction.addResources(behavior);
+                    await agent.context.transaction.begin();
+                    await behavior.onWithTimedOff({
+                        onOffControl: { acceptOnlyWhenOn: false },
+                        onTime: 6000,
+                        offWaitTime: 0,
+                    });
+                });
+                await new Promise(resolve => setTimeout(resolve, (i * 37) % 100));
+                try {
+                    await h.registry.setState(1, { onOff: true });
+                } catch (error) {
+                    failures.push(`#${i}: ${String(error)}`);
+                }
+                if ((endpoint.stateOf("onOff") as Record<string, unknown>).onOff !== true) {
+                    failures.push(`#${i}: attribute still false after the on push`);
+                }
+                try {
+                    await h.registry.setState(1, { onOff: false }); // the reset can lose the same race
+                } catch (error) {
+                    failures.push(`#${i} (reset): ${String(error)}`);
+                }
+            }
+            assert.deepEqual(failures, [], "an on push lost the race against the countdown's tick lock");
+        } finally {
+            await h.close();
+        }
+    });
+
+    /** Hold the onOff lock in another transaction until `release()` is called. */
+    async function holdOnOffLock(endpoint: Endpoint): Promise<{ release: () => void; done: Promise<void> }> {
+        let release!: () => void;
+        const held = new Promise<void>(resolve => (release = resolve));
+        let locked!: () => void;
+        const lockTaken = new Promise<void>(resolve => (locked = resolve));
+        const done = endpoint.act(async agent => {
+            const behavior = agent.get(OnOffLighting);
+            await agent.context.transaction.addResources(behavior);
+            await agent.context.transaction.begin();
+            locked();
+            await held;
+        }) as Promise<void>;
+        await lockTaken;
+        return { release, done };
+    }
+
+    for (const target of [false, true]) {
+        it(`deterministic: ${target ? "an on" : "an off"} push while another transaction holds the onOff lock waits, then lands (#338)`, async () => {
+            const h = await harness();
+            try {
+                await h.registry.reconcile([spec(1, Role.onOffLight)], false);
+                const endpoint = only(h);
+                await h.registry.setState(1, { onOff: !target });
+                const lock = await holdOnOffLock(endpoint);
+                const push = h.registry.setState(1, { onOff: target });
+                let settled = false;
+                push.then(() => (settled = true), () => (settled = true));
+                await new Promise(resolve => setTimeout(resolve, 50));
+                assert.equal(settled, false, "the push must wait for the lock, not resolve or reject while it is held");
+                lock.release();
+                await lock.done;
+                await push;
+                assert.equal((endpoint.stateOf("onOff") as Record<string, unknown>).onOff, target);
+            } finally {
+                await h.close();
+            }
+        });
+    }
+
     it("a redundant push does not kill a live countdown (§7.3)", async () => {
         const h = await harness();
         try {
@@ -3314,88 +3493,579 @@ describe("onOff commands (§4.2, §7, #143, #201)", () => {
 });
 
 describe("a countdown across a node restart (issue #203)", () => {
-    it("REPRODUCTION: a node restart drops a running countdown, leaving the device on", async () => {
-        // #203 confirmed, and its mechanism corrected. The issue predicted
-        // that neither the timer NOR `OnTime` would survive; measured, only
-        // the timer dies. `OnTime` comes back persisted at its remaining
-        // value while the in-memory `timedOnTimer` — a lazily created
-        // `Time.getPeriodicTimer` (`OnOffServer.js:151`) — does not, and
-        // nothing rearms it. The failure is one-directional: it can only
-        // ever leave something ON that was asked to go off.
-        //
-        // Deliberately driven through a real restart — close the node, reopen
-        // the SAME storage path — because the claim under test is about what
-        // matter.js persists, which a double cannot answer.
+    const REASON = "countdown_lost_on_restart";
+    const OFF_WITH_REASON = (indigoDeviceId: number): CommandEventData => ({
+        indigoDeviceId,
+        command: "onOff",
+        args: { value: false, reason: REASON },
+    });
+    const onTimeOf = (endpoint: Endpoint): unknown => (endpoint.stateOf("onOff") as Record<string, unknown>).onTime;
+    const markerOf = (h: Harness, deviceId: number): number | undefined =>
+        h.countdowns.countdownDeadline(uniqueIdFor(deviceId));
+    const on = (id: number): EndpointSpec => spec(id, Role.onOffLight, { states: { onOff: true } });
+    const off = (id: number): EndpointSpec => spec(id, Role.onOffLight, { states: { onOff: false } });
+
+    /** An ecosystem's OnWithTimedOff, as matter.js would invoke it. */
+    async function startCountdown(endpoint: Endpoint, onTime: number): Promise<void> {
+        await endpoint.act(agent =>
+            agent.get(OnOffLighting).onWithTimedOff({ onOffControl: { acceptOnlyWhenOn: false }, onTime, offWaitTime: 0 }),
+        );
+    }
+
+    const part = (h: Harness, deviceId: number): Endpoint => {
+        const found = [...h.aggregator.parts].find(candidate => candidate.id === uniqueIdFor(deviceId));
+        assert.ok(found !== undefined, `device ${deviceId} is live`);
+        return found;
+    };
+
+    /**
+     * Boot on `storagePath` the way the real node does after a restart:
+     * `restore()` the endpoints from the map (which must NOT clear a marker),
+     * then the attach's reconcile. The sweep is NOT run — the caller does, as
+     * the post-attach step.
+     */
+    async function reboot(storagePath: string, specs: EndpointSpec[], options: Parameters<typeof harness>[0] = {}) {
+        const h = await harness({ ...options, storagePath });
+        await h.registry.restore(specs.map(entry => ({ ...entry, reachable: false, states: {} })));
+        await h.registry.reconcile(specs, false);
+        h.recordIdentities();
+        return h;
+    }
+
+    /** Export the lamps ON (a persisted on), start a countdown on each, then close the node: a restart mid-countdown. */
+    async function restartMidCountdown(deviceIds: number[] = [1], onTime = 30): Promise<string> {
         const storagePath = mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-203-"));
         scratchRoots.push(storagePath);
-
-        const COUNTDOWN_DECISECONDS = 30; // 3s — long enough to restart inside
-
         const first = await harness({ storagePath });
         try {
-            await first.registry.reconcile([spec(1, Role.onOffLight)], false);
-            const endpoint = only(first);
-            await first.registry.setState(1, { onOff: true });
-            first.commands.length = 0;
+            await first.registry.reconcile(deviceIds.map(id => spec(id, Role.onOffLight)), false);
+            first.recordIdentities();
+            for (const id of deviceIds) {
+                await first.registry.setState(id, { onOff: true });
+                await startCountdown(part(first, id), onTime);
+                assert.equal(markerOf(first, id), first.clock.now + onTime * 100, "the countdown must leave a marker");
+            }
+        } finally {
+            await first.close();
+        }
+        return storagePath;
+    }
 
-            await endpoint.act(agent =>
-                agent.get(OnOffLighting).onWithTimedOff({
-                    onOffControl: { acceptOnlyWhenOn: false },
-                    onTime: COUNTDOWN_DECISECONDS,
-                    offWaitTime: 0,
-                }),
-            );
-            assert.deepEqual(
-                first.commands,
-                [{ indigoDeviceId: 1, command: "onOff", args: { value: true } }],
-                "the countdown's ON must reach Indigo",
-            );
+    it("a real lost countdown is ended by exactly one off, sent by the sweep, carrying its reason", async () => {
+        const storagePath = await restartMidCountdown();
+        const second = await reboot(storagePath, [on(1)]);
+        try {
+            assert.deepEqual(second.commands, [], "the attach reconcile itself sends nothing — the sweep runs after the response");
+            second.clock.now += 5000; // the deadline has passed
+            await second.registry.sweepCountdowns();
+            assert.deepEqual(second.commands, [OFF_WITH_REASON(1)]);
             assert.ok(
-                ((endpoint.stateOf("onOff") as Record<string, number>).onTime ?? 0) > 0,
-                "precondition: a countdown must actually be running before the restart",
+                second.logs.some(line => /^Endpoint 1:/.test(line) && /countdown/i.test(line)),
+                "the node log says why",
             );
         } finally {
-            await first.close(); // the restart
+            await second.close();
         }
+    });
 
+    it("an off that was sent but never confirmed stays stranded: the next attach sends it again", async () => {
+        const storagePath = await restartMidCountdown();
+        const second = await reboot(storagePath, [on(1)]);
+        try {
+            second.clock.now += 5000;
+            await second.registry.sweepCountdowns();
+            assert.equal(second.commands.length, 1);
+            assert.ok(markerOf(second, 1) !== undefined, "an unconfirmed off must not clear the marker");
+            assert.ok((onTimeOf(part(second, 1)) as number) > 0, "an unconfirmed off must not zero onTime");
+
+            second.commands.length = 0;
+            await second.registry.reconcile([on(1)], false); // a plugin-only reattach
+            await second.registry.sweepCountdowns();
+            assert.deepEqual(second.commands, [OFF_WITH_REASON(1)], "retried at the next attach");
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("once Indigo confirms the off, the next attach and the next restart send nothing", async () => {
+        const storagePath = await restartMidCountdown();
+        const second = await reboot(storagePath, [on(1)]);
+        try {
+            second.clock.now += 5000;
+            await second.registry.sweepCountdowns();
+            assert.equal(second.commands.length, 1);
+            await second.registry.setState(1, { onOff: false }); // the confirming push
+            assert.equal(onTimeOf(part(second, 1)), 0, "super.off() zeroes onTime");
+            assert.equal(markerOf(second, 1), undefined, "and the marker clears with it");
+
+            second.commands.length = 0;
+            await second.registry.reconcile([off(1)], false);
+            await second.registry.sweepCountdowns();
+            assert.deepEqual(second.commands, [], "next attach");
+        } finally {
+            await second.close();
+        }
+        const third = await reboot(storagePath, [off(1)]);
+        try {
+            third.clock.now += 5000;
+            await third.registry.sweepCountdowns();
+            assert.deepEqual(third.commands, [], "next restart");
+        } finally {
+            await third.close();
+        }
+    });
+
+    it("a controller writing OnTime on a lit light never creates a countdown: a plugin reattach sends nothing", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([on(1)], false);
+            h.recordIdentities();
+            await h.registry.setState(1, { onOff: true });
+            await part(h, 1).set({ onOff: { onTime: 50 } } as never); // a controller's attribute write: no timer starts
+            assert.equal(markerOf(h, 1), undefined);
+            await h.registry.reconcile([on(1)], false);
+            await h.registry.sweepCountdowns();
+            h.clock.now += 3_600_000;
+            await h.registry.sweepCountdowns();
+            assert.deepEqual(h.commands, [], "the OnTime write alone must never switch the light off");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("un-exporting during a countdown, then a restart, then re-exporting the lamp on sends no off and reads onTime 0", async () => {
+        const storagePath = await restartMidCountdown();
+        // The un-export, on the same storage, before the restart.
+        const middle = await reboot(storagePath, [on(1)]);
+        try {
+            await middle.registry.remove(1); // ADR-0016: the endpoint and its marker go
+            assert.equal(markerOf(middle, 1), undefined, "removal drops the marker");
+        } finally {
+            await middle.close();
+        }
+        const last = await harness({ storagePath });
+        try {
+            // matter.js kept the old `onTime` in its own storage (only the map record is destroyed).
+            await last.registry.reconcile([on(1)], false); // the re-export, lamp on
+            assert.equal(onTimeOf(part(last, 1)), 0, "a fresh export has no countdown to keep");
+            last.clock.now += 5000;
+            await last.registry.sweepCountdowns();
+            assert.deepEqual(last.commands, []);
+        } finally {
+            await last.close();
+        }
+    });
+
+    it("a plugin-only reattach while the countdown timer is still running sends nothing and leaves it running", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([on(1)], false);
+            h.recordIdentities();
+            await h.registry.setState(1, { onOff: true });
+            await startCountdown(part(h, 1), 50);
+            h.commands.length = 0;
+            await h.registry.reconcile([on(1)], false);
+            h.clock.now += 3_600_000;
+            await h.registry.sweepCountdowns();
+            assert.deepEqual(h.commands, [], "the timer is running: nothing is stranded");
+            assert.ok((onTimeOf(part(h, 1)) as number) > 0);
+            await waitFor(() => h.commands.length > 0, 6000);
+            assert.deepEqual(h.commands, [{ indigoDeviceId: 1, command: "onOff", args: { value: false } }], "the real expiry, no reason");
+            assert.equal(markerOf(h, 1), undefined, "a natural end clears the marker");
+        } finally {
+            await h.close();
+        }
+    });
+
+    describe("a controller writing OnTime mid-countdown (I1)", () => {
+        // A write stops matter.js's timer for 0 and 0xFFFF (`#stopHeldTimer`) and re-targets a running one
+        // for any other value. Either way the marker must follow, or a later reattach/restart acts on a
+        // deadline that is no longer true. The reattach case needs no restart at all.
+        const cases: { name: string; onTime: number; marker: (h: Harness) => number | undefined }[] = [
+            { name: "0xFFFF (hold on)", onTime: 0xffff, marker: () => undefined },
+            { name: "0 (cancel, stay on)", onTime: 0, marker: () => undefined },
+            { name: "a larger value", onTime: 1200, marker: h => h.clock.now + 120_000 },
+            { name: "a smaller value", onTime: 300, marker: h => h.clock.now + 30_000 },
+        ];
+        for (const { name, onTime, marker } of cases) {
+            it(`${name}: the marker follows, so a plain reattach sends nothing`, async () => {
+                const h = await harness();
+                try {
+                    await h.registry.reconcile([on(1)], false);
+                    h.recordIdentities();
+                    await h.registry.setState(1, { onOff: true });
+                    await startCountdown(part(h, 1), 600);
+                    assert.equal(markerOf(h, 1), h.clock.now + 60_000);
+                    h.commands.length = 0;
+                    await part(h, 1).set({ onOff: { onTime } } as never);
+                    await waitFor(() => markerOf(h, 1) === marker(h), 2000);
+                    assert.equal(markerOf(h, 1), marker(h), "the marker followed the controller's write");
+                    h.clock.now += 3_600_000; // far past every deadline involved
+                    await h.registry.reconcile([on(1)], false);
+                    await h.registry.sweepCountdowns();
+                    assert.deepEqual(h.commands, [], "no unprompted off at the old deadline");
+                } finally {
+                    await h.close();
+                }
+            });
+
+            it(`${name}: the marker follows, so a restart acts on the new deadline`, async () => {
+                const storagePath = mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-203-"));
+                scratchRoots.push(storagePath);
+                const first = await harness({ storagePath });
+                try {
+                    await first.registry.reconcile([on(1)], false);
+                    first.recordIdentities();
+                    await first.registry.setState(1, { onOff: true });
+                    await startCountdown(part(first, 1), 600); // old deadline t0 + 60 s
+                    await part(first, 1).set({ onOff: { onTime } } as never);
+                    await waitFor(() => markerOf(first, 1) === marker(first), 2000);
+                    assert.equal(markerOf(first, 1), marker(first), "the marker followed the controller's write");
+                } finally {
+                    await first.close();
+                }
+                const second = await reboot(storagePath, [on(1)]);
+                try {
+                    if (onTime === 300) {
+                        second.clock.now += 45_000; // past the NEW 30 s deadline, before the old 60 s one
+                        await second.registry.sweepCountdowns();
+                        assert.deepEqual(second.commands, [OFF_WITH_REASON(1)], "the shorter countdown really ended");
+                    } else if (onTime === 1200) {
+                        second.clock.now += 90_000; // past the OLD deadline, before the new 120 s one
+                        await second.registry.sweepCountdowns();
+                        assert.deepEqual(second.commands, [], "the extended countdown has not ended");
+                    } else {
+                        second.clock.now += 3_600_000;
+                        await second.registry.sweepCountdowns();
+                        assert.deepEqual(second.commands, [], "a cancelled / held countdown is never ended");
+                    }
+                } finally {
+                    await second.close();
+                }
+            });
+        }
+    });
+
+    it("an Indigo push does not clear a marker while the countdown it is replaying is genuinely running (S1)", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([off(1)], false);
+            h.recordIdentities();
+            // An ecosystem OnWithTimedOff: attribute still off (Indigo has not confirmed), timer running, marker set.
+            await startCountdown(part(h, 1), 600);
+            const marked = markerOf(h, 1);
+            assert.ok(marked !== undefined);
+            await h.registry.setState(1, { onOff: false }); // the replayed off, equal to the attribute
+            assert.equal(markerOf(h, 1), marked, "a replayed off must not drop the marker of a running countdown");
+            await h.registry.setState(1, { onOff: true }); // Indigo confirms the ON
+            assert.equal(markerOf(h, 1), marked, "confirming ON leaves it alone");
+            await h.registry.setState(1, { onOff: false }); // Indigo off ends it
+            assert.equal(markerOf(h, 1), undefined);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("a deadline further out than a countdown can last is discarded with a warning, never turned into an off (S2)", async () => {
+        const storagePath = await restartMidCountdown();
+        const second = await reboot(storagePath, [on(1)]);
+        try {
+            second.countdowns.setCountdown(uniqueIdFor(1), second.clock.now + 40 * 24 * 3600 * 1000);
+            await second.registry.sweepCountdowns();
+            await new Promise(resolve => setTimeout(resolve, 200));
+            assert.deepEqual(second.commands, [], "an overflowing setTimeout would have fired an off after 1 ms");
+            assert.equal(markerOf(second, 1), undefined, "discarded");
+            assert.ok(second.logs.some(line => /^Endpoint 1:/.test(line) && /implausible/.test(line)));
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("a re-sent off says it is retrying (S4)", async () => {
+        const storagePath = await restartMidCountdown();
+        const second = await reboot(storagePath, [on(1)]);
+        try {
+            second.clock.now += 5000;
+            await second.registry.sweepCountdowns();
+            assert.ok(!second.logs.some(line => /retrying/.test(line)), "the first send is not a retry");
+            await second.registry.reconcile([on(1)], false);
+            await second.registry.sweepCountdowns();
+            assert.ok(second.logs.some(line => /^Endpoint 1:/.test(line) && /retrying/.test(line)));
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("a deadline still in the future at restart sends nothing until it passes, then one off", async () => {
+        const storagePath = await restartMidCountdown([1], 10); // marker = t0 + 1000ms
+        const second = await reboot(storagePath, [on(1)]);
+        try {
+            second.clock.now += 300; // 700ms still to run
+            await second.registry.sweepCountdowns();
+            assert.deepEqual(second.commands, [], "not yet");
+            await waitFor(() => second.commands.length > 0, 3000);
+            assert.deepEqual(second.commands, [OFF_WITH_REASON(1)]);
+            await new Promise(resolve => setTimeout(resolve, 150));
+            assert.equal(second.commands.length, 1, "exactly one");
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("a deadline still in the future sends nothing at all if Indigo turned the device off first", async () => {
+        const storagePath = await restartMidCountdown([1], 10);
+        const second = await reboot(storagePath, [on(1)]);
+        try {
+            second.clock.now += 300;
+            await second.registry.sweepCountdowns();
+            await second.registry.setState(1, { onOff: false });
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            assert.deepEqual(second.commands, [], "the pending off was cancelled with the countdown");
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("a pending off is cancelled when the endpoint is removed", async () => {
+        const storagePath = await restartMidCountdown([1], 10);
+        const second = await reboot(storagePath, [on(1)]);
+        try {
+            second.clock.now += 300;
+            await second.registry.sweepCountdowns();
+            await second.registry.remove(1);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            assert.deepEqual(second.commands, []);
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("closing the registry cancels a pending off", async () => {
+        const storagePath = await restartMidCountdown([1], 10);
+        const second = await reboot(storagePath, [on(1)]);
+        second.clock.now += 300;
+        await second.registry.sweepCountdowns();
+        second.registry.close();
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        assert.deepEqual(second.commands, []);
+        await second.close();
+    });
+
+    it("storage written before the marker existed (no marker) is never treated as a lost countdown", async () => {
+        const storagePath = await restartMidCountdown();
+        rmSync(join(storagePath, COUNTDOWNS_FILE)); // what a pre-upgrade install looks like
+        const second = await reboot(storagePath, [on(1)]);
+        try {
+            assert.ok((onTimeOf(part(second, 1)) as number) > 0, "precondition: a stale onTime IS on disk");
+            second.clock.now += 5000;
+            await second.registry.sweepCountdowns();
+            assert.deepEqual(second.commands, []);
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("an off dropped because no client was attached leaves the marker, so the next attach sends it", async () => {
+        const storagePath = await restartMidCountdown();
+        const second = await reboot(storagePath, [on(1)], { emitDrops: true });
+        try {
+            second.clock.now += 5000;
+            await second.registry.sweepCountdowns(); // the emit goes nowhere, as sendEvent does with no client
+            assert.ok(markerOf(second, 1) !== undefined, "the marker must survive an off nobody received");
+            assert.ok((onTimeOf(part(second, 1)) as number) > 0);
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("the markers follow the countdown: set by OnWithTimedOff, cleared by expiry, an ecosystem off, an Indigo off and an indefinite hold", async () => {
+        const h = await harness();
+        try {
+            await h.registry.reconcile([on(1)], false);
+            h.recordIdentities();
+            await h.registry.setState(1, { onOff: true });
+            const endpoint = part(h, 1);
+
+            await startCountdown(endpoint, 50);
+            assert.equal(markerOf(h, 1), h.clock.now + 5000);
+            await h.registry.setState(1, { onOff: false });
+            assert.equal(markerOf(h, 1), undefined, "Indigo off");
+
+            await h.registry.setState(1, { onOff: true });
+            await startCountdown(endpoint, 50);
+            await endpoint.act(agent => agent.get(OnOffLighting).off()); // an ecosystem Off command
+            assert.equal(markerOf(h, 1), undefined, "ecosystem off");
+
+            await h.registry.setState(1, { onOff: false });
+            await h.registry.setState(1, { onOff: true });
+            await startCountdown(endpoint, 0xffff);
+            assert.equal(markerOf(h, 1), undefined, "an indefinite hold is not a countdown");
+
+            await h.registry.setState(1, { onOff: false });
+            await h.registry.setState(1, { onOff: true });
+            await startCountdown(endpoint, 3);
+            assert.ok(markerOf(h, 1) !== undefined);
+            await waitFor(() => markerOf(h, 1) === undefined, 3000);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("a leftover onTime on an endpoint that reads off is cleared with one INFO line, but never while a timer is running", async () => {
+        const storagePath = mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-203-"));
+        scratchRoots.push(storagePath);
+        const first = await harness({ storagePath });
+        try {
+            await first.registry.reconcile([off(1)], false);
+            await part(first, 1).set({ onOff: { onTime: 40 } } as never);
+        } finally {
+            await first.close();
+        }
+        const second = await reboot(storagePath, [off(1)]);
+        try {
+            assert.equal(onTimeOf(part(second, 1)), 40);
+            await second.registry.sweepCountdowns();
+            assert.equal(onTimeOf(part(second, 1)), 0);
+            assert.deepEqual(second.commands, []);
+            assert.equal(second.logs.filter(line => /^Endpoint 1:/.test(line) && /leftover onTime/.test(line)).length, 1);
+
+            // A countdown whose ON Indigo has not confirmed yet: attribute off, timer RUNNING, onTime counting.
+            await startCountdown(part(second, 1), 100);
+            await second.registry.sweepCountdowns();
+            assert.ok((onTimeOf(part(second, 1)) as number) > 0, "a running countdown must never be zeroed");
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("a sweep failure on one endpoint reaches the warnings channel, the others are still recovered, and a later success withdraws it", async () => {
+        const storagePath = await restartMidCountdown([1, 2]);
+        const second = await reboot(storagePath, [on(1), on(2)]);
+        const proto = Endpoint.prototype as unknown as { act: (...args: unknown[]) => Promise<unknown> };
+        const originalAct = proto.act;
+        try {
+            second.clock.now += 5000;
+            proto.act = function (this: Endpoint, ...args: unknown[]): Promise<unknown> {
+                if (this.id === uniqueIdFor(1)) {
+                    return Promise.reject(new Error("storage refused the read"));
+                }
+                return originalAct.apply(this, args);
+            };
+            await second.registry.sweepCountdowns();
+        } finally {
+            proto.act = originalAct;
+        }
+        try {
+            assert.deepEqual(second.commands, [OFF_WITH_REASON(2)], "the healthy endpoint is still recovered");
+            assert.equal(second.warnings.size, 1);
+            const [warning] = [...second.warnings.values()];
+            assert.match(warning!, /device 1/);
+            assert.match(warning!, /storage refused the read/);
+            assert.match(warning!, /next attach/i);
+            await second.registry.sweepCountdowns();
+            assert.equal(second.warnings.size, 0, "withdrawn once the endpoint sweeps cleanly");
+            assert.deepEqual(
+                second.commands.map(command => command.indigoDeviceId).sort(),
+                [1, 2, 2],
+                "device 1 is now recovered; device 2 is still unconfirmed so it is re-sent",
+            );
+        } finally {
+            await second.close();
+        }
+    });
+});
+
+describe("a create-time applyStates failure (issue #355)", () => {
+    it("names the device and role, says the endpoint is live but its state was not applied, and leaves it live", async () => {
+        const h = await harness();
+        const proto = IndigoOnOffServer.prototype;
+        const original = proto.applyIndigoOnOff;
+        try {
+            proto.applyIndigoOnOff = function (): Promise<void> {
+                return Promise.reject(new Error("storage refused the write"));
+            };
+            const error = await rejects(
+                () => h.registry.upsert(spec(7, Role.onOffLight, { states: { onOff: true } })),
+                ErrorCode.internal,
+            );
+            assert.match(error.message, /device 7/);
+            assert.match(error.message, /onOffLight/);
+            assert.match(error.message, /live/);
+            assert.match(error.message, /could not be applied/);
+            assert.match(error.message, /storage refused the write/);
+            assert.equal(h.registry.size, 1, "the endpoint stays live — the message must not claim otherwise");
+        } finally {
+            proto.applyIndigoOnOff = original;
+            await h.close();
+        }
+    });
+
+    it("a create whose states cannot be applied fails the reconcile, stays live, and bumps ConfigurationVersion", async () => {
+        const h = await harness();
+        const version = (): number =>
+            (h.node.state.basicInformation as { configurationVersion?: number }).configurationVersion ?? 0;
+        const proto = Endpoint.prototype as unknown as { set: (...args: unknown[]) => Promise<void> };
+        const originalSet = proto.set;
+        try {
+            const start = version();
+            proto.set = function (this: Endpoint, ...args: unknown[]): Promise<void> {
+                const values = args[0] as Record<string, unknown> | undefined;
+                if (this.id === uniqueIdFor(7) && values?.levelControl !== undefined) {
+                    return Promise.reject(new Error("storage refused the create-time level"));
+                }
+                return originalSet.apply(this, args);
+            };
+            const error = await rejects(
+                () => h.registry.reconcile([spec(7, Role.dimmableLight, { states: { onOff: true, level: 60 } })], false),
+                ErrorCode.internal,
+            );
+            proto.set = originalSet;
+            assert.match(error.message, /device 7/);
+            assert.match(error.message, /storage refused the create-time level/);
+            assert.equal([...h.aggregator.parts].length, 1, "the endpoint stays registered for the next update to retry");
+            assert.ok(version() > start, `ConfigurationVersion must move: ${start} -> ${version()}`);
+        } finally {
+            proto.set = originalSet;
+            await h.close();
+        }
+    });
+
+    it("re-exporting every role over different persisted states emits no command (create-time applyStates is local)", async () => {
+        const storagePath = mkdtempSync(join(SCRATCH_ROOT, "indigo-matter-355all-"));
+        scratchRoots.push(storagePath);
+        const specs = (golden.attach_all_roles.request.args as { endpoints: EndpointSpec[] }).endpoints.map(entry => ({
+            ...spec(entry.indigoDeviceId, entry.role),
+            states: entry.states,
+            battery: entry.battery ?? false,
+            options: entry.options ?? {},
+        }));
+        const ids = new Set(specs.map(entry => entry.indigoDeviceId));
+        const pushes = Object.entries(golden as unknown as Record<string, unknown>)
+            .filter(([name]) => name.startsWith("set_state_"))
+            .map(
+                ([, example]) =>
+                    (example as { request: { args: { indigoDeviceId: number; states: Record<string, unknown> } } })
+                        .request.args,
+            )
+            .filter(args => ids.has(args.indigoDeviceId));
+        assert.ok(specs.length >= 20 && pushes.length > 0, `precondition: ${specs.length} roles, ${pushes.length} pushes`);
+        const first = await harness({ storagePath });
+        try {
+            await first.registry.reconcile(specs, false);
+            for (const args of pushes) {
+                await first.registry.setState(args.indigoDeviceId, args.states);
+            }
+            for (const entry of specs) {
+                await first.registry.remove(entry.indigoDeviceId);
+            }
+        } finally {
+            await first.close();
+        }
         const second = await harness({ storagePath });
         try {
-            await second.registry.reconcile([spec(1, Role.onOffLight)], false);
-            const endpoint = only(second);
-            // The plugin's own attach push. Indigo still has the device ON,
-            // correctly — it was turned on and nothing has turned it off.
-            await second.registry.setState(1, { onOff: true });
-            second.commands.length = 0;
-
-            // The mechanism, and NOT the one #203 modelled: `OnTime` survives
-            // the restart intact — matter.js persists the attribute — while
-            // `timedOnTimer` does not, because it is an in-memory
-            // `Time.getPeriodicTimer` nothing rearms on start
-            // (`OnOffServer.js:151`). So the endpoint comes back openly
-            // stating that 3.0s of countdown were left, and no clock is
-            // running against it.
-            //
-            // That is the useful half of this reproduction: the evidence a
-            // fix needs is already on disk. A fix does not have to persist
-            // anything new — only to READ this at attach.
-            assert.equal(
-                (endpoint.stateOf("onOff") as Record<string, unknown>).onTime,
-                COUNTDOWN_DECISECONDS,
-                "OnTime is persisted verbatim — the in-flight countdown is still legible after the restart",
-            );
-
-            // Well past the original 3s deadline.
-            await waitFor(() => second.commands.length > 0, 4500);
-            assert.deepEqual(
-                second.commands,
-                [],
-                "#203 REPRODUCED: no off ever reaches Indigo, so the device stays on indefinitely",
-            );
-            assert.equal(
-                (endpoint.stateOf("onOff") as Record<string, unknown>).onOff,
-                true,
-                "and the attribute agrees with Indigo that it is still on",
-            );
+            await second.registry.reconcile(specs, false);
+            await new Promise(resolve => setTimeout(resolve, 300));
+            assert.deepEqual(second.commands, [], "create-time applyStates echoed a command to the plugin");
         } finally {
             await second.close();
         }

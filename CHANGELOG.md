@@ -44,6 +44,103 @@ current version is `Info.plist`'s `PluginVersion`.
   `threadHealth` state a trigger might watch is unchanged. A node that is both Unassigned
   and unavailable gets both flags.
 
+## 2026.35.2 — Toggle follows what Indigo shows, not what the bulb believes
+
+- Fix (issue #367): Indigo's Toggle on a light (relay, dimmer or colour dimmer)
+  was sent to the device as Matter's own `Toggle`, which flips the device's idea
+  of its state. When that differs from what Indigo shows (IKEA KAJPLATS bulbs keep
+  reporting "on" while dark after a power cut) you got the opposite of what the
+  screen promised. Toggle now sends `Off` if Indigo shows the light on and `On` if
+  it shows it off, the same way the plugin's locks, valves and thermostats already
+  behave. It falls back to Matter `Toggle` only when Indigo has no usable on/off
+  state for the device. Dimmers are judged by their on/off state, not brightness.
+- User-visible consequences. If Indigo shows a light as off while it is actually
+  lit, Toggle sends `On` and nothing visible happens; a second Toggle then turns
+  it off. Two Toggles sent before the device has reported back used to return the
+  light to where it started (Matter `Toggle` twice); now both read the same shown
+  state and send the same command, so it ends in that state.
+- Explicit On/Off is also safer when a command times out and is retried: a late
+  command plus its retry give the same end state, where two Toggles would cancel.
+- The Matter `Toggle` fallback is defensive and not expected on real devices
+  (relays and dimmers always have an on/off state). If it is ever used, one
+  warning per device per plugin run names the device and the value.
+
+## 2026.35.1 — A null attribute update no longer turns an on/off device off
+
+- Fix (issue #374): matter-server 1.5.0 and later report an attribute that has been
+  removed from a node (after a firmware update or a re-interview) as an ordinary
+  update whose value is null. The plugin read a null on/off value as "off" and
+  wrote it to the device. A null now means "no value known": the plugin keeps the
+  device's last state, or its creation default if no value was ever received, and
+  logs one info line per device and attribute naming the device, node, endpoint,
+  cluster and attribute (repeats stay at debug). A null can also be a nullable
+  attribute that is temporarily unknown, so the line does not say "removed". The same applies to a null in a node's initial snapshot. Every other
+  device type already ignored nulls; this is now enforced in one place for all of
+  them. Thread diagnostics still reads a null neighbour table as "unknown" as before.
+  Nothing here changes which matter-server the plugin uses.
+
+## 2026.35.0 — Bridge 0.18.0: three Matter export fixes on matter.js 0.18
+
+Needs **bridge 0.18.0** (Install/update the Matter bridge; the plugin now pins it).
+The plugin/bridge protocol is unchanged (still v2), so no handshake or minimum-version
+check moves.
+
+- Upgrade (issue #375): the bridge node now runs on matter.js 0.18.0 (was 0.17.8). A
+  bridge commissioned on 0.17.8 starts on 0.18.0 with the same fabric and endpoints in
+  a matter.js test controller; **not yet soaked against real Apple Home and Alexa**, so
+  expect to watch the first days. matter.js 0.18 now also publishes a Groupcast cluster
+  and the Auxiliary ACL on the bridge's root endpoint, and logs a device-type warning
+  for a smoke or CO alarm exported without a battery (it always lacked the Power Source
+  cluster its device type calls for; 0.18 is just the first version to say so).
+- Fix (issue #338): turning a device off from Indigo while an ecosystem's timed-on
+  countdown (`OnWithTimedOff`) was running could fail with a transaction conflict,
+  leaving Indigo showing off and the ecosystem showing on. The bridge now waits for the
+  countdown's lock instead of failing. The same wait protects pushing a device on.
+- Fix (first pairing, found in review): matter.js 0.18 now really ends the window an unpaired
+  bridge advertises on after 48 hours (0.17.8 never did), so a bridge left unpaired for two days —
+  or two days after a factory reset or after its last ecosystem was removed — stopped being
+  discoverable while the pairing menu still said it was advertising. The bridge now reports the real
+  window state and re-enters commissionable mode itself (same pairing codes) within a minute, or at
+  once when you ask for the pairing codes. A paired bridge is unaffected.
+- Fix (issue #203): restarting the bridge node mid-countdown left the device on for
+  good, because the countdown timer lived only in memory. The bridge now records each
+  timed-on countdown it starts (its end time, in a small `countdowns.json` beside
+  `endpoint-map.json`, which countdown activity never rewrites) and clears that record when the countdown ends, when the device
+  goes off by any route, and when the endpoint is removed or freshly exported. After the
+  next attach it turns off, in Indigo, a device that reads on with a recorded countdown
+  and no timer running: at once if the end time has passed, otherwise when it does. It
+  never infers a lost countdown from the remaining time alone, so a controller writing
+  the On-time attribute, or a device you re-export while its old countdown was
+  pending, is left alone. The off is sent only after the attach has completed, carries a
+  reason, and is logged in the Indigo log (`turning "<name>" off — its timed-on countdown
+  was lost when the bridge node restarted`). The recovery never marks itself done: Indigo's confirmation that
+  the device is off does, so an off that was never executed is sent again at the next attach
+  (a countdown that ends naturally while the plugin is detached is the one case where the off is
+  dropped and the device stays on, as before); a recovery that fails is reported in the Indigo log. A controller changing the On-time
+  of a running countdown moves or cancels the record with it. A countdown that is still
+  running (a plugin-only reconnect) and a device Indigo reports off are left alone.
+  **Known limitations:** a countdown already running when the bridge is upgraded (started under
+  bridge 0.17.x, or recorded by an earlier unreleased build) has no recorded end time and is not
+  recovered; and if you turn the device off and on again in Indigo while the
+  node is down, that deliberate "on" is indistinguishable from the lost countdown and is
+  turned off.
+- Fix (issue #355): un-exporting a device, restarting the bridge node and exporting it
+  again brought the accessory back showing its old state (on/off, brightness, colour
+  temperature) instead of the state sent with the export. The bridge now applies those
+  states when it creates the endpoint. A failure to do so is reported naming the device and
+  saying the accessory is live but may show stale state, instead of "nothing is exported",
+  and the plugin re-sends that device's state on its next change.
+- New: the plugin now warns, once per connection, when the running bridge node is older than
+  the version this plugin release installs, naming **Install/update the Matter bridge**
+  (and notes a newer one), like the existing matter-server check.
+- Internal: the bridge pins matter.js's device-type validation to `warn` explicitly, so a future
+  matter.js default change cannot refuse the mains smoke/CO endpoint and abort every attach; and
+  the commissioning window passes its duration to matter.js 0.18's own window timer so the two
+  agree (an expiry is still reported as expired).
+- Internal: the session-hygiene age in the bridge log is now a whole number of
+  milliseconds (matter.js 0.18 reports session times on a monotonic clock; only
+  differences between them are used).
+
 ## 2026.34.1 — Stopping the bridge node on purpose is no longer reported as a failure
 
 - Fix (issue #366): an un-export that had completed was repeated on every plugin

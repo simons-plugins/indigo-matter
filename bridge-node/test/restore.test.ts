@@ -23,12 +23,15 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { after, describe, it } from "node:test";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { after, describe, it, mock } from "node:test";
 
-import { type Endpoint, Logger, ServerNode } from "@matter/main";
+import { type Endpoint, Environment, Environmental, Logger, Seconds, ServerNode, Time, UninitializedDependencyError } from "@matter/main";
+import { AdministratorCommissioning } from "@matter/main/clusters/administrator-commissioning";
+import { DeviceCommissioner, FabricManager, FailsafeContext } from "@matter/main/protocol";
 import { OnOffServer } from "@matter/main/behaviors/on-off";
 
 import {
@@ -37,7 +40,9 @@ import {
     type EndpointMapFile,
     type EndpointMapFileV1,
 } from "../src/endpoint-map.js";
-import { uniqueIdFor } from "../src/endpoints.js";
+import { COUNTDOWNS_FILE } from "../src/countdowns.js";
+import { EndpointMapStore } from "../src/endpoint-map.js";
+import { IndigoOnOffServer, uniqueIdFor } from "../src/endpoints.js";
 import { BridgeNode, ENDPOINT_COUNT_ADVISORY, ENDPOINT_COUNT_WARNING, matterJsVersion } from "../src/node.js";
 import { ErrorCode, PROTOCOL_VERSION, RefuseReason } from "../src/protocol.js";
 import { BridgeWsServer } from "../src/ws-server.js";
@@ -111,12 +116,12 @@ interface Session {
 }
 
 /** Start a real node + protocol server on `storagePath` and connect to it. */
-async function boot(storagePath: string, options: { commissionedAt?: string; refusal?: string } = {}):
+async function boot(storagePath: string, options: { commissionedAt?: string; refusal?: string; commissionableCheckMs?: number } = {}):
     Promise<Session> {
     const logged: string[] = [];
     const bridge = new BridgeNode(
         // Ephemeral on both ports, so a parallel run cannot collide.
-        { storagePath, matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK },
+        { storagePath, matterPort: 0, wsPort: 0, mdnsInterface: LOOPBACK, commissionableCheckMs: options.commissionableCheckMs },
         options.commissionedAt === undefined
             ? { ...IDENTITY }
             : { ...IDENTITY, commissionedAt: options.commissionedAt },
@@ -172,6 +177,11 @@ async function attach(
         }
         events.push(frame);
     }
+}
+
+function readCountdowns(storagePath: string): Record<string, number> {
+    return (JSON.parse(readFileSync(join(storagePath, COUNTDOWNS_FILE), "utf8")) as { countdowns: Record<string, number> })
+        .countdowns;
 }
 
 function readMap(storagePath: string): EndpointMapFile {
@@ -467,11 +477,7 @@ describe("issue #353: currentLevel retention over a REAL node restart", () => {
         // `registry.test.ts`'s create-path restart test drives (a fresh
         // `Registry` against old storage, which always takes the CREATE
         // branch regardless of what is on disk — see that test's own comment,
-        // and issue #355 for the narrower gap it leaves: `create` never calls
-        // `applyStates` at all, so that path survives only because persisted
-        // nonvolatile values take precedence over construction values —
-        // matter.js's own restore is applied AFTER the construction patch,
-        // deterministically, not by winning a race against it).
+        // and issue #355, fixed since: `create` now runs `applyStates` too).
         const storagePath = storage();
         const LANDING = 223456792;
         const landingSpec = {
@@ -1601,6 +1607,725 @@ describe("issue #274 at node level: remove_endpoint destroys, so a later upsert 
                 readMap(storagePath).endpoints[uniqueIdFor(KITCHEN)],
                 undefined,
                 "KITCHEN's own removal destroyed the entry outright — nothing left to pair with",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+});
+
+async function setStateFor(
+    client: TestClient,
+    messageId: string,
+    indigoDeviceId: number,
+    states: Record<string, unknown>,
+): Promise<void> {
+    client.send({ message_id: messageId, command: "set_state", args: { indigoDeviceId, states } });
+    for (;;) {
+        const frame = await client.next(10_000);
+        if (frame.message_id === messageId) {
+            assert.equal(frame.error_code, undefined, JSON.stringify(frame));
+            return;
+        }
+    }
+}
+
+describe("issue #355: un-export, restart, re-export", () => {
+    it("the states sent with the re-export win over what matter.js persisted for that id", async () => {
+        // ADR-0016 deletes the removed endpoint's map record, so the next boot
+        // restores nothing for it — but `closeOne` only `close()`s the
+        // endpoint, so matter.js still holds its persisted attributes. The
+        // re-export is then a CREATE (not the update branch a restored
+        // endpoint takes), and before #355 `create()` never applied
+        // `spec.states`: the accessory came back with the OLD onOff.
+        const storagePath = storage();
+
+        const first = await boot(storagePath);
+        try {
+            await attach(first.client, "a1", [LOUNGE_SPEC]);
+            first.client.send({
+                message_id: "s1",
+                command: "set_state",
+                args: { indigoDeviceId: LOUNGE, states: { onOff: false, level: 20 } },
+            });
+            for (;;) {
+                const frame = await first.client.next(10_000);
+                if (frame.message_id === "s1") {
+                    assert.equal(frame.error_code, undefined, JSON.stringify(frame));
+                    break;
+                }
+            }
+            assert.equal(onOffOf(first.bridge.server, LOUNGE), false, "fixture setup: persisted state is off");
+            assert.notEqual(
+                currentLevelOf(first.bridge.server, LOUNGE),
+                152,
+                "fixture setup: the persisted level (20%) differs from the one the re-export carries (60%)",
+            );
+            await removeOne(first.client, "r1", LOUNGE);
+        } finally {
+            await first.close();
+        }
+
+        const second = await boot(storagePath);
+        try {
+            assert.equal(
+                childOf(second.bridge.server, LOUNGE),
+                undefined,
+                "the un-exported device is not restored (ADR-0016)",
+            );
+            const { events } = await attach(second.client, "a2", [LOUNGE_SPEC]);
+            assert.equal(
+                onOffOf(second.bridge.server, LOUNGE),
+                true,
+                "#355: the re-exported accessory must show the state it was exported with, not the persisted one",
+            );
+            assert.equal(currentLevelOf(second.bridge.server, LOUNGE), 152, "level 60% from the export");
+            assert.deepEqual(
+                events.filter(frame => frame.event === "command"),
+                [],
+                "applying initial states must not emit command events to the plugin",
+            );
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("a re-export's colour temperature wins over a different persisted one", async () => {
+        const CT_SPEC = {
+            indigoDeviceId: HALL,
+            role: "colorTemperatureLight",
+            label: "Hall Strip",
+            reachable: true,
+            states: { onOff: true, level: 60, colorTempMireds: 320 },
+            options: {},
+        };
+        const mireds = (server: ServerNode): unknown =>
+            (childOf(server, HALL)?.stateOf("colorControl") as { colorTemperatureMireds?: number } | undefined)
+                ?.colorTemperatureMireds;
+        const storagePath = storage();
+        const first = await boot(storagePath);
+        try {
+            await attach(first.client, "a1", [CT_SPEC]);
+            await setStateFor(first.client, "s1", HALL, { colorTempMireds: 200 });
+            assert.equal(mireds(first.bridge.server), 200, "fixture setup: the persisted colour temperature is 200");
+            await removeOne(first.client, "r1", HALL);
+        } finally {
+            await first.close();
+        }
+        const second = await boot(storagePath);
+        try {
+            const { events } = await attach(second.client, "a2", [CT_SPEC]);
+            assert.equal(mireds(second.bridge.server), 320, "the export's colour temperature, not the persisted one");
+            assert.deepEqual(events.filter(frame => frame.event === "command"), []);
+        } finally {
+            await second.close();
+        }
+    });
+});
+
+describe("issue #203: a countdown lost across a real node restart", () => {
+    const REASON_OFF = { indigoDeviceId: KITCHEN, command: "onOff", args: { value: false, reason: "countdown_lost_on_restart" } };
+    const commandsIn = (frames: Record<string, unknown>[]): unknown[] =>
+        frames.filter(frame => frame.event === "command").map(frame => frame.data);
+
+    async function setStateOne(client: TestClient, messageId: string, states: Record<string, unknown>): Promise<void> {
+        client.send({
+            message_id: messageId,
+            command: "set_state",
+            args: { indigoDeviceId: KITCHEN, states },
+        });
+        for (;;) {
+            const frame = await client.next(10_000);
+            if (frame.message_id === messageId) {
+                assert.equal(frame.error_code, undefined, JSON.stringify(frame));
+                return;
+            }
+        }
+    }
+
+    /** Frames that arrive within `ms` of now — "nothing more came" is only meaningful with a wait. */
+    async function framesWithin(client: TestClient, ms: number): Promise<Record<string, unknown>[]> {
+        const frames: Record<string, unknown>[] = [];
+        const until = Date.now() + ms;
+        while (Date.now() < until) {
+            try {
+                frames.push(await client.next(Math.max(until - Date.now(), 1)));
+            } catch {
+                break;
+            }
+        }
+        return frames;
+    }
+
+    /** Export the kitchen lamp ON (persisted), start an ecosystem countdown, then stop the node. */
+    async function restartMidCountdown(storagePath: string): Promise<void> {
+        const first = await boot(storagePath);
+        try {
+            await attach(first.client, "a1", [{ ...KITCHEN_SPEC, states: { onOff: false } }]);
+            await setStateOne(first.client, "s1", { onOff: true });
+            const kitchen = childOf(first.bridge.server, KITCHEN);
+            assert.ok(kitchen !== undefined);
+            await kitchen.act(agent =>
+                agent.get(OnOffLighting).onWithTimedOff({
+                    onOffControl: { acceptOnlyWhenOn: false },
+                    onTime: 30,
+                    offWaitTime: 0,
+                }),
+            );
+            assert.ok(
+                readCountdowns(storagePath)[uniqueIdFor(KITCHEN)] !== undefined,
+                "the countdown must be recorded on disk",
+            );
+        } finally {
+            await first.close();
+        }
+    }
+
+    /** Move the recorded deadline, or drop it, so the restart's clock position is not at the mercy of boot time. */
+    function setDeadline(storagePath: string, deadline: number | undefined): void {
+        const countdowns = readCountdowns(storagePath);
+        if (deadline === undefined) {
+            delete countdowns[uniqueIdFor(KITCHEN)];
+        } else {
+            countdowns[uniqueIdFor(KITCHEN)] = deadline;
+        }
+        writeFileSync(join(storagePath, COUNTDOWNS_FILE), JSON.stringify({ version: 1, countdowns }));
+    }
+
+    it("sends the off only AFTER the attach response, once, with its reason; a confirmed off ends it for good", async () => {
+        const storagePath = storage();
+        await restartMidCountdown(storagePath);
+        setDeadline(storagePath, Date.now() - 1000);
+
+        const second = await boot(storagePath);
+        try {
+            assert.ok(childOf(second.bridge.server, KITCHEN) !== undefined, "restored from the map before attach");
+            const { status, events } = await attach(second.client, "a2", [{ ...KITCHEN_SPEC, states: { onOff: true } }]);
+            assert.equal(status.error_code, undefined, JSON.stringify(status));
+            assert.deepEqual(events, [], "NOTHING may precede the attach response — the plugin is not attached yet");
+            const after = await framesWithin(second.client, 1500);
+            assert.deepEqual(commandsIn(after), [REASON_OFF], "exactly one off, after the response, with its reason");
+            assert.equal(after.length, 1);
+
+            // Never confirmed: the next attach on the same node sends it again.
+            const again = await attach(second.client, "a2b", [{ ...KITCHEN_SPEC, states: { onOff: true } }]);
+            assert.deepEqual(again.events, []);
+            assert.deepEqual(commandsIn(await framesWithin(second.client, 1000)), [REASON_OFF], "retried");
+
+            // The plugin's confirmation of the off it performed.
+            await setStateOne(second.client, "s2", { onOff: false });
+            const confirmed = await attach(second.client, "a2c", [{ ...KITCHEN_SPEC, states: { onOff: false } }]);
+            assert.deepEqual(confirmed.events, []);
+            assert.deepEqual(await framesWithin(second.client, 500), [], "confirmed: nothing more");
+        } finally {
+            await second.close();
+        }
+
+        const third = await boot(storagePath);
+        try {
+            const { events } = await attach(third.client, "a3", [{ ...KITCHEN_SPEC, states: { onOff: false } }]);
+            assert.deepEqual(events, []);
+            assert.deepEqual(await framesWithin(third.client, 500), [], "nothing left to recover on the next restart");
+        } finally {
+            await third.close();
+        }
+    });
+
+    it("a plugin-only reattach while a countdown is genuinely running sends nothing; the countdown's own expiry then sends one off, without a reason", async () => {
+        const session = await boot(storage());
+        try {
+            await attach(session.client, "a1", [{ ...KITCHEN_SPEC, states: { onOff: true } }]);
+            const kitchen = childOf(session.bridge.server, KITCHEN);
+            assert.ok(kitchen !== undefined);
+            await kitchen.act(agent =>
+                agent.get(OnOffLighting).onWithTimedOff({
+                    onOffControl: { acceptOnlyWhenOn: false },
+                    onTime: 20,
+                    offWaitTime: 0,
+                }),
+            );
+            // The countdown's own ON frame, drained so it cannot land in the second attach.
+            const on = await session.client.next(5_000);
+            assert.deepEqual(on.data, { indigoDeviceId: KITCHEN, command: "onOff", args: { value: true } });
+            const { events } = await attach(session.client, "a2", [{ ...KITCHEN_SPEC, states: { onOff: true } }]);
+            assert.deepEqual(commandsIn(events), [], "a reattach must not end a live countdown");
+            const frame = await session.client.next(5_000);
+            assert.deepEqual(frame.data, { indigoDeviceId: KITCHEN, command: "onOff", args: { value: false } });
+            assert.deepEqual(commandsIn(await framesWithin(session.client, 500)), [], "exactly one");
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("countdown activity never touches endpoint-map.json — it is the identity witness, the markers have their own file", async () => {
+        const storagePath = storage();
+        const session = await boot(storagePath);
+        const proto = EndpointMapStore.prototype as unknown as { persist: (...args: unknown[]) => boolean };
+        const originalPersist = proto.persist;
+        try {
+            await attach(session.client, "a1", [{ ...KITCHEN_SPEC, states: { onOff: true } }]);
+            const before = readFileSync(join(storagePath, ENDPOINT_MAP_FILE));
+            let persists = 0;
+            proto.persist = function (): boolean {
+                persists += 1;
+                throw new Error("the endpoint map must not be rewritten for a countdown");
+            };
+            const kitchen = childOf(session.bridge.server, KITCHEN);
+            assert.ok(kitchen !== undefined);
+            await kitchen.act(agent =>
+                agent.get(OnOffLighting).onWithTimedOff({ onOffControl: { acceptOnlyWhenOn: false }, onTime: 600, offWaitTime: 0 }),
+            );
+            assert.ok(readCountdowns(storagePath)[uniqueIdFor(KITCHEN)] !== undefined, "start wrote a marker");
+            await setStateOne(session.client, "s1", { onOff: false });
+            assert.equal(readCountdowns(storagePath)[uniqueIdFor(KITCHEN)], undefined, "the off cleared it");
+            assert.equal(persists, 0);
+            assert.ok(readFileSync(join(storagePath, ENDPOINT_MAP_FILE)).equals(before), "byte for byte");
+        } finally {
+            proto.persist = originalPersist;
+            await session.close();
+        }
+    });
+
+    it("a marker for an endpoint the map no longer knows is pruned at boot", async () => {
+        const storagePath = storage();
+        await restartMidCountdown(storagePath);
+        writeFileSync(
+            join(storagePath, COUNTDOWNS_FILE),
+            JSON.stringify({ version: 1, countdowns: { ...readCountdowns(storagePath), "indigo-999": Date.now() } }),
+        );
+        const session = await boot(storagePath);
+        try {
+            const kept = readCountdowns(storagePath);
+            assert.equal(kept["indigo-999"], undefined);
+            assert.ok(kept[uniqueIdFor(KITCHEN)] !== undefined, "the live endpoint's marker stays");
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("an unreadable endpoint map does not wipe the markers at boot (pruning against an empty map would)", async () => {
+        const storagePath = storage();
+        await restartMidCountdown(storagePath);
+        writeFileSync(join(storagePath, ENDPOINT_MAP_FILE), "{ not json");
+        const session = await boot(storagePath);
+        try {
+            assert.ok(
+                readCountdowns(storagePath)[uniqueIdFor(KITCHEN)] !== undefined,
+                "a map that could not be read says nothing about which endpoints exist",
+            );
+        } finally {
+            await session.close();
+        }
+    });
+
+    it("an attach that says the device is off sends nothing", async () => {
+        const storagePath = storage();
+        await restartMidCountdown(storagePath);
+        setDeadline(storagePath, Date.now() - 1000);
+
+        const second = await boot(storagePath);
+        try {
+            const { events } = await attach(second.client, "a2", [{ ...KITCHEN_SPEC, states: { onOff: false } }]);
+            assert.deepEqual(events, []);
+            assert.deepEqual(await framesWithin(second.client, 800), []);
+            const kitchen = childOf(second.bridge.server, KITCHEN);
+            assert.equal((kitchen?.stateOf("onOff") as { onTime?: number } | undefined)?.onTime, 0);
+            assert.equal(readCountdowns(storagePath)[uniqueIdFor(KITCHEN)], undefined);
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("storage with no marker (written before the marker existed) sends nothing", async () => {
+        const storagePath = storage();
+        await restartMidCountdown(storagePath);
+        setDeadline(storagePath, undefined);
+
+        const second = await boot(storagePath);
+        try {
+            const { events } = await attach(second.client, "a2", [{ ...KITCHEN_SPEC, states: { onOff: true } }]);
+            assert.deepEqual(events, []);
+            assert.deepEqual(await framesWithin(second.client, 800), []);
+        } finally {
+            await second.close();
+        }
+    });
+
+    it("a sweep failure reaches the §4.3 warnings, not just the node log", async () => {
+        const storagePath = storage();
+        await restartMidCountdown(storagePath);
+        setDeadline(storagePath, Date.now() - 1000);
+
+        const second = await boot(storagePath);
+        const proto = IndigoOnOffServer.prototype;
+        const originalRunning = proto.timerRunning;
+        try {
+            // Only the sweep asks the behaviour whether its timer runs (the attach's own push reads `internal` directly).
+            proto.timerRunning = function (): boolean {
+                throw new Error("storage refused the read");
+            };
+            await attach(second.client, "a2", [{ ...KITCHEN_SPEC, states: { onOff: true } }]);
+            await framesWithin(second.client, 500);
+            const warnings = second.bridge.getStatus().warnings;
+            assert.ok(
+                warnings.some(warning => /device 223456789/.test(warning) && /storage refused the read/.test(warning)),
+                JSON.stringify(warnings),
+            );
+        } finally {
+            proto.timerRunning = originalRunning;
+            await second.close();
+        }
+    });
+});
+
+describe("the commissioning window's timeout agrees with matter.js 0.18's own timer", () => {
+    it("passes our duration as the timeout, and a window matter.js closes at that deadline reports 'expired'", async () => {
+        const session = await boot(storage());
+        const proto = DeviceCommissioner.prototype as unknown as {
+            allowEnhancedCommissioning: (...args: unknown[]) => Promise<void>;
+        };
+        const original = proto.allowEnhancedCommissioning;
+        let captured: { timeout?: number; onClose?: () => unknown } | undefined;
+        // Not forwarded: matter.js 0.18 refuses an Enhanced window on a node that is not yet
+        // commissioned (its own Basic window is in place), and what is under test is the options we pass.
+        proto.allowEnhancedCommissioning = function (this: DeviceCommissioner, ...args: unknown[]): Promise<void> {
+            captured = args[2] as typeof captured;
+            return Promise.resolve();
+        };
+        try {
+            const opened = await session.client.request(
+                { message_id: "w1", command: "attach", args: { protocolVersion: PROTOCOL_VERSION, pluginVersion: "t", endpoints: [] } },
+                10_000,
+            );
+            assert.equal(opened.error_code, undefined, JSON.stringify(opened));
+            const response = await session.client.request(
+                { message_id: "w2", command: "open_commissioning_window", args: { durationSeconds: 180 } },
+                10_000,
+            );
+            assert.equal(response.error_code, undefined, JSON.stringify(response));
+            assert.ok(captured !== undefined, "the window must be opened through DeviceCommissioner");
+            assert.equal(captured.timeout, Seconds(180), "matter.js's timer must run for OUR duration, not its own default");
+
+            // matter.js's timer ending the window at its deadline: onClose, with the clock at the deadline.
+            const realNow = Date.now();
+            const clock = mock.method(Date, "now", () => realNow + 180_000);
+            try {
+                await captured.onClose?.();
+            } finally {
+                clock.mock.restore();
+            }
+            const frame = await session.client.next(5000);
+            assert.deepEqual(frame, { event: "window_closed", data: { reason: "expired" } });
+        } finally {
+            proto.allowEnhancedCommissioning = original;
+            await session.close();
+        }
+    });
+
+    it("matter.js ending the window reaches the plugin as window_closed 'commissioned'", async () => {
+        // The `onClose` callback is the ONLY path by which a commissioner finishing is noticed.
+        const session = await boot(storage());
+        try {
+            await attach(session.client, "a1", []);
+            const commissioner = session.bridge.server.env.get(DeviceCommissioner);
+            await commissioner.endCommissioning(); // the node's own basic window
+            await session.bridge.openCommissioningWindow(180);
+            await commissioner.endCommissioning();
+            for (;;) {
+                const frame = await session.client.next(5_000);
+                if (frame.event === "window_closed") {
+                    assert.deepEqual(frame.data, { reason: "commissioned" });
+                    break;
+                }
+            }
+        } finally {
+            await session.close();
+        }
+    });
+});
+
+
+describe("an uncommissioned bridge stays pairable (matter.js 0.18's 48-hour window timer)", () => {
+    const NOT_OPEN = AdministratorCommissioning.CommissioningWindowStatus.WindowNotOpen;
+    type Timer = { name: string; duration: unknown; cb: () => unknown };
+
+    /** Record every "Commissioning timeout" timer matter.js builds, so a test can fire it instead of waiting 48 h. */
+    function captureWindowTimers(): { timers: Timer[]; restore: () => void } {
+        const timers: Timer[] = [];
+        const original = Time.getTimer.bind(Time);
+        (Time as unknown as { getTimer: unknown }).getTimer = (name: string, duration: number, cb: () => unknown) => {
+            if (name === "Commissioning timeout") {
+                timers.push({ name, duration, cb });
+            }
+            return original(name, duration as never, cb as never);
+        };
+        return { timers, restore: () => ((Time as unknown as { getTimer: unknown }).getTimer = original) };
+    }
+
+    const statusOf = (session: Session): unknown => session.bridge.server.env.get(DeviceCommissioner).windowStatus;
+    const settle = (ms = 200): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
+    it("matter.js really does close the node's own window at 48 h, and getPairing then says so", async () => {
+        const capture = captureWindowTimers();
+        const session = await boot(storage());
+        try {
+            const before = session.bridge.getPairing();
+            assert.equal(before.windowOpen, true);
+            assert.ok(before.manualPairingCode !== null);
+            const own = capture.timers.at(-1);
+            assert.ok(own !== undefined, "matter.js built the window timer");
+            assert.equal(Number(own.duration), 48 * 3600 * 1000, "an uncommissioned node's window is 48 h (0.17.8 never started it)");
+            await own.cb(); // 48 h pass
+            await settle();
+            assert.equal(statusOf(session), NOT_OPEN, "precondition: matter.js stopped advertising");
+            const gap = session.bridge.getPairing();
+            assert.equal(gap.commissioned, false);
+            assert.equal(gap.windowOpen, false, "getPairing must not claim an advertising window that is closed");
+            assert.equal(gap.manualPairingCode, null);
+        } finally {
+            capture.restore();
+            await session.close();
+        }
+    });
+
+    it("re-enters commissionable mode with the SAME codes, and says so once", async () => {
+        const capture = captureWindowTimers();
+        const session = await boot(storage());
+        try {
+            const before = session.bridge.getPairing();
+            await capture.timers.at(-1)!.cb();
+            await settle();
+            assert.equal(await session.bridge.ensureCommissionable(), true);
+            assert.notEqual(statusOf(session), NOT_OPEN);
+            const after = session.bridge.getPairing();
+            assert.equal(after.windowOpen, true);
+            assert.equal(after.manualPairingCode, before.manualPairingCode);
+            assert.equal(after.qrPairingCode, before.qrPairingCode);
+            assert.equal(session.logged.filter(line => /re-entering commissionable mode/i.test(line)).length, 1);
+            assert.equal(await session.bridge.ensureCommissionable(), false, "already open: nothing to do");
+        } finally {
+            capture.restore();
+            await session.close();
+        }
+    });
+
+    it("the periodic check reopens it with no request at all", async () => {
+        const capture = captureWindowTimers();
+        const session = await boot(storage(), { commissionableCheckMs: 50 });
+        try {
+            await capture.timers.at(-1)!.cb();
+            await waitUntil(() => statusOf(session) !== NOT_OPEN, 5000);
+            assert.equal(session.bridge.getPairing().windowOpen, true);
+        } finally {
+            capture.restore();
+            await session.close();
+        }
+    });
+
+    it("a pairing request on a closed window reopens it rather than claiming it is open", async () => {
+        const capture = captureWindowTimers();
+        const session = await boot(storage());
+        try {
+            const before = session.bridge.getPairing();
+            await capture.timers.at(-1)!.cb();
+            await settle();
+            const report = await session.bridge.getPairingSettled();
+            assert.equal(report.windowOpen, true);
+            assert.equal(report.manualPairingCode, before.manualPairingCode);
+        } finally {
+            capture.restore();
+            await session.close();
+        }
+    });
+
+    it("after a factory reset the new window is covered too", async () => {
+        const capture = captureWindowTimers();
+        const session = await boot(storage());
+        try {
+            await session.bridge.factoryReset(false);
+            await settle(500);
+            const own = capture.timers.at(-1)!;
+            const codes = session.bridge.getPairing();
+            assert.equal(codes.windowOpen, true, "matter.js re-enters commissionable mode after the erase");
+            await own.cb();
+            await settle();
+            assert.equal(session.bridge.getPairing().windowOpen, false);
+            assert.equal(await session.bridge.ensureCommissionable(), true);
+            assert.equal(session.bridge.getPairing().manualPairingCode, codes.manualPairingCode);
+        } finally {
+            capture.restore();
+            await session.close();
+        }
+    });
+
+    it("getPairing during an erase either succeeds or throws the retryable UninitializedDependencyError, and never builds a commissioner (#133)", async () => {
+        // matter.js tears the commissioner down and rebuilds it during `erase()`. A read that goes through
+        // `env.get(DeviceCommissioner)` in that gap either throws UnsupportedDependencyError (which
+        // settlePairingRead does not retry) or CONSTRUCTS a stray commissioner and answers "closed".
+        const session = await boot(storage());
+        const created = { whileReading: 0, total: 0 };
+        let reading = false;
+        const original = (DeviceCommissioner as unknown as Record<symbol, (env: unknown) => unknown>)[Environmental.create]!;
+        (DeviceCommissioner as unknown as Record<symbol, unknown>)[Environmental.create] = function (this: unknown, env: unknown) {
+            created.total += 1;
+            if (reading) {
+                created.whileReading += 1;
+            }
+            return original.call(this, env);
+        };
+        try {
+            const outcomes = new Map<string, number>();
+            let polling = true;
+            const poll = (async () => {
+                while (polling) {
+                    try {
+                        reading = true;
+                        session.bridge.getPairing();
+                        outcomes.set("ok", (outcomes.get("ok") ?? 0) + 1);
+                    } catch (error) {
+                        const key = error instanceof UninitializedDependencyError ? "retryable" : `OTHER ${String(error)}`.slice(0, 120);
+                        outcomes.set(key, (outcomes.get(key) ?? 0) + 1);
+                    } finally {
+                        reading = false;
+                    }
+                    await new Promise(resolve => setImmediate(resolve));
+                }
+            })();
+            await session.bridge.server.erase();
+            polling = false;
+            await poll;
+            const others = [...outcomes.keys()].filter(key => key !== "ok" && key !== "retryable");
+            assert.deepEqual(others, [], `every read must succeed or throw the retryable error: ${JSON.stringify([...outcomes])}`);
+            assert.equal(created.whileReading, 0, "a read must never construct a DeviceCommissioner");
+        } finally {
+            (DeviceCommissioner as unknown as Record<symbol, unknown>)[Environmental.create] = original;
+            await session.close();
+        }
+    });
+
+    it("a node whose fabric table already has a fabric is NOT reopened, even while isCommissioned has not flipped yet", async () => {
+        // matter.js adds the fabric and closes the window when commissioning completes, but `isCommissioned` only
+        // flips later (failsafe teardown -> handleFabricChange -> syncCommissioned). Reopening a BASIC window in that
+        // gap makes the user's Enhanced window fail with MatterFlowError. Same shape between the last fabric
+        // leaving and the erase. Stand-in: a real node (so `isCommissioned` is genuinely false) whose FabricManager
+        // reports one fabric — no matter.js test controller is in this suite.
+        const capture = captureWindowTimers();
+        const session = await boot(storage());
+        try {
+            await capture.timers.at(-1)!.cb();
+            await settle();
+            assert.equal(session.bridge.server.lifecycle.isCommissioned, false);
+            const fabrics = session.bridge.server.env.get(FabricManager);
+            Object.defineProperty(fabrics, "length", { get: () => 1, configurable: true });
+            const before = session.logged.length;
+            assert.equal(await session.bridge.ensureCommissionable(), false);
+            assert.equal(statusOf(session), NOT_OPEN, "no window opened");
+            assert.equal((await session.bridge.getPairingSettled()).windowOpen, false);
+            assert.equal(statusOf(session), NOT_OPEN, "and asking for the pairing codes did not open one");
+            assert.deepEqual(session.logged.slice(before).filter(line => /48 hours/.test(line)), []);
+            delete (fabrics as unknown as Record<string, unknown>).length;
+            assert.equal(await session.bridge.ensureCommissionable(), true, "with no fabric it reopens as before");
+        } finally {
+            capture.restore();
+            await session.close();
+        }
+    });
+
+    it("a node with a fail-safe armed (a commissioning in progress) is NOT reopened", async () => {
+        const capture = captureWindowTimers();
+        const session = await boot(storage());
+        const env = session.bridge.server.env;
+        try {
+            await capture.timers.at(-1)!.cb();
+            await settle();
+            env.set(FailsafeContext, { construction: { status: "active" }, close: async () => {}, [Symbol.asyncDispose]: async () => {} } as never);
+            assert.equal(await session.bridge.ensureCommissionable(), false);
+            assert.equal(statusOf(session), NOT_OPEN);
+        } finally {
+            env.delete(FailsafeContext, env.maybeGet(FailsafeContext) as never);
+            capture.restore();
+            await session.close();
+        }
+    });
+
+    it("a COMMISSIONED node is left alone: no window reopens on its own, and getPairing says closed", async () => {
+        const capture = captureWindowTimers();
+        const session = await boot(storage());
+        try {
+            await capture.timers.at(-1)!.cb();
+            await settle();
+            Object.defineProperty(session.bridge.server.lifecycle, "isCommissioned", { get: () => true });
+            assert.equal(await session.bridge.ensureCommissionable(), false);
+            assert.equal(statusOf(session), NOT_OPEN);
+            const report = await session.bridge.getPairingSettled();
+            assert.equal(report.windowOpen, false);
+            assert.equal(statusOf(session), NOT_OPEN, "and asking did not open one");
+        } finally {
+            capture.restore();
+            await session.close();
+        }
+    });
+});
+
+async function waitUntil(check: () => boolean, capMs: number): Promise<void> {
+    const until = Date.now() + capMs;
+    while (!check()) {
+        if (Date.now() > until) {
+            throw new Error("condition not reached");
+        }
+        await new Promise(resolve => setTimeout(resolve, 25));
+    }
+}
+
+describe("device-type validation is pinned", () => {
+    it("the node sets endpoint.validation to 'warn' itself, whatever the environment says", async () => {
+        // matter.js 0.18 reads `endpoint.validation` (default "warn"; also MATTER_ENDPOINT_VALIDATION). A
+        // stricter value refuses a device type that fails conformance — e.g. the mains smoke/CO endpoint, which
+        // has no Power Source — and that would abort every attach. Pin it so a changed default cannot.
+        const vars = Environment.default.vars;
+        const before = vars.get("endpoint.validation");
+        vars.set("endpoint.validation", "strict");
+        const session = await boot(storage());
+        try {
+            assert.equal(vars.get("endpoint.validation"), "warn");
+        } finally {
+            vars.set("endpoint.validation", before);
+            await session.close();
+        }
+    });
+});
+
+describe("upgrade: a 0.17.x storage directory", () => {
+    // Written by bridge 0.17.5 on matter.js 0.17.8 — see the README beside it for how.
+    const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "test", "fixtures", "bridge-0.17.5-storage");
+
+    it("boots on a copy, restores the same endpoint numbers, and keeps a persisted attribute", async () => {
+        const storagePath = storage();
+        cpSync(FIXTURE, storagePath, { recursive: true });
+        rmSync(join(storagePath, "README.md"));
+        rmSync(join(storagePath, "generate.mjs"));
+        const written = readMap(storagePath);
+        const session = await boot(storagePath);
+        try {
+            const lamp = childOf(session.bridge.server, 111);
+            const dimmer = childOf(session.bridge.server, 222);
+            assert.ok(lamp !== undefined && dimmer !== undefined, "both accessories restored before any attach");
+            assert.equal(Number(lamp.number), written.endpoints[uniqueIdFor(111)]!.number);
+            assert.equal(Number(dimmer.number), written.endpoints[uniqueIdFor(222)]!.number);
+            assert.equal(
+                (dimmer.stateOf("levelControl") as { currentLevel?: number }).currentLevel,
+                51,
+                "the level 0.17.8 persisted (20%) is still there",
+            );
+            const { status } = await attach(session.client, "a1", [
+                { indigoDeviceId: 111, role: "onOffLight", label: "Fixture Lamp", reachable: true, states: { onOff: false }, options: {} },
+                { indigoDeviceId: 222, role: "dimmableLight", label: "Fixture Dimmer", reachable: true, states: { onOff: true, level: 20 }, options: {} },
+            ]);
+            assert.equal(status.error_code, undefined, JSON.stringify(status));
+            assert.deepEqual(
+                (status.result as { drift: unknown[] }).drift,
+                [],
+                "no endpoint-number drift: nothing a paired ecosystem knows has moved",
             );
         } finally {
             await session.close();

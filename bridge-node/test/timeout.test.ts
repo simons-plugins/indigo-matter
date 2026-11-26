@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { after, before, it } from "node:test";
 
 import { PROTOCOL_VERSION } from "../src/protocol.js";
+import { matterJsVersion } from "../src/node.js";
 import { BridgeWsServer } from "../src/ws-server.js";
 import { TestClient } from "./client.js";
 import { StubBridge } from "./stub-bridge.js";
@@ -15,7 +16,7 @@ const server = new BridgeWsServer({
     port: 0,
     bridge: new StubBridge(),
     bridgeVersion: "0.1.0-test",
-    matterJsVersion: "0.17.8",
+    matterJsVersion,
     log: () => {},
     unattachedTimeoutMs: 150,
 });

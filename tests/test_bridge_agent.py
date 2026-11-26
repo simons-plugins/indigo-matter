@@ -351,3 +351,34 @@ def test_the_bridge_plist_pins_matter_js_to_info_and_the_controller_is_untouched
                                npx_path=str(tmp_path / "home" / "bin" / "npx"),
                                runner=FakeRunner())
     assert "MATTER_LOG_LEVEL" not in plistlib.loads(controller.build_plist())["EnvironmentVariables"]
+
+
+# ---------------------------------------------------------------------------
+# bridge_version_drift: the running bridge node vs this release's pin
+# ---------------------------------------------------------------------------
+class TestBridgeVersionDrift:
+    PIN = "indigo-matter-bridge@0.18.0"
+
+    def test_older(self):
+        assert bridge_agent.bridge_version_drift("0.17.0", self.PIN) == ("0.17.0", "0.18.0", "older")
+
+    def test_equal_is_current(self):
+        assert bridge_agent.bridge_version_drift("0.18.0", self.PIN) == ("0.18.0", "0.18.0", "current")
+
+    def test_newer(self):
+        assert bridge_agent.bridge_version_drift("0.19.1", self.PIN) == ("0.19.1", "0.18.0", "newer")
+
+    def test_numeric_not_lexical(self):
+        assert bridge_agent.bridge_version_drift("0.9.0", "indigo-matter-bridge@0.10.0")[2] == "older"
+
+    @pytest.mark.parametrize("bad", [None, "", "unknown", "garbage", 5, {}])
+    def test_a_malformed_or_missing_running_version_is_none(self, bad):
+        assert bridge_agent.bridge_version_drift(bad, self.PIN) is None
+
+    @pytest.mark.parametrize("spec", ["indigo-matter-bridge", "indigo-matter-bridge@", "indigo-matter-bridge@latest", None])
+    def test_an_unreadable_pin_is_none(self, spec):
+        assert bridge_agent.bridge_version_drift("0.18.0", spec) is None
+
+    def test_defaults_to_this_releases_pin(self):
+        pinned = bridge_agent.DEFAULT_INSTALL_SPEC.split("@", 1)[1]
+        assert bridge_agent.bridge_version_drift("0.0.1")[1] == pinned
