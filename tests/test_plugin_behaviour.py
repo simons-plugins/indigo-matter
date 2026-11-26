@@ -2772,7 +2772,7 @@ def test_drift_warns_an_install_still_on_the_previous_pin(plug):
     asyncio.run(plug._resync())
     texts = _warning_texts(plug)
     assert len(texts) == 1
-    assert "1.2.2" in texts[0] and "1.6.1" in texts[0]
+    assert "1.2.2" in texts[0] and plug._pinned in texts[0]
     assert f"Plugins ▸ Matter ▸ {BACKUP_MENU}, then Plugins ▸ Matter ▸ {INSTALL_MENU}" in texts[0]
 
 
@@ -2901,9 +2901,12 @@ def test_status_body_reports_pin_and_outdated(plug):
     assert "matterServerOutdated" not in body
 
 
+from server_process import PINNED_VERSION  # noqa: E402
+
+
 @pytest.mark.parametrize("info,expected", [
     ({"sdk_version": "matter-server/0.6.8"}, "older"),
-    ({"sdk_version": "matter-server/1.6.1 (matter.js/0.18.1)"}, "current"),
+    ({"sdk_version": f"matter-server/{PINNED_VERSION} (matter.js/0.18.1)"}, "current"),
     # The previous pin. An install the user has not yet updated through the menu item
     # must read as outdated, not as current (issue #374).
     ({"sdk_version": "matter-server/1.2.2 (matter.js/0.17.5-alpha.0-20260710-82b39217b)"}, "older"),

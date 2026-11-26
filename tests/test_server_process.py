@@ -1686,7 +1686,7 @@ def test_install_not_blocked_when_node_version_unreadable(tmp_path, prefs, mock_
 # ---------------------------------------------------------------------------
 # version_drift (issue #75): running matter-server vs this release's pin
 # ---------------------------------------------------------------------------
-from server_process import version_drift  # noqa: E402
+from server_process import PINNED_VERSION, version_drift  # noqa: E402
 
 _MJS = " (matter.js/0.17.0-alpha.0-20260101-abc)"
 
@@ -1758,10 +1758,10 @@ def test_version_drift_default_pin_matches_the_real_1_6_1_server():
 @pytest.mark.parametrize("running", [
     "matter-server/1.2.2 (matter.js/0.17.5-alpha.0-20260710-82b39217b)",  # the previous pin
     "matter-server/1.6.0 (matter.js/0.18.1-alpha.0-20261114-0000000)",
-    "matter-server/1.6.1-alpha.0-20261125-0000000 (matter.js/0.18.1)",
+    f"matter-server/{PINNED_VERSION}-alpha.0-20261125-0000000 (matter.js/0.18.1)",   # pre-release of the pin
 ])
 def test_version_drift_default_pin_calls_anything_below_1_6_1_older(running):
-    assert version_drift(running)[1:] == ("1.6.1", "older")
+    assert version_drift(running)[1:] == (PINNED_VERSION, "older")
 
 
 def test_version_drift_oversized_numeric_component_is_unknown_not_an_exception():

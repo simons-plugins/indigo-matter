@@ -27,7 +27,7 @@ from launch_agent import (
     EADDRINUSE_MARKER, FATAL_FRESHNESS_SLACK_SECONDS, INSTALL_NODE_STAMP, NO_BOOTSTRAP_RECENT_WINDOW_SECONDS,
     VERDICT_CONFLICT_FREE, VERDICT_DEAD, VERDICT_PENDING, AgentSpec, FatalCause, LaunchAgent,
 )
-from server_process import APPLIED_PLIST_MARKER, LABEL, ServerProcess
+from server_process import APPLIED_PLIST_MARKER, DEFAULT_INSTALL_SPEC, LABEL, ServerProcess
 
 from test_server_process import FakeRunner, ProcRunner, launchctl_print_fixture
 
@@ -999,7 +999,7 @@ def test_controller_spec_pins_matter_server(tmp_path, mock_logger):
     sp = ServerProcess({"serverLocation": "local"}, mock_logger, home=str(home),
                        npx_path="/opt/homebrew/bin/npx", runner=FakeRunner())
     assert sp.spec.package == "matter-server"
-    assert sp.spec.install_spec == "matter-server@1.6.1"
+    assert sp.spec.install_spec == DEFAULT_INSTALL_SPEC   # the constant; its value is pinned in test_server_process
     assert sp.spec.default_entry == "dist/esm/MatterServer.js"
     assert sp.spec.port == 5580                 # int for lsof; sp.port stays the CLI string
     assert sp.port == "5580"

@@ -493,6 +493,68 @@ def test_endpoint_added_logs_debug_and_does_not_create(bds, bridge_indigo_env, m
     assert len(list(devices)) == count_before  # no new device
 
 
+# Event order is version-dependent (issue #374): up to matter-server 1.4.0 (1.2.2
+# included) the node_updated carrying a structure change arrives AFTER
+# endpoint_added/endpoint_removed; from 1.5.0 (pinned 1.6.1) it arrives BEFORE.
+
+_BRIDGE_NODE_WITH_EP3 = {
+    **_BRIDGE_NODE_RAW,
+    "attributes": {
+        **_BRIDGE_NODE_RAW["attributes"],
+        "3/57/5": "Hall bulb",
+        "3/57/17": True,
+        "3/6/0": False,
+        "3/29/0": [{"0": 266}],
+    },
+}
+
+_BRIDGE_NODE_WITHOUT_EP1 = {
+    **_BRIDGE_NODE_RAW,
+    "attributes": {k: v for k, v in _BRIDGE_NODE_RAW["attributes"].items() if not k.startswith("1/")},
+}
+
+
+def _node_updated(raw):
+    return MatterEvent(kind=protocol.EVT_NODE_UPDATED, node_id=raw["node_id"],
+                       raw={"event": "node_updated", "data": raw})
+
+
+@pytest.mark.parametrize("order", ["node_updated_first", "endpoint_added_first"])
+def test_new_endpoint_is_picked_up_whichever_side_of_node_updated_endpoint_added_lands(
+        bds, bridge_indigo_env, order):
+    _indigo, devices = bridge_indigo_env
+    bds.create_from_raw(_BRIDGE_NODE_RAW, "")
+    added = MatterEvent(kind=protocol.EVT_ENDPOINT_ADDED, node_id=200, endpoint=3,
+                        raw={"event": "endpoint_added", "data": {"node_id": 200, "endpoint_id": 3}})
+    events = [_node_updated(_BRIDGE_NODE_WITH_EP3), added]
+    if order == "endpoint_added_first":
+        events.reverse()
+        bds.handle_event(events.pop(0))
+        assert bds.lookup(200, 3) is None          # endpoint_added alone never creates
+    for evt in events:
+        bds.handle_event(evt)
+    dev_id = bds.lookup(200, 3)
+    assert dev_id is not None
+    assert devices[dev_id].errorState == ""
+
+
+@pytest.mark.parametrize("order", ["node_updated_first", "endpoint_removed_first"])
+def test_removed_endpoint_stays_unreachable_whichever_side_of_node_updated_endpoint_removed_lands(
+        bds, bridge_indigo_env, order):
+    _indigo, devices = bridge_indigo_env
+    bds.create_from_raw(_BRIDGE_NODE_RAW, "")
+    id1, id2 = bds.lookup(200, 1), bds.lookup(200, 2)
+    events = [_node_updated(_BRIDGE_NODE_WITHOUT_EP1),
+              MatterEvent(kind=protocol.EVT_ENDPOINT_REMOVED, node_id=200, endpoint=1,
+                          raw=GOLDEN_ENDPOINT_REMOVED_FRAME)]
+    if order == "endpoint_removed_first":
+        events.reverse()
+    for evt in events:
+        bds.handle_event(evt)
+    assert devices[id1].errorState == "unreachable"
+    assert devices[id2].errorState == ""
+
+
 def test_endpoint_added_malformed_frame_is_logged(bds, bridge_indigo_env, mock_logger):
     """endpoint_added with node_id=None logs a warning and is dropped."""
     _indigo, _devices = bridge_indigo_env
