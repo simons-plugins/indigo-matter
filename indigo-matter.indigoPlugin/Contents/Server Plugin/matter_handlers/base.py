@@ -93,6 +93,12 @@ class ClusterHandler(ABC):
     #: of the node's Indigo devices rather than just the one at the event's
     #: endpoint.
     node_scoped: bool = False
+    #: Whether this handler gives a JSON null attribute value a meaning of its
+    #: own. Default False: null means "no value known" (matter-server 1.5.0+ sends
+    #: one when an attribute is REMOVED from a node, #374), and ``device_sync``
+    #: then drops the update before it reaches the handler, so the last known
+    #: state stays. Only a handler that reads null as information sets True.
+    accepts_null: bool = False
     #: Display-capability props every device this handler creates must carry.
     #: Indigo applies Supports*/subtype capabilities via creation props, not
     #: Devices.xml statics, for API-created devices (the colour lesson;

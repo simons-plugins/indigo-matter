@@ -3,6 +3,20 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.35.1 — A null attribute update no longer turns an on/off device off
+
+- Fix (issue #374): matter-server 1.5.0 and later report an attribute that has been
+  removed from a node (after a firmware update or a re-interview) as an ordinary
+  update whose value is null. The plugin read a null on/off value as "off" and
+  wrote it to the device. A null now means "no value known": the plugin keeps the
+  device's last state, or its creation default if no value was ever received, and
+  logs one info line per device and attribute naming the device, node, endpoint,
+  cluster and attribute (repeats stay at debug). A null can also be a nullable
+  attribute that is temporarily unknown, so the line does not say "removed". The same applies to a null in a node's initial snapshot. Every other
+  device type already ignored nulls; this is now enforced in one place for all of
+  them. Thread diagnostics still reads a null neighbour table as "unknown" as before.
+  Nothing here changes which matter-server the plugin uses.
+
 ## 2026.35.0 — Bridge 0.18.0: three Matter export fixes on matter.js 0.18
 
 Needs **bridge 0.18.0** (Install/update the Matter bridge; the plugin now pins it).
