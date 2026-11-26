@@ -26,7 +26,7 @@ Three differences from the controller agent, all of them deliberate:
   never propagates into an Indigo callback.
 
 **Distribution.** ``indigo-matter-bridge`` is an npm package, exact-pinned by
-:data:`DEFAULT_INSTALL_SPEC` exactly as ``matter-server@1.2.2`` is — which is
+:data:`DEFAULT_INSTALL_SPEC` exactly as ``matter-server@1.6.1`` is — which is
 precisely the parameterisation the ``AgentSpec`` extraction was for:
 installing it is ``npm install --prefix ~/indigo-matter <spec>`` with a
 different string. The plugin bundle ships **no JavaScript**; ``bridge-node/`` is

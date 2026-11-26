@@ -9,9 +9,9 @@ VERIFIED wire shapes (ws-controller v0.6.2):
     endpoint_removed: {"event": "endpoint_removed",  "data": {"node_id": N, "endpoint_id": E}}
   Both ids are plain integers (TypeScript NodeId / EndpointNumber).
 
-  PairedNode.ts #triggerNodeStructureChanges (line 954) always emits
-  structureChanged → node_updated AFTER nodeEndpointAdded/Removed, so a
-  node_updated reliably follows every endpoint_added.
+  A node_updated carrying the new endpoint is always sent for the structure
+  change: after endpoint_added up to matter-server 1.2.2, before it from 1.5.0
+  (pinned 1.6.1). endpoint_added itself is only logged, so either order works.
 """
 from __future__ import annotations
 

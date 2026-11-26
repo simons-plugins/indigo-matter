@@ -116,7 +116,7 @@ def scripted_responder(results: dict) -> Callable[[dict], list]:
 
 
 #: A real ``open_commissioning_window`` result (issue #210), snake_case —
-#: VERIFIED against matter-server v1.2.2's WebSocketControllerHandler.ts (see
+#: VERIFIED against matter-server v1.2.2's and v1.6.1's WebSocketControllerHandler.ts (see
 #: protocol.py's module header). Plays the role
 #: tests/fixtures/bridge_protocol/frames.json's shapes play for the OUTBOUND
 #: bridge contract: a golden fixture any test wanting a realistic result reaches

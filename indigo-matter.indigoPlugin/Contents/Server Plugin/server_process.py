@@ -1,9 +1,11 @@
 """matter-server process management — the controller LaunchAgent (PM-B).
 
 Manages a launchd LaunchAgent that runs matter-server, per IMPLEMENTATION.md §1.4.
-The ``matter-server`` npm package ships ``"bin": null`` (true through at least 1.2.2)
-— there is NO ``matter-server`` executable — so ``npx matter-server`` fails with
-"could not determine executable to run", and launchd KeepAlive-respawns it forever.
+The ``matter-server`` npm package shipped ``"bin": null`` through at least 1.2.2
+— there was NO ``matter-server`` executable — so ``npx matter-server`` failed with
+"could not determine executable to run", and launchd KeepAlive-respawned it forever.
+1.6.1 does declare a bin (``dist/esm/bin.js``), but that file only enables source maps
+and imports ``MatterServer.js``, so nothing is lost by keeping the direct launch.
 We therefore launch node directly on the package main (``dist/esm/MatterServer.js``,
 read from the package's ``package.json``), exactly like the working hand-rolled
 run.sh. This is the recommended process-management approach because the server
@@ -42,11 +44,11 @@ LABEL = "com.simons-plugins.indigo-matter"
 MATTER_SERVER_PACKAGE = "matter-server"
 # Version installed by install(). Pinned (exact, not caret) for reproducibility — the
 # package is fast-moving pre-1.0-style Alpha/Beta. Kept in one place so a version bump
-# is a one-line change (matches docs/INSTALL.md). NOTE: 1.2.2 requires Node >= 22.13.0
+# is a one-line change (matches docs/INSTALL.md). NOTE: 1.6.1 requires Node >= 22.13.0
 # (enforced by launch_agent.MIN_NODE_VERSION).
-DEFAULT_INSTALL_SPEC = "matter-server@1.2.2"
+DEFAULT_INSTALL_SPEC = "matter-server@1.6.1"
 # Fallback entry point if the package's package.json is missing/unreadable. Matches the
-# "main" of both 0.6.x and 1.2.x ("dist/esm/MatterServer.js"); _server_entry() reads the
+# "main" of 0.6.x, 1.2.x and 1.6.x ("dist/esm/MatterServer.js"); _server_entry() reads the
 # real value from the installed package.json and only falls back to this.
 DEFAULT_SERVER_ENTRY = "dist/esm/MatterServer.js"
 SERVER_OUT_LOG = "matter-server.log"
@@ -177,8 +179,9 @@ def matter_server_arguments(agent: "ServerProcess") -> list[str]:
     ``--enable-test-net-dcl`` ordering hazard below cannot survive generalisation.
     """
     # node <package main> … — NOT `npx matter-server`: the matter-server npm
-    # package ships "bin": null, so npx cannot resolve an executable and the
-    # LaunchAgent respawn-loops with "could not determine executable to run".
+    # package shipped "bin": null through at least 1.2.2, so npx could not resolve
+    # an executable and the LaunchAgent respawn-looped with "could not determine
+    # executable to run". (1.6.1 has a bin, which just imports the same main.)
     args = [
         agent.node_path,
         agent._server_entry(),  # pylint: disable=protected-access
@@ -271,8 +274,8 @@ class ServerProcess(LaunchAgent):
         # Off by default: a device that fails attestation is one whose certificate
         # chain we can't verify against production Matter roots. Needed to commission
         # dev/test bridges (Homebridge's Matter accessory server currently presents a
-        # test PAA). Verified against matter-server 1.2.2 (DEFAULT_INSTALL_SPEC), which
-        # declares it as an optional-value option, so the bare flag means "on".
+        # test PAA). Verified against matter-server 1.2.2 and 1.6.1 (DEFAULT_INSTALL_SPEC),
+        # both of which declare it as an optional-value option, so the bare flag means "on".
         raw_test_net_dcl = prefs.get("enableTestNetDcl", False)
         self.enable_test_net_dcl = _pref_flag(raw_test_net_dcl)
         if _pref_unrecognised(raw_test_net_dcl):

@@ -782,17 +782,21 @@ class LaunchAgent:
                 # tell it from an orphan — don't risk killing it.
                 return False
             if managed_pid is None:
-                # Loaded with NO pid line: the job is dead and launchd has decided not to
-                # respawn it (#104 fault 2 — matter-server exits 0 on a fatal startup
-                # error, which KeepAlive {SuccessfulExit: false} reads as a clean exit).
-                # There is no healthy server to protect here, so fall through to the
-                # bootout + bootstrap below, which is the only thing that revives it.
+                # Loaded with NO pid line. Version-dependent (issue #374): a server that
+                # exits 0 on a fatal startup error (#104 fault 2, matter-server 0.6.x) is
+                # read by KeepAlive {SuccessfulExit: false} as a clean exit and never
+                # respawned. matter-server 1.6.1 exits 1 instead (observed: ~9 s after a
+                # lost port bind), so launchd respawns it every ~10 s, and between
+                # attempts `launchctl print` shows "state = spawn scheduled" with no pid
+                # line — this same branch. Either way there is no healthy server to
+                # protect here, so fall through to the bootout + bootstrap below, which
+                # revives the first case and costs nothing in the second.
                 self.logger.warning(
-                    "the %s LaunchAgent is loaded but not running, and launchd "
-                    "will not respawn it on its own (%s exits 0 even on a fatal "
-                    "startup error such as 'listen EADDRINUSE', which its KeepAlive policy "
-                    "treats as a clean exit). Restarting it now; see %s for the cause.",
-                    self.spec.package, self.spec.package,
+                    "the %s LaunchAgent is loaded but not running (a fatal startup error "
+                    "such as 'listen EADDRINUSE' stops it; depending on how it exited, "
+                    "launchd either leaves it stopped or keeps retrying every few seconds). "
+                    "Restarting it now; see %s for the cause.",
+                    self.spec.package,
                     os.path.join(self.log_dir, self.spec.err_log),
                 )
             elif self.reap_orphan_servers(exclude_pid=managed_pid) == 0:
@@ -1838,6 +1842,17 @@ class LaunchAgent:
         (It also corrects the older assumption, recorded in :meth:`_managed_job`, that
         such a server exits 0 and leaves the job visibly dead — 1.2.2 does not.)
 
+        matter-server 1.6.1 (the pin since issue #374) behaves differently again: it
+        exits 1 on the same FATAL (observed ~9 s after the bind fails; upstream bounds
+        it at 30 s), so launchd respawns it every ~10 s while the port stays taken. A
+        sample that lands while one of those attempts is alive gets the authoritative
+        verdict below; one that lands between attempts sees no pid and returns None,
+        leaving the report to :meth:`post_bootstrap_verdict` (``VERDICT_DEAD`` with the
+        EADDRINUSE cause from the err log). The age-gated branch cannot fire for such a
+        loop — every attempt is younger than :data:`STARTUP_GRACE_SECONDS` — which is
+        correct: nothing is lingering without a listener. Older servers can still be
+        running against this code, so the 1.2.2 handling stays.
+
         Signals, in order of trust:
 
         * **Authoritative** — the port is held by a pid that is not ours. Whatever our
@@ -2045,7 +2060,10 @@ class LaunchAgent:
           perfectly healthy from here while having no WebSocket listener at all. A pid
           from this method therefore means "launchd has a live process", never "our
           server is reachable" — :meth:`port_conflict_report` answers that second
-          question. Both behaviours are in the wild, so neither may be assumed.
+          question. 1.6.1 is a third case (issue #374): it exits 1, which this
+          KeepAlive policy DOES respawn, so the job alternates between a short-lived
+          pid and "spawn scheduled" with no pid line. All three behaviours are in the
+          wild, so none may be assumed.
         * ``arguments`` — the ProgramArguments launchd actually cached at bootstrap,
           which is NOT necessarily what the plist on disk now says (fault 3).
         """

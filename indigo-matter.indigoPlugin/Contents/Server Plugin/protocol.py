@@ -72,11 +72,17 @@ CMD_DEVICE = "device_command"            # invoke a cluster command
 CMD_START_LISTENING = "start_listening"
 CMD_SET_FABRIC_LABEL = "set_default_fabric_label"  # persists + pushes UpdateFabricLabel to nodes
 
-# matter-server's ServerErrorCode. VERIFIED against ws-controller 1.2.2
-# (@matter-server/ws-controller/dist/esm/types/WebSocketMessageTypes.js: UnknownError 0,
+# matter-server's ServerErrorCode. VERIFIED against ws-controller 1.2.2 and 1.6.1
+# (@matter-server/ws-controller/src/types/WebSocketMessageTypes.ts: UnknownError 0,
 # NodeCommissionFailed 1, NodeInterviewFailed 2, NodeNotReady 3, NodeNotResolving 4,
 # NodeNotExists 5, VersionMismatch 6, SDKStackError 7, InvalidArguments 8,
-# InvalidCommand 9, UpdateCheckError 10, UpdateError 11, IcdMultiAdmin 100).
+# InvalidCommand 9, UpdateCheckError 10, UpdateError 11, IcdMultiAdmin 100; 1.6.1 adds
+# OtaUploadError 101 and camera codes 102-106, none of which this plugin can trigger).
+# Live-checked against 1.6.1 (issue #374): get_node, read_attribute, remove_node,
+# device_command, write_attribute, interview_node and open_commissioning_window on a
+# node that does not exist all answer {message_id, error_code: 5, details: "Node N
+# does not exist"}. 1.6.1 may add optional status/cluster_status/reason keys to an
+# error frame; nothing here reads them.
 # Named codes are the ones that change a decision — everything else is handled
 # generically. ERR_NODE_NOT_EXISTS: for remove_node, "the node is not in the
 # fabric" is the DESIRED END STATE of a decommission, not a failure — see
@@ -96,14 +102,14 @@ ARG_CLUSTER = "cluster_id"               # IMPLEMENTATION.md used "cluster"
 ARG_COMMAND = "command_name"             # IMPLEMENTATION.md used "command"
 ARG_PAYLOAD = "payload"                  # IMPLEMENTATION.md used "args"
 
-# open_commissioning_window's one argument (issue #210). VERIFIED against the
-# pinned matter-server v1.2.2 (@matter-server/ws-controller/src/server/
+# open_commissioning_window's one argument (issue #210). VERIFIED against
+# matter-server v1.2.2 and v1.6.1 (@matter-server/ws-controller/src/server/
 # WebSocketControllerHandler.ts): its name on the wire is "timeout", but it is
 # the length of the commissioning window in SECONDS, not an RPC deadline —
 # do not wire this to matter_client.request()'s same-named "timeout" kwarg,
 # which means the opposite thing on the same call. Omitted entirely, the
 # window defaults to 900s (matter.js PairedNode.openEnhancedCommissioningWindow's
-# own default). 1.2.2's handler also accepts iteration/option/discriminator in
+# own default). 1.2.2's (and 1.6.1's) handler also accepts iteration/option/discriminator in
 # its arg type, but has them commented out of the destructure, so every window
 # this plugin opens is an Enhanced window — there is no basic-window toggle to
 # build against this version.
@@ -111,7 +117,8 @@ ARG_WINDOW_DURATION = "timeout"
 
 # open_commissioning_window's result keys (issue #210). VERIFIED against the
 # same WebSocketControllerHandler.ts: the reply is snake_case
-# {setup_pin_code, setup_manual_code, setup_qr_code} — NOT the camelCase
+# {setup_pin_code, setup_manual_code, setup_qr_code} (1.6.1 adds discriminator,
+# vendor_id, product_id and commissioning_timeout, unused here) — NOT the camelCase
 # manualPairingCode/qrPairingCode our own bridge_protocol emits for the
 # OUTBOUND bridge node (a different wire contract we own both ends of; this
 # one we don't). parse_commissioning_window below still falls back to the
@@ -134,10 +141,13 @@ EVT_NODE_EVENT = "node_event"
 #     endpoint_added:   {event: "endpoint_added",   data: {node_id, endpoint_id}}
 #     endpoint_removed: {event: "endpoint_removed",  data: {node_id, endpoint_id}}
 #   Both ids are the raw TypeScript NodeId/EndpointNumber values (integers).
-#   PairedNode.ts (matter.js) always emits structureChanged → node_updated AFTER
-#   nodeEndpointAdded/nodeEndpointRemoved, so a node_updated reliably follows
-#   each endpoint_added (verified: PairedNode.ts #triggerNodeStructureChanges,
-#   line 954 calls events.structureChanged.emit() after all endpoint events).
+#   Ordering is version-dependent. Up to 1.2.2 the node_updated carrying the new
+#   endpoint was deferred (setImmediate) and so arrived AFTER endpoint_added. From
+#   1.5.0 (and in the pinned 1.6.1) the server flushes that pending node_updated
+#   BEFORE sending endpoint_added (ws-controller WebSocketControllerHandler.ts,
+#   flushNodeUpdatedFor). Either way a node_updated with the full snapshot is
+#   sent for the structure change, and that snapshot is what device_sync acts on;
+#   endpoint_added itself is only logged, so the order does not matter here.
 EVT_ENDPOINT_ADDED = "endpoint_added"
 EVT_ENDPOINT_REMOVED = "endpoint_removed"
 
