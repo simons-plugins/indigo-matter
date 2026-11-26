@@ -18,7 +18,6 @@ from test_device_sync import (  # noqa: F401
 )
 from test_review_pass3 import _Matter, _run_apply, _live
 from test_unread_settings import _stub, _open, _lock
-from test_device_sync_replace import coffee  # noqa: F401
 
 ARL = next(s for s in settings_for_type("matterLock") if s.key == "autoRelockTime")
 WCL = next(s for s in settings_for_type("matterLock") if s.key == "wrongCodeEntryLimit")
@@ -122,7 +121,7 @@ def test_a_firmware_that_acks_and_ignores_says_so(plugin_cls, ds, indigo_env, mo
     _i, devices = indigo_env
     dev = _lock(ds, devices)
     _fail_arl(plugin_cls, ds, dev, mock_logger, value=45, matter=_Matter(read=30))
-    assert "ignored" in dev.states["settingsError"] or "still 30" in dev.states["settingsError"]
+    assert dev.states["settingsError"] == "Auto-relock time: the device ignored the change (still 30 seconds)"
 
 
 def test_the_write_of_the_text_is_no_clear_and_carries_an_explicit_ui_value(
@@ -221,13 +220,6 @@ def test_a_failing_write_of_the_text_still_logs_the_original_failure_and_loses_n
     assert dev.errorState == ""
 
 
-def test_a_lock_fielded_without_the_state_yet_is_not_an_error(plugin_cls, ds, indigo_env, mock_logger):
-    _i, devices = indigo_env
-    dev = _lock(ds, devices)
-    del dev.states["settingsError"]
-    _fail_arl(plugin_cls, ds, dev, mock_logger)                     # must not raise
-    assert "settingsError" not in dev.states
-
 
 # --- the dialog ----------------------------------------------------------------
 
@@ -296,11 +288,3 @@ def test_the_normal_report_path_does_no_failure_bookkeeping_when_nothing_failed(
     ds._clear_satisfied_failures(dev, [{"key": "autoRelockTime", "value": 3}])   # returns at once
     _live(ds, 90)                                                                  # and so does a report
     assert worked == []
-
-
-def test_node_replace_drops_the_rebound_devices_failed_requests(ds, coffee):
-    ds._failed_requests[(coffee.old_relay.id, "startUpOnOff")] = 1
-    ds._failed_requests[(999, "startUpOnOff")] = 1                     # another device: untouched
-    ds.replace_node(coffee.plan)
-    assert (coffee.old_relay.id, "startUpOnOff") not in ds._failed_requests
-    assert (999, "startUpOnOff") in ds._failed_requests

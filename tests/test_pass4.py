@@ -389,7 +389,7 @@ def test_the_flag_write_uses_the_documented_call_with_recorded_keywords(ds, indi
         "autoRelockTime", "unknown", False, False)
 
 
-def test_a_null_read_back_for_a_null_state_setting_leaves_the_device_flagged(
+def test_a_null_read_back_for_a_null_state_setting_is_recorded_on_the_setting_not_the_device_flag(
         plugin_cls, ds, indigo_env, mock_logger):
     _i, devices = indigo_env
     raw = LIGHTING_PLUG_NODE

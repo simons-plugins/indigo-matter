@@ -4232,7 +4232,7 @@ class DeviceSync:
 
     def apply_states(self, dev_id: int, kvlist: list, *, clear_error: bool = True,
                      count_as_read: bool = True, skip_read: bool = False,
-                     trigger_events: Optional[bool] = None) -> None:
+                     trigger_events: Optional[bool] = None) -> set:
         """The single asyncio→Indigo write seam (see module docstring).
 
         ``clear_error=False`` is for a write that is NOT evidence the device is
@@ -4257,7 +4257,7 @@ class DeviceSync:
                 "device %s vanished before state apply (deleted?); dropped %d state(s)",
                 dev_id, len(kvlist),
             )
-            return
+            return set()
         if skip_read:
             keys = self._setting_keys(dev)
             kvlist = [kv for kv in kvlist
@@ -4266,7 +4266,7 @@ class DeviceSync:
             kvlist = self._drop_unstorable_settings(dev, kvlist)
             kvlist = self._with_setting_display(dev, kvlist)
         if not kvlist:
-            return
+            return set()
         failed: set = set()
         if clear_error:
             dev.updateStatesOnServer(kvlist)
@@ -4281,6 +4281,7 @@ class DeviceSync:
         # a fresh value means the device is reachable — clear any stale error
         if clear_error and getattr(dev, "errorState", ""):
             dev.setErrorStateOnServer("")
+        return failed
 
     def _write_keeping_error(self, dev: Any, kvlist: list, trigger_events: bool = True) -> set:
         """Write states one key at a time WITHOUT clearing the device's error state.
@@ -4370,10 +4371,16 @@ class DeviceSync:
         self._edit_settings_error(dev_id, setting, f"{setting.label}: {cause}")
 
     def clear_setting_failure(self, dev_id: Any, setting: Any) -> None:
-        """Drop this setting's failure text (and only its)."""
-        with self._lock:
-            self._failed_requests.pop((int(dev_id), setting.key), None)
-        self._edit_settings_error(dev_id, setting, None)
+        """Drop this setting's failure text (and only its).
+
+        The remembered request is dropped only AFTER the text was cleared: if the write of
+        the empty text fails, the memory must survive so the next reading of the requested
+        value tries again.
+        """
+        with self._error_edit_lock:
+            if self._edit_settings_error(dev_id, setting, None):
+                with self._lock:
+                    self._failed_requests.pop((int(dev_id), setting.key), None)
 
     def _clear_satisfied_failures(self, dev: Any, kvlist: list) -> None:
         """A reading showing exactly the value a failed write asked for clears that failure.
@@ -4402,15 +4409,16 @@ class DeviceSync:
             if requested is not None and kv.get("value") == requested:
                 self.clear_setting_failure(dev.id, setting)
 
-    def _edit_settings_error(self, dev_id: Any, setting: Any, sentence: Optional[str]) -> None:
+    def _edit_settings_error(self, dev_id: Any, setting: Any, sentence: Optional[str]) -> bool:
+        """Edit one setting's sentence; True unless Indigo refused the write."""
         with self._error_edit_lock:
-            self._edit_settings_error_locked(dev_id, setting, sentence)
+            return self._edit_settings_error_locked(dev_id, setting, sentence)
 
-    def _edit_settings_error_locked(self, dev_id: Any, setting: Any, sentence: Optional[str]) -> None:
+    def _edit_settings_error_locked(self, dev_id: Any, setting: Any, sentence: Optional[str]) -> bool:
         try:
             dev = indigo.devices[int(dev_id)]       # fresh, inside the lock: never a stale read
         except KeyError:
-            return
+            return True                          # the device is gone: nothing left to clear
         current = getattr(dev, "states", {})
         if self.ERROR_STATE not in current:
             # A device fielded before this state existed, not yet rebuilt: nothing to write
@@ -4420,7 +4428,7 @@ class DeviceSync:
                 self.logger.warning(
                     "%s: has no %s state yet (its state list has not been rebuilt), so a setting "
                     "failure is only in the Event Log", device_log_name(dev_id), self.ERROR_STATE)
-            return
+            return True                          # nothing to write to
         prefix = f"{setting.label}: "
         parts = [part for part in str(current.get(self.ERROR_STATE) or "").split(self._SEPARATOR)
                  if part and not part.startswith(prefix)]
@@ -4428,12 +4436,13 @@ class DeviceSync:
             parts.append(sentence)
         text = self._SEPARATOR.join(parts)
         if text == (current.get(self.ERROR_STATE) or ""):
-            return
+            return True
         # no-clear (not evidence of reachability); explicit uiValue; fires triggers so a
         # user can be told. A refusal by Indigo is logged inside _write_keeping_error.
-        self.apply_states(int(dev_id), [{"key": self.ERROR_STATE, "value": text,
-                                         "uiValue": text or "none"}],
-                          clear_error=False, count_as_read=False, trigger_events=True)
+        failed = self.apply_states(int(dev_id), [{"key": self.ERROR_STATE, "value": text,
+                                                  "uiValue": text or "none"}],
+                                   clear_error=False, count_as_read=False, trigger_events=True)
+        return not failed
 
     def _note_settings_primed(self, dev: Any, kvlist: list) -> None:
         """Record that these setting states hold a real reading, and keep the cached
