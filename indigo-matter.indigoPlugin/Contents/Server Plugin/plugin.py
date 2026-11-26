@@ -165,6 +165,26 @@ def _matter_connected(plugin) -> bool:
     return client is not None and bool(getattr(client, "connected", False))
 
 
+def _drop_superseded(plugin, dev_id, values, plans, superseded) -> list:
+    """Drop a planned write that is just an OLDER dialog's untouched seed.
+
+    When a stale-looking dialog record is replaced, the old dialog may still be open.
+    Saved untouched, its fields differ from the new slot's seeds (the device moved on)
+    and would count as edits. A field equal to a superseded seed is not a choice the
+    user made, so it is not written; the log says so.
+    """
+    kept = []
+    for plan in plans:
+        if any(device_settings.matches_seed(plan.setting, values, old) for old in superseded):
+            plugin.logger.warning(
+                "%s: %s was not written - the dialog it came from was opened before another "
+                "one on this device; please reopen the dialog and set it again",
+                _device_log_name(dev_id), plan.setting.label)
+        else:
+            kept.append(plan)
+    return kept
+
+
 def _connected_and_reconciled(plugin, dev_id) -> bool:
     """Connected to matter-server AND this device's node read this run."""
     if not _matter_connected(plugin):
@@ -182,6 +202,9 @@ def _connected_and_reconciled(plugin, dev_id) -> bool:
 #: fired) and replaced. Judged ONLY at open: one dialog left open for an hour still saves.
 SEED_SLOT_MAX_AGE = 600.0
 
+#: How many replaced dialogs' seeds are remembered as superseded on a slot.
+SEED_SUPERSEDED_MAX = 3
+
 
 def _remember_seed(plugin, dev_id, seeds: dict) -> None:
     """Remember what a dialog was seeded with, per device.
@@ -197,11 +220,16 @@ def _remember_seed(plugin, dev_id, seeds: dict) -> None:
     if existing is not None and now - existing["stamp"] <= SEED_SLOT_MAX_AGE:
         existing["ambiguous"] = True
         return
+    superseded: list = []
     if existing is not None:
         plugin.logger.info(
             "device %s: an unclosed settings dialog record from %.0f minutes ago was discarded",
             dev_id, (now - existing["stamp"]) / 60)
-    slots[dev_id] = {"seeds": seeds, "ambiguous": False, "stamp": now}
+        # The old dialog may still be open and may still be saved. Its seeds are kept
+        # (bounded) as SUPERSEDED: a field still equal to one of them is that old dialog
+        # untouched, and must not be written as if the user had chosen it.
+        superseded = [existing["seeds"], *existing.get("superseded", [])][:SEED_SUPERSEDED_MAX]
+    slots[dev_id] = {"seeds": seeds, "ambiguous": False, "stamp": now, "superseded": superseded}
 
 
 def _usable_seeds(plugin, dev_id):
@@ -1765,6 +1793,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         # The remembered seed is spent either way (Save or Cancel).
         slot = vars(self).get("_dialog_seeds", {}).pop(devId, None)
         seeds = None if slot is None or slot["ambiguous"] else slot["seeds"]
+        superseded = [] if slot is None else slot.get("superseded", [])
         if userCancelled or not settings_for_type(typeId):
             return
         if seeds is None:
@@ -1794,6 +1823,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             self.logger.exception("%s: could not work out device setting changes: %s",
                                   _device_log_name(devId), exc)
             return
+        plans = _drop_superseded(self, devId, valuesDict, plans, superseded)
         if not plans:
             return
         if self.runtime is None or not _matter_connected(self):

@@ -47,7 +47,7 @@ __all__ = [
     "OfferedSetting", "PlannedWrite", "MARKER_YES", "MARKER_NO",
     "offered_settings", "unimplemented_states", "config_ui_values",
     "validate_settings", "planned_writes", "apply_setting",
-    "RemovedStateLog", "PrimedLookup", "picker_rows", "edited_settings", "NO_ATTRIBUTE_LIST_REASON",
+    "RemovedStateLog", "PrimedLookup", "picker_rows", "edited_settings", "matches_seed", "NO_ATTRIBUTE_LIST_REASON",
     "UNREAD_OPTION_ID", "UNREAD_OPTION_LABEL",
 ]
 
@@ -411,6 +411,11 @@ def _is_seed(seeds: Optional[dict], setting: DeviceSetting, values: dict) -> boo
         return False
     typed_int, seed_int = _as_int(typed), _as_int(seed)
     return typed_int is not None and typed_int == seed_int
+
+
+def matches_seed(setting: DeviceSetting, values: dict, seeds: dict) -> bool:
+    """Is the submitted field equal to *seeds*' value for it (numerically for numbers)?"""
+    return _is_seed(seeds, setting, values)
 
 
 def edited_settings(device_type_id: str, values: dict, limits: LimitsLookup,

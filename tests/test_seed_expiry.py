@@ -102,3 +102,63 @@ def test_expiry_is_per_device(plugin_cls, ds, indigo_env, mock_logger):
     values = _open(plugin_cls, stub, dev, "matterLock")        # A's stale slot replaced
     values["autoRelockTime"] = "90"
     assert _save(plugin_cls, stub, dev, values) == 1
+
+
+# --- a replaced slot's seeds are kept as SUPERSEDED: they must never be written -------
+
+def _stale_scenario(plugin_cls, ds, indigo_env, mock_logger):
+    """A opens (seed 30) and stays open; the lock changes to 77 elsewhere; >600 s later B
+    opens (seed 77) and replaces A's abandoned-looking slot."""
+    from test_pass4 import _live
+    dev, stub, clock = _setup(plugin_cls, ds, indigo_env, mock_logger)
+    a = _open(plugin_cls, stub, dev, "matterLock")
+    assert a["autoRelockTime"] == "30"
+    _live(ds, 77)
+    clock.now += LIMIT + 1
+    b = _open(plugin_cls, stub, dev, "matterLock")
+    assert b["autoRelockTime"] == "77"
+    return dev, stub, a, b
+
+
+def test_the_stale_dialog_saved_untouched_after_a_replacement_writes_nothing_and_warns(
+        plugin_cls, ds, indigo_env, mock_logger):
+    dev, stub, a, _b = _stale_scenario(plugin_cls, ds, indigo_env, mock_logger)
+    assert _save(plugin_cls, stub, dev, a) == 0                  # A's untouched 30 is NOT written
+    warning = " ".join(str(c) for c in mock_logger.warning.call_args_list)
+    assert dev.name in warning and "Auto-relock time" in warning and "reopen" in warning
+
+
+def test_the_second_dialog_saving_a_real_edit_to_a_third_value_still_writes(
+        plugin_cls, ds, indigo_env, mock_logger):
+    dev, stub, _a, b = _stale_scenario(plugin_cls, ds, indigo_env, mock_logger)
+    b["autoRelockTime"] = "55"
+    assert _save(plugin_cls, stub, dev, b) == 1
+
+
+def test_the_second_dialog_saved_untouched_writes_nothing(plugin_cls, ds, indigo_env, mock_logger):
+    dev, stub, _a, b = _stale_scenario(plugin_cls, ds, indigo_env, mock_logger)
+    assert _save(plugin_cls, stub, dev, b) == 0
+
+
+def test_a_superseded_value_compares_numerically(plugin_cls, ds, indigo_env, mock_logger):
+    dev, stub, a, _b = _stale_scenario(plugin_cls, ds, indigo_env, mock_logger)
+    a["autoRelockTime"] = "030"
+    assert _save(plugin_cls, stub, dev, a) == 0
+
+
+def test_after_close_and_a_fresh_open_the_old_seed_no_longer_blocks(plugin_cls, ds, indigo_env, mock_logger):
+    dev, stub, a, b = _stale_scenario(plugin_cls, ds, indigo_env, mock_logger)
+    _save(plugin_cls, stub, dev, b)                              # closes the slot, superseded with it
+    fresh = _open(plugin_cls, stub, dev, "matterLock")
+    fresh["autoRelockTime"] = "30"                               # the user now WANTS 30
+    assert _save(plugin_cls, stub, dev, fresh) == 1
+
+
+def test_the_superseded_list_is_bounded(plugin_cls, ds, indigo_env, mock_logger):
+    from test_pass4 import _live
+    dev, stub, clock = _setup(plugin_cls, ds, indigo_env, mock_logger)
+    for n in range(10):
+        _open(plugin_cls, stub, dev, "matterLock")
+        _live(ds, 100 + n)
+        clock.now += LIMIT + 1
+    assert len(vars(stub)["_dialog_seeds"][dev.id]["superseded"]) <= 3
