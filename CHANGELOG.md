@@ -11,9 +11,11 @@ current version is `Info.plist`'s `PluginVersion`.
   matter-server you already have running, and the plugin logs a warning that it is older
   than 1.6.1. To upgrade, run **Plugins ▸ Matter ▸ Back up the Matter fabric…** first,
   then **Plugins ▸ Matter ▸ Install/update the Matter controller (matter-server)**.
-- Make the backup first. matter-server 1.6 rewrites its stored device records when it
-  first starts, so going back to 1.2.2 means restoring that backup with **Restore a
-  fabric backup…**, not installing 1.2.2 again over the same storage.
+- Make the backup first, and treat the upgrade as one-way. matter-server 1.6 changes
+  what it stores about each device, and running 1.2.2 again over storage that 1.6 has
+  used is not tested with real devices. To go back, reinstall the previous plugin
+  release, run **Install/update the Matter controller (matter-server)** to get 1.2.2
+  back, then restore that backup with **Restore a fabric backup…**.
 - A device's availability may change more often than before. The controller no longer
   waits three minutes after losing a device before reporting it unavailable, so a device
   that drops off briefly is now shown as unreachable for that time.
