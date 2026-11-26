@@ -18,6 +18,7 @@ from test_device_sync import (  # noqa: F401
 )
 from test_review_pass3 import _Matter, _run_apply, _live
 from test_unread_settings import _stub, _open, _lock
+from test_device_sync_replace import coffee  # noqa: F401
 
 ARL = next(s for s in settings_for_type("matterLock") if s.key == "autoRelockTime")
 WCL = next(s for s in settings_for_type("matterLock") if s.key == "wrongCodeEntryLimit")
@@ -249,3 +250,57 @@ def test_a_dialog_with_nothing_failed_hides_the_line(plugin_cls, ds, indigo_env,
     stub = _stub(plugin_cls, ds, mock_logger, matter=CONNECTED)
     values = _open(plugin_cls, stub, dev, "matterLock")
     assert values["settingsErrorShown"] == "no" and values["settingsErrorText"] == ""
+
+
+# --- follow-ups on fe2ddd3 -----------------------------------------------------------
+
+def test_apply_setting_itself_raising_still_records_the_failure_and_marks_the_setting_unread(
+        plugin_cls, ds, indigo_env, mock_logger, monkeypatch):
+    _i, devices = indigo_env
+    dev = _lock(ds, devices)
+    fatal = _FatalFlag(dev)
+
+    async def boom(*a, **k):
+        raise RuntimeError("something unexpected")
+
+    monkeypatch.setattr(device_settings, "apply_setting", boom)
+    stub = _stub(plugin_cls, ds, mock_logger, matter=_refuse(30))
+    import asyncio
+    asyncio.run(plugin_cls._apply_setting(stub, 0x39, 1, dev.id, device_settings.PlannedWrite(ARL, 99999, 30)))
+    assert dev.states["settingsError"] == "Auto-relock time: the write failed unexpectedly, see the event log"
+    assert fatal.calls == [] and dev.errorState == ""
+    assert not ds.setting_primed(dev.id, "autoRelockTime")          # we do not know what it holds
+    assert mock_logger.exception.called                              # logged, loop not killed
+
+
+def test_a_failing_failure_record_cannot_break_an_ordinary_report(ds, indigo_env, mock_logger):
+    _i, devices = indigo_env
+    ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
+    dev = devices[ds.lookup(0x39, 1)]
+    ds._failed_requests[(dev.id, "autoRelockTime")] = 45
+    dev.setErrorStateOnServer("unreachable")
+    ds._edit_settings_error = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("lookup failed"))
+    _live(ds, 45)                                                    # the very value that was asked for
+    assert dev.states["autoRelockTime"] == 45                         # the report's own state landed
+    assert dev.errorState == ""                                       # and the stale flag was cleared
+    assert any("settings error" in str(c).lower() for c in mock_logger.warning.call_args_list)
+
+
+def test_the_normal_report_path_does_no_failure_bookkeeping_when_nothing_failed(ds, indigo_env):
+    _i, devices = indigo_env
+    ds.create_from_raw(LOCK_SETTINGS_NODE, "Side Gate")
+    dev = devices[ds.lookup(0x39, 1)]
+    assert not ds._failed_requests
+    worked = []
+    ds._clear_satisfied_failures_unguarded = lambda *a, **k: worked.append(a)
+    ds._clear_satisfied_failures(dev, [{"key": "autoRelockTime", "value": 3}])   # returns at once
+    _live(ds, 90)                                                                  # and so does a report
+    assert worked == []
+
+
+def test_node_replace_drops_the_rebound_devices_failed_requests(ds, coffee):
+    ds._failed_requests[(coffee.old_relay.id, "startUpOnOff")] = 1
+    ds._failed_requests[(999, "startUpOnOff")] = 1                     # another device: untouched
+    ds.replace_node(coffee.plan)
+    assert (coffee.old_relay.id, "startUpOnOff") not in ds._failed_requests
+    assert (999, "startUpOnOff") in ds._failed_requests

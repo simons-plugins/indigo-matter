@@ -4365,7 +4365,22 @@ class DeviceSync:
         self._edit_settings_error(dev_id, setting, None)
 
     def _clear_satisfied_failures(self, dev: Any, kvlist: list) -> None:
-        """A reading showing exactly the value a failed write asked for clears that failure."""
+        """A reading showing exactly the value a failed write asked for clears that failure.
+
+        Bookkeeping: it must never be able to break a state report, so it returns at
+        once when nothing has failed and contains anything that goes wrong.
+        """
+        if not self._failed_requests:
+            return
+        try:
+            self._clear_satisfied_failures_unguarded(dev, kvlist)
+        except Exception as exc:  # pylint: disable=broad-except
+            # the report's own states are already written; losing the clear costs one
+            # stale sentence, whereas escaping would skip the stale error-flag clear
+            self.logger.warning("could not clear the settings error of device %s (%s)",
+                                getattr(dev, "id", "?"), exc)
+
+    def _clear_satisfied_failures_unguarded(self, dev: Any, kvlist: list) -> None:
         settings = {s.key: s for s in settings_for_type(getattr(dev, "deviceTypeId", "") or "")}
         for kv in kvlist:
             setting = settings.get(kv.get("key"))
@@ -4459,6 +4474,8 @@ class DeviceSync:
         keys = self._setting_keys(dev)
         with self._lock:
             self._settings_primed -= {(int(dev.id), key) for key in keys}
+            for key in keys:
+                self._failed_requests.pop((int(dev.id), key), None)
 
     def node_reconciled(self, node_id: Any) -> bool:
         """Has an informative snapshot of this node been cached this run?"""

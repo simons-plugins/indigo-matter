@@ -1852,6 +1852,14 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
         except Exception as exc:  # pylint: disable=broad-except
             # a crash here must not kill the loop
             self.logger.exception('"%s" could not be applied: %s', label, exc)
+            # The user asked for a change and nothing says it did not happen: record it,
+            # and since we do not know what the device holds, the setting is unread again.
+            try:
+                self.device_sync.mark_setting_unread(dev_id, plan.setting.key)
+            except Exception as inner:  # pylint: disable=broad-except
+                # bookkeeping after a crash must not itself escape
+                self.logger.warning("could not mark %s unread on device %s (%s)", label, dev_id, inner)
+            _record_setting_outcome(self, dev_id, plan, "the write failed unexpectedly, see the event log")
             return
         if ok:
             self.logger.info("%s", message)
