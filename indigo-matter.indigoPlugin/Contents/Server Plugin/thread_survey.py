@@ -1,7 +1,7 @@
 """Thread mesh survey: cache-first, optionally live-refreshed (#334).
 
 The one shared implementation of "read every Thread node's ThreadNetworkDiagnostics
-and, optionally, live-refresh the sleepy ones" — the menu diagnostic
+and, optionally, live-refresh them" — the menu diagnostic
 (:meth:`diagnostics_menu_mixin.DiagnosticsMenuMixin.menuReportThreadMesh`) and the
 IWS Thread page (``http_api_mixin.http_thread_page``) both need exactly this, and
 ``thread_mesh``'s own module docstring already explains why a cached sleepy-device
@@ -49,6 +49,12 @@ from thread_mesh import (
     ATTR_ROUTE_TABLE,
     ATTR_ROUTING_ROLE,
     CLUSTER_THREAD_DIAG,
+    ROLE_ED,
+    ROLE_REED,
+    ROLE_ROUTER,
+    ROLE_SED,
+    ROLE_UNASSIGNED,
+    ROLE_UNSPECIFIED,
     NodeDiag,
     parse_node_diag,
 )
@@ -57,13 +63,15 @@ __all__ = ["Survey", "survey_thread_nodes", "run_survey"]
 
 # The five attributes a live read refreshes — exactly what a sleepy device's
 # cached snapshot can be hours stale on (role, neighbours, routes, and the two
-# fields a partition-split diagnosis hinges on). RouteTable (8) is included
-# despite this only ever live-reading NON-routers: it is NOT a router-only
-# structure — every SED in the 2026-09-01 fixture carries its own single-row
-# RouteTable (its path to the leader) — so leaving it out of the refresh used
-# to pair a freshly live LeaderRouterId with a stale cached RouteTable, which
-# could make a non-router's far_from_leader check judge a hop count that no
-# longer matched reality (#334 post-review, B4.5).
+# fields a partition-split diagnosis hinges on). RouteTable (8) is included for
+# every node: it is NOT a router-only structure — every SED in the 2026-09-01
+# fixture carries its own single-row RouteTable (its path to the leader) — so
+# leaving it out of the refresh used to pair a freshly live LeaderRouterId with a
+# stale cached RouteTable, which could make a non-router's far_from_leader check
+# judge a hop count that no longer matched reality (#334 post-review, B4.5).
+# NeighborTable (7) and RouteTable (8) are also the two attributes a router can
+# never be trusted to have fresh in the cache: Thread marks them changes-omitted,
+# so a subscription never refreshes them (#348).
 _LIVE_ATTR_IDS = (ATTR_ROUTING_ROLE, ATTR_NEIGHBOR_TABLE, ATTR_ROUTE_TABLE, ATTR_PARTITION_ID, ATTR_LEADER_ROUTER_ID)
 
 
@@ -121,7 +129,7 @@ class Survey:
 async def survey_thread_nodes(  # pylint: disable=too-many-locals
     matter: Any,
     *,
-    live_sleepy: bool,
+    live_read: bool,
     per_node_timeout: float = ATTRIBUTE_TIMEOUT,
     node_names: Optional[Mapping[int, str]] = None,
     event_stamps: Optional[Mapping[int, float]] = None,
@@ -136,12 +144,17 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
     fine but has no cluster-0x35 key at all (not a Thread node) is simply excluded
     — that is not a skip, it is a correct "not mine".
 
-    When ``live_sleepy`` is true, every parsed diag that is NOT a router
-    (:attr:`~thread_mesh.NodeDiag.is_router`) is live-read concurrently, each
-    bounded by its own ``per_node_timeout``. Routers are never touched: a router is
-    mains-powered and polled continuously already, so its cache is not the stale
-    one. A live-read failure or timeout never drops the node: the cached
-    :class:`~thread_mesh.NodeDiag` stands, with ``read_error`` set to say why.
+    When ``live_read`` is true, EVERY parsed diag — routers included (#348) — is
+    live-read concurrently, each bounded by its own ``per_node_timeout``. Routers
+    used to be skipped on the theory that a mains-powered node's cache is fresh,
+    but NeighborTable and RouteTable are changes-omitted attributes: a
+    subscription never refreshes them, so a router's cached tables go stale
+    exactly like a sleepy device's. Because the reads are concurrent, the worst
+    case is one ``per_node_timeout`` however many nodes there are. A live-read
+    failure or timeout never drops the node: the cached
+    :class:`~thread_mesh.NodeDiag` stands, with ``read_error`` set to say why (and
+    its cached children stay too — a failed read is "unknown", never "no
+    children"; see :func:`_live_refresh` for the opposite, successful case).
 
     **#344 cache-age fields are applied AFTER live-refresh, not before.**
     ``date_commissioned``/``last_interview`` (from the raw node's own top-level
@@ -201,8 +214,8 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
         )
         raw_stamp_values_by_node[node_id] = (raw_date_commissioned, raw_last_interview)
 
-    if live_sleepy:
-        targets = [diag for diag in diags if not diag.is_router]
+    if live_read:
+        targets = diags
         if targets:
             results = await asyncio.gather(
                 *(_live_refresh(matter, diag, raw_attributes_by_node[diag.node_id], per_node_timeout)
@@ -244,17 +257,85 @@ async def survey_thread_nodes(  # pylint: disable=too-many-locals
     return Survey(diags=diags, raw_count=len(raw_nodes), skipped=skipped)
 
 
-async def _live_refresh(matter: Any, diag: NodeDiag, raw_attributes: Mapping, per_node_timeout: float) -> None:
+_ATTR_NAMES = {
+    ATTR_ROUTING_ROLE: "RoutingRole",
+    ATTR_NEIGHBOR_TABLE: "NeighborTable",
+    ATTR_ROUTE_TABLE: "RouteTable",
+    ATTR_PARTITION_ID: "PartitionId",
+    ATTR_LEADER_ROUTER_ID: "LeaderRouterId",
+}
+
+#: Live roles that say "not attached": such a node has no partition or leader to
+#: report, so a null there is its true answer, not an unusable one (#348 review).
+#: Unspecified counts — a live "role unknown" statement must not be replaced by a
+#: cached "attached" one (it surfaces as ``role_unknown``).
+_NOT_ATTACHED_ROLES = (ROLE_UNSPECIFIED, ROLE_UNASSIGNED)
+
+#: The attached, NON-leader roles. Only for these is "I have no neighbours at all"
+#: implausible enough, when the role is unchanged from the cache, to be distrusted.
+#: A Leader can legitimately be alone in its own partition, and Unassigned has no
+#: neighbours by definition.
+_ATTACHED_NON_LEADER_ROLES = (ROLE_SED, ROLE_ED, ROLE_REED, ROLE_ROUTER)
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _unusable_live_answers(live_values: Mapping[int, Any]) -> list[str]:
+    """Why the live answers cannot replace the cache — one message per unusable
+    attribute, empty when every one is usable. The governing rule of the live pass
+    (#348 review): a live answer replaces the cache only when it is USABLE; the
+    caller treats ANY unusable one as a failed read of the whole node, so a node
+    is never left half cached and half live."""
+    problems: list[str] = []
+    role = live_values[ATTR_ROUTING_ROLE]
+    if not _is_int(role):
+        problems.append("live read returned no usable RoutingRole")
+    if not isinstance(live_values[ATTR_NEIGHBOR_TABLE], list):
+        problems.append("live read returned no NeighborTable")
+    if not isinstance(live_values[ATTR_ROUTE_TABLE], list):
+        problems.append("live read returned no usable RouteTable")
+    detached = role in _NOT_ATTACHED_ROLES
+    for attr in (ATTR_PARTITION_ID, ATTR_LEADER_ROUTER_ID):
+        value = live_values[attr]
+        if not _is_int(value) and not (detached and value is None):
+            problems.append(f"live read returned no usable {_ATTR_NAMES[attr]}")
+    return problems
+
+
+async def _live_refresh(  # pylint: disable=too-many-return-statements
+        matter: Any, diag: NodeDiag, raw_attributes: Mapping, per_node_timeout: float) -> None:
     """Live-read ``diag`` in place; never raises — a failure only sets ``read_error``.
 
     Mutates ``diag`` directly (it is a plain, non-frozen dataclass already sitting
     in the caller's list) rather than returning a replacement, so one failing node
     cannot disturb the others sharing the same ``asyncio.gather`` call.
+
+    **All-or-nothing, usable-or-failed (#348 review).** Either every live answer is
+    usable and they replace the cached values together (``source`` -> ``"live"``),
+    or the read FAILED: the cached diag is left exactly as it was, ``read_error``
+    says why, ``source`` stays ``"cache"``. ``read_error`` is never set on a
+    ``"live"`` diag. Failed means: any attribute read raised or the node timed out
+    (the message names each attribute); any answer is unusable (see
+    :func:`_unusable_live_answers`); or the live NeighborTable came back empty when
+    the cache had neighbours AND the node still claims, live, the same attached
+    non-leader role as in the cache (Router, REED, End Device, Sleepy End Device).
+    An unchanged "attached, but I see nobody" is far likelier a failed read than
+    "everyone left"; but a node that live-reports Unassigned/Unspecified (really
+    detached), Leader (alone in its own partition) or ANY different role has
+    demonstrably answered, and that answer is exactly what this diagnostic exists
+    to show — it is taken as it is. A table whose rows existed but none parsed is
+    unparseable (not empty) and is a failed read under every role.
     """
     node_id = diag.node_id
+    cached_child_rlocs = [child.rloc16 for child in diag.children]
+    cached_neighbour_count = len(diag.neighbours)
+    cached_role = diag.role
     try:
         values = await asyncio.wait_for(
-            asyncio.gather(*(matter.read(node_id, 0, CLUSTER_THREAD_DIAG, attr) for attr in _LIVE_ATTR_IDS)),
+            asyncio.gather(*(matter.read(node_id, 0, CLUSTER_THREAD_DIAG, attr) for attr in _LIVE_ATTR_IDS),
+                           return_exceptions=True),
             timeout=per_node_timeout,
         )
     except asyncio.TimeoutError:
@@ -270,16 +351,30 @@ async def _live_refresh(matter: Any, diag: NodeDiag, raw_attributes: Mapping, pe
         diag.read_error = f"live read failed: {exc}"
         return
 
+    # return_exceptions=True so one attribute failing is NAMED rather than hiding
+    # which of the five it was; any failure is still a failed read of the node.
+    failures = []
+    for attr, value in zip(_LIVE_ATTR_IDS, values):
+        if isinstance(value, BaseException):
+            reason = "timed out" if isinstance(value, asyncio.TimeoutError) else str(value) or repr(value)
+            failures.append(f"{_ATTR_NAMES[attr]} {reason}")
+    if failures:
+        if all(isinstance(value, asyncio.TimeoutError) for value in values):
+            diag.read_error = f"live read timed out after {per_node_timeout:g} s"  # the whole node, as before
+        else:
+            diag.read_error = f"live read failed: {'; '.join(failures)}"
+        return
+
     live_values = dict(zip(_LIVE_ATTR_IDS, values))
-    neighbor_table_value = live_values[ATTR_NEIGHBOR_TABLE]
-    if neighbor_table_value is None or not isinstance(neighbor_table_value, list):
-        # #334 post-review, B3.3: a live NeighborTable of None/garbage must not
-        # become "live / 0 neighbours / ok" — that is indistinguishable from a
-        # genuinely healthy router with no neighbours, and ties to thread_mesh's
-        # own absent-vs-empty distinction (B2.1). Keep the CACHED diag entirely
-        # (do not partial-merge the other attrs that DID answer) rather than
-        # invent a live reading this module cannot actually stand behind.
-        diag.read_error = "live read returned no NeighborTable"
+    problems = _unusable_live_answers(live_values)
+    if problems:
+        # #334 post-review, B3.3 (and #348 review): a live NeighborTable of
+        # None/garbage must not become "live / 0 neighbours / ok" — and the same
+        # goes for a role, route table, partition or leader that came back
+        # unusable. Keep the CACHED diag entirely (no partial merge of the attrs
+        # that DID answer) rather than invent a live reading this module cannot
+        # stand behind.
+        diag.read_error = "; ".join(problems)
         return
 
     merged = dict(raw_attributes)
@@ -291,9 +386,22 @@ async def _live_refresh(matter: Any, diag: NodeDiag, raw_attributes: Mapping, pe
 
     live_diag = parse_node_diag(node_id, diag.name, diag.available, merged)
     if live_diag is None:
-        # RoutingRole came back empty/unparseable — treat like any other failed
-        # live read rather than silently keeping half-updated cached data.
         diag.read_error = "live read returned no usable RoutingRole"
+        return
+    live_row_count = len(live_values[ATTR_NEIGHBOR_TABLE])
+    skipped_rows = live_row_count - len(live_diag.neighbours)
+    if live_row_count and not live_diag.neighbours:
+        diag.read_error = (
+            f"live neighbour table had {live_row_count} row(s) and none could be parsed — "
+            "the cached table is shown"
+        )
+        return
+    if (not live_row_count and cached_neighbour_count
+            and live_diag.role == cached_role and cached_role in _ATTACHED_NON_LEADER_ROLES):
+        diag.read_error = (
+            "live neighbour table came back empty while the cache had "
+            f"{cached_neighbour_count} neighbour(s) and the role is unchanged — the cached table is shown"
+        )
         return
     live_diag.source = "live"
     # Per-field copy rather than diag.__dict__.update(live_diag.__dict__): same
@@ -301,6 +409,24 @@ async def _live_refresh(matter: Any, diag: NodeDiag, raw_attributes: Mapping, pe
     # future NodeDiag gaining __slots__ (#334 post-review, B1.1).
     for declared_field in dataclasses.fields(NodeDiag):
         setattr(diag, declared_field.name, getattr(live_diag, declared_field.name))
+
+    # #348: only reached after a SUCCESSFUL, usable read. The live table replaced
+    # the cached one, so a cached child it no longer lists was not seen live; it is
+    # not drawn as an anonymous child of this router (the map is built from
+    # diag.children) and the node's own parse_warnings say so. Worded as the
+    # OBSERVATION, not "departed": the child may have re-attached elsewhere, and an
+    # owned device is still drawn from its own parent data. Skipped when any live row
+    # was skipped as malformed — the skipped row might have been that child.
+    # Appended AFTER the field copy above, which overwrites parse_warnings.
+    if skipped_rows == 0:
+        live_rlocs = {neighbour.rloc16 for neighbour in diag.neighbours}
+        for rloc16 in cached_child_rlocs:
+            if rloc16 not in live_rlocs:
+                diag.parse_warnings.append(
+                    f"child 0x{rloc16:04X} was in matter-server's cache but is absent from this router's "
+                    "live neighbour table (it has left or re-attached elsewhere), so it is not drawn as an "
+                    "anonymous child of this router"
+                )
 
 
 def _node_name(node_id: int, attributes: Mapping, node_names: Optional[Mapping[int, str]]) -> str:
@@ -323,7 +449,7 @@ def run_survey(
     runtime: Any,
     matter: Any,
     *,
-    live_sleepy: bool,
+    live_read: bool,
     per_node_timeout: float = ATTRIBUTE_TIMEOUT,
     node_names: Optional[Mapping[int, str]] = None,
     event_stamps: Optional[Mapping[int, float]] = None,
@@ -331,7 +457,7 @@ def run_survey(
     """Indigo-thread bridge for :func:`survey_thread_nodes` (Indigo -> asyncio,
     see ``async_runtime``'s module docstring). Blocks the calling Indigo thread.
 
-    The non-router live reads inside run concurrently, so the total wait is NOT
+    The live reads inside run concurrently, so the total wait is NOT
     ``per_node_timeout`` multiplied by node count — it is one ``per_node_timeout``
     budget for the slowest of them, plus ``SURVEY_READ_TIMEOUT`` for the
     ``get_nodes()`` round trip and result marshalling back across the bridge
@@ -344,7 +470,7 @@ def run_survey(
     nobody is waiting for any more.
     """
     future = runtime.submit(
-        survey_thread_nodes(matter, live_sleepy=live_sleepy, per_node_timeout=per_node_timeout,
+        survey_thread_nodes(matter, live_read=live_read, per_node_timeout=per_node_timeout,
                             node_names=node_names, event_stamps=event_stamps)
     )
     try:

@@ -1137,6 +1137,15 @@ def _freshness_cell(diag, now: datetime) -> str:
     return text
 
 
+def _unreachable_chip(diag) -> str:
+    """An amber chip in the Nodes table itself for a node matter-server marks
+    unavailable (#348 review) — not only in Flags and a hover tooltip. Same style
+    as the stale chip; says nothing about Thread attachment."""
+    if diag.available:
+        return ""
+    return ' <span class="chip-stale" title="matter-server marks this node unavailable">unreachable</span>'
+
+
 def _best_link_text(diag) -> str:
     if diag.is_router:
         rssi = diag.best_rssi
@@ -1161,7 +1170,7 @@ def _render_table(diags: list, now: datetime) -> str:
             f"<td>{_escape(diag.role_name)}</td>"
             f"<td>{_escape(router_bits)}</td>"
             f"<td>{_escape(_fmt_opt(diag.partition_id))}</td>"
-            f"<td>{_freshness_cell(diag, now)}</td>"
+            f"<td>{_freshness_cell(diag, now)}{_unreachable_chip(diag)}</td>"
             f"<td>{len(diag.neighbours)}</td>"
             f"<td>{_escape(_best_link_text(diag))}</td>"
             f"<td>{_escape(counters)}</td>"
@@ -1226,8 +1235,21 @@ def render_thread_page(mesh, diags: list, *, generated_at: str, live: bool,  # p
     resolved_now = now or datetime.now(timezone.utc)
     live_url = f"/message/{_escape(plugin_id)}/thread?live=1"
     cached_url = f"/message/{_escape(plugin_id)}/thread"
-    badge = "LIVE" if live else "CACHED"
-    badge_class = "badge-live" if live else "badge-cached"
+    # #348 review: the badge reports what the SURVEY did, not what was asked for.
+    # ``live`` is only "a live read was requested" — if every live read failed the
+    # page is showing matter-server's cache and must not say LIVE.
+    live_count = sum(1 for diag in diags if diag.source == "live")
+    cache_diags = [diag for diag in diags if diag.source != "live"]
+    if diags and not cache_diags:
+        badge, badge_class, survey_note = "LIVE", "badge-live", ""
+    elif live_count:
+        badge, badge_class = "PARTLY LIVE", "badge-cached"
+        survey_note = (f' <span class="badge-note">{live_count} of {len(diags)} nodes read live — '
+                       f'the rest are matter-server\'s cache</span>')
+    else:
+        badge, badge_class = "CACHED", "badge-cached"
+        survey_note = (' <span class="badge-note">a live read was requested but no node answered live — '
+                       'showing matter-server\'s cache</span>') if live and diags else ""
 
     # #344 UX (Simon's call), rewritten #344 review B3 to match A3: the
     # header note is purely informational and appears on any CACHED render
@@ -1235,16 +1257,16 @@ def render_thread_page(mesh, diags: list, *, generated_at: str, live: bool,  # p
     # naming how many diags have NO baseline at all (A3), rather than
     # silently implying the whole fabric is that fresh. The BANNER — the
     # thing pointing at "Refresh (live)" — is gated separately, on the
-    # oldest KNOWN baseline actually being stale (> 1 h). Neither ever
-    # appears on a live render.
-    oldest_age, unknown_baseline_count = (None, 0) if live else _oldest_interview_age(diags, resolved_now)
-    badge_note = ""
+    # oldest KNOWN baseline actually being stale (> 1 h). Neither appears
+    # when every node was read live.
+    oldest_age, unknown_baseline_count = _oldest_interview_age(cache_diags, resolved_now)
+    badge_note = survey_note
     stale_banner = ""
     if oldest_age is not None:
         # #344 review, A3: "(N unknown)" only when there IS an unknown diag —
         # wording is unchanged when every diag's baseline is known.
         unknown_note = f" ({unknown_baseline_count} unknown)" if unknown_baseline_count else ""
-        badge_note = (
+        badge_note += (
             f' <span class="badge-note">oldest node baseline: '
             f'{_escape(humanise_age(oldest_age))}{unknown_note}</span>'
         )
@@ -1261,7 +1283,7 @@ def render_thread_page(mesh, diags: list, *, generated_at: str, live: bool,  # p
                 f'<p class="msg">Some of this data is matter-server\'s cache — oldest node baseline '
                 f'{_escape(humanise_age(oldest_age))} ago. Baselines are a lower bound: a value may be '
                 f'staler than its interview.{unknown_sentence} Use <a href="{live_url}">Refresh (live)</a> '
-                f'to re-read sleepy devices.</p>'
+                f'to re-read every node.</p>'
             )
 
     header = f"""

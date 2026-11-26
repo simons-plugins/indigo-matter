@@ -55,7 +55,7 @@ never do (#334 post-review, B2.6 — this module used to carry its own
 parse; both are gone, on purpose, not an oversight).
 
 **Which attributes are subscribed.** Only what the four states actually consume,
-per ``thread_mesh.health_flags``: RoutingRole (role_name, detached, is_router,
+per ``thread_mesh.health_flags``: RoutingRole (role_name, detached, unreachable, is_router,
 single_neighbour), NeighborTable (neighbour count, weak_link, high_frame_error,
 the parent for a non-router's ``threadLinkRssi``), RouteTable + LeaderRouterId
 (far_from_leader — the one health check that needs a second attribute pair beyond

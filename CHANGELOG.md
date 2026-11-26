@@ -3,6 +3,47 @@
 Notable changes per release. Versions are `YYYY.R.P`; the authoritative
 current version is `Info.plist`'s `PluginVersion`.
 
+## 2026.36.0 — The Thread mesh report reads routers live and stops calling an unreachable device "detached"
+
+- Fix (issue #348): **Report Thread mesh…** with the live-read option on (and the
+  Thread page's **Refresh (live)**) now reads every node, routers included. Before,
+  routers were skipped on the assumption that a mains-powered node's cache is fresh,
+  but a router's neighbour and route tables are never refreshed by matter-server's
+  subscription, so they could be hours out of date. The checkbox is now **Live-read
+  every node first**; `?live=1` is unchanged. Reads still run at the same time, so a
+  live report takes at most about 50 s however many routers you have.
+- Fix (issue #348): a live answer only replaces the cache when it is usable. If a node's
+  live read fails, times out, or comes back unusable (no RoutingRole, RouteTable,
+  PartitionId or LeaderRouterId, a neighbour table whose rows none could be parsed, or an
+  empty neighbour table from a node whose role is unchanged and still attached while the
+  cache had neighbours), the node keeps its cached data, is listed under
+  **Unreadable** with the reason (naming each attribute that failed), and carries the
+  `stale` note. It is never half cached and half live. A node that really has detached (live role Unassigned or Unspecified, empty
+  tables, no partition), or split off as the Leader of its own partition, is a correct
+  live answer and is shown as such, flagged `detached` / `role_unknown` / no neighbours.
+- Fix (issue #348): a child a router's cache listed but its usable live table no longer
+  does is not drawn as an anonymous child of that router; the node's block says so
+  ("child 0x5C04 was in matter-server's cache but is absent from this router's live
+  neighbour table (it has left or re-attached elsewhere) ..."). If the router's live read
+  fails, its cached children are left exactly as they were.
+- Fix (issue #348): every cached node now carries the `stale` note, routers included, and
+  it says a router's neighbour and route tables are never refreshed by subscription.
+- Fix (issue #348): the Thread page's header badge follows what the survey did: **LIVE**
+  only when every node was read live, **PARTLY LIVE** (with "n of m") when some were, and
+  **CACHED** when a live read was asked for but no node answered. The stale-cache banner
+  is based on the cached nodes only. Nodes matter-server marks unavailable show an
+  `unreachable` chip in the Nodes table. The menu report only says "could not be
+  live-read" for nodes whose live read was asked for and failed.
+- Fix (issue #369): the Flags section no longer says `detached` for a node the controller
+  merely reports as unavailable. `detached` now means the node's Thread role is
+  Unassigned, and nothing else. A device matter-server marks unavailable gets a new
+  `unreachable` flag that says only that, says it is not about Thread attachment, and
+  says whether the Thread data shown is matter-server's cache or a live read succeeded
+  anyway. A node whose Thread role could not be read (or is Unspecified) gets a separate
+  `role_unknown` flag. `unreachable` and `role_unknown` are both BAD, so the
+  `threadHealth` state a trigger might watch is unchanged. A node that is both Unassigned
+  and unavailable gets both flags.
+
 ## 2026.35.2 — Toggle follows what Indigo shows, not what the bulb believes
 
 - Fix (issue #367): Indigo's Toggle on a light (relay, dimmer or colour dimmer)
