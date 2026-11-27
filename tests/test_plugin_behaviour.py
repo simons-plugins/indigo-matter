@@ -11,6 +11,7 @@ import asyncio
 import importlib
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -1997,7 +1998,7 @@ def test_menu_restart_clears_window_when_ensure_installed_raises(plug, plugin_mo
 # ---------------------------------------------------------------------------
 
 def _fake_agent(port, package, report, *, due_bootstrap=None, has_pid=True, verdict=VERDICT_CONFLICT_FREE,
-                fatal_cause=None):
+                fatal_cause=None, holds_port=True):
     """A LaunchAgent-shaped fake for one agent's contribution to a tick (#182/#187).
 
     ``due_bootstrap`` is the deadline TOKEN ``due_for_bootstrap_verification()``
@@ -2017,6 +2018,7 @@ def _fake_agent(port, package, report, *, due_bootstrap=None, has_pid=True, verd
         post_bootstrap_verdict=lambda: verdict() if callable(verdict) else verdict,
         managed_job_has_pid=lambda: has_pid() if callable(has_pid) else has_pid,
         describe_fatal_cause=lambda: fatal_cause() if callable(fatal_cause) else fatal_cause,
+        managed_pid_holds_port=lambda: holds_port() if callable(holds_port) else holds_port,
     )
 
 
@@ -2353,19 +2355,37 @@ def _respawning_controller(tmp_path, monkeypatch, *, alive_for, phase, listen_pi
     running = launchctl_print_fixture("respawn_attempt_running")
     between = launchctl_print_fixture("respawn_spawn_scheduled")
 
+    # Controls a test may set on the returned clock dict:
+    #   fail_prints / etime_none: the next N `launchctl print` / `ps -o etime=` reads fail.
+    #   runs0, epoch: `runs` = runs0 + one per 10 s cycle since epoch (a restart sets 1, now).
+    #   bound_at: our attempt (pid 33602) bound the port at this time and stays up.
+    clock.update(fail_prints=0, etime_none=0, runs0=3, epoch=start, bound_at=None)
+
     def text():
+        if clock["bound_at"] is not None:            # recovered: one attempt, up and serving
+            return running.replace("\truns = 3\n", f"\truns = {clock['bound_runs']}\n", 1)
         # launchd's `runs` climbs once per ~10 s cycle, as it does for a real loop.
-        runs = 3 + int((clock["t"] - start + phase) // 10)
+        runs = clock["runs0"] + int((clock["t"] - clock["epoch"] + phase) // 10)
         return (running if offset() < alive_for else between).replace(
             "\truns = 3\n", f"\truns = {runs}\n", 1)
-    runner = ProcRunner(print_text=text,
-                        proc_etime=lambda: f"00:{int(offset()):02d}", listen_pids=listen_pids,
+
+    def etime():
+        if clock["etime_none"]:
+            clock["etime_none"] -= 1
+            return None                              # ps: the pid died between the two reads
+        age = clock["t"] - clock["bound_at"] if clock["bound_at"] is not None else offset()
+        return f"{int(age) // 60:02d}:{int(age) % 60:02d}"
+    runner = ProcRunner(print_text=text, proc_etime=etime, listen_pids=listen_pids,
                         ps_lines=[f"{pid} node /elsewhere/MatterServer.js --port 5580" for pid in listen_pids])
+    clock["runner"] = runner
 
     def fatal_if_restarted(cmd, **kwargs):
         # Make-it-fatal: nothing in the watchdog may restart, stop or signal anything.
         if cmd[:2] in (["launchctl", "bootout"], ["launchctl", "bootstrap"]) or cmd[:1] == ["kill"]:
             raise AssertionError(f"the watchdog must only report, never act: {cmd}")
+        if cmd[:2] == ["launchctl", "print"] and clock["fail_prints"]:
+            clock["fail_prints"] -= 1
+            return subprocess.CompletedProcess(cmd, 113, stdout="", stderr="Could not find service")
         return runner(cmd, **kwargs)
     agent = _sp_proc(tmp_path, Mock(), fatal_if_restarted)
     os.makedirs(agent.log_dir, exist_ok=True)
@@ -2379,6 +2399,106 @@ def _respawning_controller(tmp_path, monkeypatch, *, alive_for, phase, listen_pi
 
 def _texts(method):
     return [c.args[0] % c.args[1:] if len(c.args) > 1 else str(c.args[0]) for c in method.call_args_list]
+
+
+def _ticks(plug, clock, n):
+    for _ in range(n):
+        plug._port_conflict_tick()
+        clock["t"] += 15
+
+
+_RIVAL_FATAL = "listen EADDRINUSE: address already in use 127.0.0.1:5580"
+_LOCK_FATAL = "[storage-lock] Storage is locked by another process (pid 607)"
+
+
+@pytest.mark.parametrize("failure", ["fail_prints", "etime_none"])
+def test_one_unreadable_sample_mid_loop_changes_nothing(plug, tmp_path, monkeypatch, failure):
+    """A failed `launchctl print`, or a `ps` age that could not be read (the pid died
+    between the two reads), in the middle of a reported loop. It used to wipe the
+    baseline: the #182 message naming OUR changing pid, a "resolved" line while the
+    rival still held the port, then the loop report again."""
+    agent, clock = _respawning_controller(tmp_path, monkeypatch, alive_for=9, phase=4,
+                                          listen_pids=[777], fatal=_RIVAL_FATAL)
+    plug.server_process, plug.bridge_process = agent, None
+    _ticks(plug, clock, 40)
+    clock[failure] = 1
+    plug._next_port_check = 0.0
+    _ticks(plug, clock, 60)
+    errors = _texts(plug.logger.error)
+    assert len(errors) == 1, errors
+    assert not [t for t in errors if "33602" in t]
+    assert not [t for t in _texts(plug.logger.info) if "resolved" in t]
+
+
+def test_a_restart_that_does_not_fix_a_loop_never_says_resolved(plug, tmp_path, monkeypatch):
+    """Restart the Matter controller during a storage-lock loop (the remedy the message
+    suggests) and the lock is still held: the new job's `runs` starts again at 1. No
+    "resolved" may appear; the loop may be reported again at most once (the user
+    acted, so one re-report is fair — here it reads the same, so it is not)."""
+    agent, clock = _respawning_controller(tmp_path, monkeypatch, alive_for=1, phase=4,
+                                          listen_pids=[], fatal=_LOCK_FATAL)
+    plug.server_process, plug.bridge_process = agent, None
+    _ticks(plug, clock, 40)
+    assert len(_texts(plug.logger.error)) == 1
+    # What _bootstrap_and_record() does on the menu restart; launchd's count restarts.
+    agent._respawn_baseline = None
+    agent._bootstrap_verify_after = clock["t"] + STARTUP_GRACE_SECONDS
+    clock["runs0"], clock["epoch"] = 1, clock["t"]
+    _ticks(plug, clock, 60)
+    assert not [t for t in _texts(plug.logger.info) if "resolved" in t]
+    assert len(_texts(plug.logger.error)) <= 2
+
+
+def test_a_loop_that_ends_is_announced_once_and_never_blames_our_own_server(plug, tmp_path, monkeypatch):
+    agent, clock = _respawning_controller(tmp_path, monkeypatch, alive_for=9, phase=4,
+                                          listen_pids=[777], fatal=_RIVAL_FATAL)
+    plug.server_process, plug.bridge_process = agent, None
+    _ticks(plug, clock, 40)
+    assert len(_texts(plug.logger.error)) == 1
+    # The rival goes away; our next attempt binds and serves.
+    clock["bound_at"], clock["bound_runs"] = clock["t"], 40
+    clock["runner"].listen_pids = [33602]
+    clock["runner"].ps_lines = ["33602 node /ours/MatterServer.js --port 5580"]
+    _ticks(plug, clock, 1)
+    resolved = [t for t in _texts(plug.logger.info) if "resolved" in t]
+    assert len(resolved) == 1 and "start-up problem" in resolved[0]
+    _ticks(plug, clock, 40)
+    assert len([t for t in _texts(plug.logger.info) if "resolved" in t]) == 1
+    errors = _texts(plug.logger.error)
+    assert len(errors) == 1 and "33602" not in errors[0]
+
+
+@pytest.mark.parametrize("binds_after", [0, 16])     # bound when sampled / binds 16 s into its life
+def test_restarts_minutes_apart_are_never_a_loop(plug, tmp_path, monkeypatch, binds_after):
+    """runs 3 at the first check, then an ordinary restart (a server that exits 1 on
+    SIGTERM) every four minutes. A climb measured against a baseline of any age called
+    that "keeps failing to start … about every 10 seconds"."""
+    from test_server_process import ProcRunner, _sp_proc, launchctl_print_fixture
+    clock = {"t": 90_000.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+    base = launchctl_print_fixture("kickstarted_twice_exit_1")
+    pid = int(base.split("\tpid = ", 1)[1].split()[0])
+    job = {"runs": 3, "born": clock["t"] - 60}
+
+    def age():
+        return int(clock["t"] - job["born"])
+    runner = ProcRunner(print_text=lambda: base.replace("\truns = 3\n", f"\truns = {job['runs']}\n", 1),
+                        proc_etime=lambda: f"{age() // 60:02d}:{age() % 60:02d}")
+
+    def run(cmd, **kwargs):
+        if cmd[:2] in (["launchctl", "bootout"], ["launchctl", "bootstrap"]) or cmd[:1] == ["kill"]:
+            raise AssertionError(f"the watchdog must only report, never act: {cmd}")
+        runner.listen_pids = [pid] if age() >= binds_after else []
+        return runner(cmd, **kwargs)
+    agent = _sp_proc(tmp_path, Mock(), run)
+    plug.server_process, plug.bridge_process = agent, None
+    for minute in range(16):
+        if minute and minute % 4 == 0:
+            job["runs"] += 1
+            job["born"] = clock["t"]
+        _ticks(plug, clock, 4)
+    assert not plug.logger.error.called, _texts(plug.logger.error)
+    assert not [t for t in _texts(plug.logger.warning) if "abandoned" in t]
 
 
 @pytest.mark.parametrize("fixture", ["kickstarted_twice_exit_1", "kickstarted_twice_signal_death"])
