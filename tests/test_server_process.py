@@ -1232,24 +1232,28 @@ def test_reload_over_a_respawning_job_is_not_left_alone_silently(tmp_path, mock_
     """Issue #374: matter-server 1.6.1 exits 1 on a failed start and launchd respawns it
     about every 10 s. A plugin reload that samples a live attempt sees a pid, a matching
     digest and no orphan — every pre-#374 signal for "healthy, hands off" — and used to
-    log nothing. It must say the controller keeps failing to start, and (restarting
-    would only fail the same way) must neither bootout nor signal anything to do so."""
+    log nothing and schedule nothing. One sample cannot tell a loop from a healthy job
+    restarted twice since it was loaded, so the reload arms a verification that is due
+    at once: the watchdog's next sample, with `runs` climbed, reports the loop. Nothing
+    may be stopped or signalled to get there (restarting would only fail the same way)."""
     runner = ProcRunner(print_text=launchctl_print_fixture("first_run_never_exited"))
     sp = _sp_proc_installed(tmp_path, mock_logger, runner)
     sp.ensure_installed()                                # records the marker
-    runner.print_text = launchctl_print_fixture("respawn_attempt_running")
+    sp.clear_bootstrap_verification(sp._bootstrap_verify_after)
+    runner.print_text = launchctl_print_fixture("respawn_attempt_running")      # runs = 3
     runner.proc_etime = "00:04"
     runner.calls.clear()
     mock_logger.reset_mock()
 
     def fatal_if_restarted(cmd, **kwargs):
-        if cmd[:2] == ["launchctl", "bootout"] or cmd[:1] == ["kill"]:
+        if cmd[:2] in (["launchctl", "bootout"], ["launchctl", "bootstrap"]) or cmd[:1] == ["kill"]:
             raise AssertionError(f"a reload must not restart a respawning job: {cmd}")
         return ProcRunner.__call__(runner, cmd, **kwargs)
     sp._run = fatal_if_restarted
-    sp.ensure_installed()
-    errors = " ".join(str(c) for c in mock_logger.error.call_args_list)
-    assert "keeps failing to start" in errors
+    assert sp.ensure_installed() is False                # left running…
+    assert sp.due_for_bootstrap_verification() is not None   # …but not left alone
+    runner.print_text = runner.print_text.replace("\truns = 3\n", "\truns = 4\n", 1)
+    assert "keeps failing to start" in (sp.port_conflict_report() or "")
 
 
 def test_reload_reports_a_foreign_port_holder_instead_of_declaring_health(tmp_path,

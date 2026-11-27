@@ -2352,7 +2352,13 @@ def _respawning_controller(tmp_path, monkeypatch, *, alive_for, phase, listen_pi
 
     running = launchctl_print_fixture("respawn_attempt_running")
     between = launchctl_print_fixture("respawn_spawn_scheduled")
-    runner = ProcRunner(print_text=lambda: running if offset() < alive_for else between,
+
+    def text():
+        # launchd's `runs` climbs once per ~10 s cycle, as it does for a real loop.
+        runs = 3 + int((clock["t"] - start + phase) // 10)
+        return (running if offset() < alive_for else between).replace(
+            "\truns = 3\n", f"\truns = {runs}\n", 1)
+    runner = ProcRunner(print_text=text,
                         proc_etime=lambda: f"00:{int(offset()):02d}", listen_pids=listen_pids,
                         ps_lines=[f"{pid} node /elsewhere/MatterServer.js --port 5580" for pid in listen_pids])
 
@@ -2373,6 +2379,50 @@ def _respawning_controller(tmp_path, monkeypatch, *, alive_for, phase, listen_pi
 
 def _texts(method):
     return [c.args[0] % c.args[1:] if len(c.args) > 1 else str(c.args[0]) for c in method.call_args_list]
+
+
+@pytest.mark.parametrize("fixture", ["kickstarted_twice_exit_1", "kickstarted_twice_signal_death"])
+def test_a_healthy_job_restarted_twice_is_not_reported_as_a_loop(plug, tmp_path, monkeypatch, fixture):
+    """runs = 3, a young pid and (for a server that exits 1 on SIGTERM) last exit code
+    = 1: what `launchctl kickstart -k` twice — or two crashes weeks apart — leaves. The
+    counter never climbs again, so no tick may call it a loop; the verification ends
+    the normal way once the pid is past the grace window."""
+    from test_server_process import ProcRunner, _sp_proc, launchctl_print_fixture
+    clock = {"t": 80_000.0}
+    start = clock["t"]
+    monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+    text = launchctl_print_fixture(fixture)
+    pid = int(text.split("\tpid = ", 1)[1].split()[0])
+    runner = ProcRunner(print_text=text, listen_pids=[pid],
+                        proc_etime=lambda: f"{int(clock['t'] - start + 5) // 60:02d}:{int(clock['t'] - start + 5) % 60:02d}")
+
+    def fatal_if_restarted(cmd, **kwargs):
+        if cmd[:2] in (["launchctl", "bootout"], ["launchctl", "bootstrap"]) or cmd[:1] == ["kill"]:
+            raise AssertionError(f"the watchdog must only report, never act: {cmd}")
+        return runner(cmd, **kwargs)
+    agent = _sp_proc(tmp_path, Mock(), fatal_if_restarted)
+    agent._bootstrap_verify_after = start                 # due at once, as a reload arms it
+    plug.server_process = agent
+    plug.bridge_process = None
+    for _ in range(20):                                   # 5 minutes of 15 s ticks
+        plug._port_conflict_tick()
+        clock["t"] += 15
+    assert not plug.logger.error.called, _texts(plug.logger.error)
+    assert not [t for t in _texts(plug.logger.warning) if "abandoned" in t]
+    assert agent.due_for_bootstrap_verification() is None   # ended as CONFLICT_FREE
+
+
+def test_the_end_of_a_start_up_loop_is_announced_as_that_not_as_a_port_conflict(plug):
+    state = {"report": "matter-server keeps failing to start: it exits with code 1 and macOS "
+                       "restarts it about every 10 seconds. The last error it logged: storage lock."}
+    _plug_with_server(plug, lambda: state["report"])
+    plug._port_conflict_tick()
+    state["report"] = None
+    plug._next_port_check = 0.0
+    plug._port_conflict_tick()
+    info = " ".join(_texts(plug.logger.info))
+    assert "start-up problem reported earlier is resolved" in info
+    assert "port conflict" not in info
 
 
 @pytest.mark.parametrize("alive_for,fatal", [
