@@ -36,9 +36,9 @@ current version is `Info.plist`'s `PluginVersion`.
   and, if another program holds the port, which one. Before this fix that loop could
   go unreported, or the same port-conflict error could be repeated every few minutes
   and followed by a wrong "resolved" line.
-- Commissioning: the hint to restart the controller when no device was discovered also
-  appears when matter-server 1.6.1 reports that failure in different words, using the
-  reason code it now sends with the error.
+- Commissioning: the hint to restart the controller when no device was discovered now
+  also goes by the reason code matter-server 1.6.1 sends with the error, not only by the
+  wording of its message.
 - "Allow test/development device certificates" now says what it does with matter-server
   1.6.0 and later: besides test/development certificates, it also accepts a device that
   does not report the vendor or product ID its certification is checked against. The
