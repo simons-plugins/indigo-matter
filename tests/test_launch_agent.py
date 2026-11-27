@@ -965,9 +965,10 @@ def test_respawn_state_needs_a_climb_within_the_grace_window(tmp_path, mock_logg
     clock["runs"] = 4
     assert agent.respawn_state() == la.RESPAWN_LOOPING
     assert agent.respawn_state() == la.RESPAWN_LOOPING            # same tick, read again
-    clock["t"] += 200                                             # longer than the grace window…
-    clock["runs"] = 25
-    assert agent.respawn_state() == la.RESPAWN_LOOPING            # …but each LOOPING sample renewed it
+    for runs in (12, 21):                                         # 200 s on: past the grace window…
+        clock["t"] += 100
+        clock["runs"] = runs
+        assert agent.respawn_state() == la.RESPAWN_LOOPING        # …but each LOOPING sample renewed it
 
 
 def test_a_baseline_older_than_the_grace_window_is_replaced_not_compared(tmp_path, mock_logger, monkeypatch):
@@ -1020,13 +1021,9 @@ def test_unknown_with_no_loop_in_progress_falls_back_to_the_old_checks(tmp_path,
 
 
 def test_a_loop_report_never_names_our_own_pid_as_the_port_holder(tmp_path, mock_logger, monkeypatch):
-    agent, clock, runner = _state_agent(tmp_path, mock_logger, monkeypatch, listen_pids=[777])
+    agent, _clock, runner = _state_agent(tmp_path, mock_logger, monkeypatch, listen_pids=[777, 33602])
     runner.ps_lines = ["777 node /elsewhere/MatterServer.js --port 5580"]
-    agent.port_conflict_report()
-    clock["t"] += 15
-    clock["runs"], clock["text"] = 4, "respawn_spawn_scheduled"
-    runner.listen_pids = [777, 33602]                  # stale lsof row for our previous attempt
-    report = agent.port_conflict_report()
+    report = agent._respawn_loop_report({"pid": 33602, "last_exit": 1})
     assert "777" in report and "33602" not in report
 
 

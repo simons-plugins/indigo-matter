@@ -31,16 +31,12 @@ current version is `Info.plist`'s `PluginVersion`.
 - When matter-server 1.6.1 cannot start (for example because another program holds its
   port, or its storage is locked), it stops and macOS restarts it about every 10
   seconds until the cause goes away, instead of staying running without a connection
-  as 1.2.2 did. The plugin reports this once it has seen macOS restart it again between
-  two of its checks: a little over two minutes after the plugin starts the controller,
-  within about 15 seconds of a plugin reload that finds it restarting, and otherwise
-  within about 10 minutes. It is one error saying the controller keeps failing to start
-  and is being restarted, with the error matter-server logged and, if another program
-  holds the port, which one; when the problem clears, the log says the start-up problem
-  is resolved. A controller that was simply restarted a couple of times and is now
-  running normally is not reported. Before this fix that loop could go unreported, or
-  the same port-conflict error could be repeated every few minutes and followed by a
-  wrong "resolved" line.
+  as 1.2.2 did. The plugin reports this once, as one error, about 15 seconds after it
+  first sees the controller restarting (so a little over two minutes after the plugin
+  itself starts it), naming the error matter-server logged and any other program
+  holding its port. The line saying the start-up problem is resolved appears when the
+  controller is serving on its port again. A controller that was simply restarted a
+  few times and is running normally is not reported.
 - Commissioning: the hint to restart the controller when no device was discovered now
   also goes by the reason code matter-server 1.6.1 sends with the error, not only by the
   wording of its message.
