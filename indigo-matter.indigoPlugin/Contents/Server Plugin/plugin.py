@@ -52,7 +52,8 @@ from export_recovery_menu_mixin import ExportRecoveryMenuMixin
 from export_store import ExportStore
 from http_api_mixin import HttpApiMixin
 from http_handlers import HttpApi
-from launch_agent import STARTUP_GRACE_SECONDS, VERDICT_CONFLICT_FREE, VERDICT_DEAD, VERDICT_RESPAWNING
+from launch_agent import (RESPAWN_LOOP_PHRASE, STARTUP_GRACE_SECONDS, VERDICT_CONFLICT_FREE, VERDICT_DEAD,
+                          VERDICT_RESPAWNING)
 from matter_client import MatterClient
 from matter_handlers.registry import HandlerRegistry
 from node_replace_menu_mixin import NodeReplaceMenuMixin
@@ -116,6 +117,15 @@ def _dead_verdict_cause_text(agent) -> str:
     # ". See <path>." after this text, so a trailing period here would double up.
     return cause.message.rstrip(".")
 
+
+
+def _resolved_text(agent, previous: str) -> str:
+    """The line announcing that a report from :meth:`Plugin._check_agent_port_conflict`
+    has cleared: a start-up loop (issue #374) or a port conflict (#182)."""
+    if RESPAWN_LOOP_PHRASE in previous:
+        return f"{agent.spec.package} is running again; the start-up problem reported earlier is resolved."
+    return (f"{agent.spec.package} now owns port {agent.spec.port} again; the port conflict reported "
+            f"earlier is resolved.")
 
 
 def _unreachable_state(dev_id, logger=None):
@@ -1177,8 +1187,7 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # Gated on a pid (#187 review): port_conflict_report() also goes quiet when the
             # managed job has NO pid at all — the dead-process branch above already reported
             # that, and it is the opposite of resolved.
-            self.logger.info("%s now owns port %s again; the port conflict reported "
-                             "earlier is resolved.", agent.spec.package, agent.spec.port)
+            self.logger.info("%s", _resolved_text(agent, previous))
         setattr(self, last_attr, conflict)
 
     # ------------------------------------------------------------------

@@ -93,10 +93,14 @@ VERDICT_PENDING = "pending"
 # Issue #374: the job keeps failing to start and launchd keeps restarting it (see
 # LaunchAgent._respawn_loop_report). A verdict, unlike PENDING: waiting cannot end it.
 VERDICT_RESPAWNING = "respawning"
-# How many launchd runs since the job was loaded, the last one exiting non-zero, make a
-# respawn LOOP rather than one crash and a restart (runs = 2). launchd's `runs` counter
-# restarts at 1 on every bootstrap, and a loop reaches 3 within ~20 s of one.
+# The least launchd `runs` (since the job was loaded) for a sample to be SUSPECTED of a
+# respawn loop; one crash and a restart is runs = 2. Not proof on its own: `runs` only
+# resets on bootstrap, so a healthy job restarted twice since then also has runs >= 3.
+# A loop is confirmed only by `runs` climbing between samples (LaunchAgent._respawn_facts).
 RESPAWN_LOOP_MIN_RUNS = 3
+#: The words every respawn-loop report starts with after the package name; the plugin
+#: uses them to say "start-up problem resolved" rather than "port conflict resolved".
+RESPAWN_LOOP_PHRASE = "keeps failing to start"
 
 # LaunchAgent._stale_reason_for_live_pid() outcomes (stale-lock review). Collapsing
 # LIVE_PID_OURS and LIVE_PID_UNDECIDED into the same (False, "") is what let the
@@ -286,6 +290,10 @@ class LaunchAgent:
         # due_for_bootstrap_verification() has been acted on (issue #187). See that
         # method's docstring for why this exists alongside port_conflict_report().
         self._bootstrap_verify_after: Optional[float] = None
+        # launchd's `runs` at the first sample that looked like a respawn loop; a loop is
+        # only confirmed once a later sample's `runs` is higher (issue #374). Cleared by
+        # any sample that does not look like one, and by a bootstrap (runs restarts at 1).
+        self._respawn_baseline_runs: Optional[int] = None
         # Wall-clock time this instance last bootstrapped something itself (via
         # _bootstrap_and_record's two callers, or the older-macOS `launchctl load`
         # fallback in _apply_plist) — the freshness anchor for describe_fatal_cause().
@@ -837,6 +845,11 @@ class LaunchAgent:
                 conflict = self.port_conflict_report(managed_pid=managed_pid)
                 if conflict:
                     self.logger.error(conflict)
+                elif self._respawn_facts()["suspicious"]:
+                    # Issue #374: this looks like a respawn loop, but one sample cannot
+                    # tell it from a healthy job restarted twice. Arm the verification
+                    # due now, so the watchdog's next tick takes the second sample.
+                    self._bootstrap_verify_after = time.monotonic()
                 return False
             # else: an orphan was starving it; fall through to a clean bootout + bootstrap.
         if running and not self._bootout():
@@ -899,6 +912,7 @@ class LaunchAgent:
         if plist_bytes is not None:
             self._record_applied_digest(self._digest_of(plist_bytes))
         self._bootstrap_verify_after = time.monotonic() + STARTUP_GRACE_SECONDS
+        self._respawn_baseline_runs = None
         return True
 
     @staticmethod
@@ -1883,14 +1897,19 @@ class LaunchAgent:
         cannot start, and launchd restarts it about every 10 s. Every attempt is
         younger than the grace window and the gap between attempts has no pid, so none
         of the signals below can see it, and the conflict message would name a
-        different pid of ours on every respawn. :meth:`_respawn_loop_report` returns
-        one message that reads the same in every phase of that loop.
+        different pid of ours on every respawn. Once :meth:`_respawn_facts` has seen
+        launchd's restart count climb, :meth:`_respawn_loop_report` returns one message
+        that reads the same in every phase of that loop. A sample that only LOOKS like
+        a loop (the first one, or a healthy job restarted twice since it was loaded)
+        returns None, and the checks below are skipped for it.
 
         Returns a message for the caller to log, or None when nothing is wrong.
         """
-        respawning = self._respawn_loop_report() if self.spec.port is not None else None
-        if self.spec.port is None or respawning:
-            return respawning
+        facts = self._respawn_facts() if self.spec.port is not None else {"suspicious": False}
+        if self.spec.port is None or facts["suspicious"]:
+            # A suspected loop is reported once confirmed and says nothing until then:
+            # one sample cannot tell it from a healthy job restarted twice.
+            return self._respawn_loop_report(facts) if facts["suspicious"] else None
         if managed_pid is None:
             managed_pid = self._managed_job()["pid"]
         if managed_pid is None:
@@ -2020,10 +2039,15 @@ class LaunchAgent:
             inside the grace window, or unknowable. NOT a verdict — the caller
             must leave the verification armed and let the next tick retry.
           * :data:`VERDICT_RESPAWNING` — launchd keeps restarting a job that keeps
-            failing (:meth:`_respawn_facts`). A verdict: waiting cannot end it.
+            failing (:meth:`_respawn_facts`). A verdict: waiting cannot end it. The
+            first sample that looks like a loop is PENDING instead: only a second one,
+            with launchd's restart count higher, confirms it.
         """
-        if self._respawn_facts()["looping"]:
+        facts = self._respawn_facts()
+        if facts["looping"]:
             return VERDICT_RESPAWNING
+        if facts["suspicious"]:
+            return VERDICT_PENDING          # one more sample decides: loop, or healthy job
         pid = self._managed_job()["pid"]
         if pid is None:
             return VERDICT_DEAD
@@ -2118,22 +2142,33 @@ class LaunchAgent:
     def _respawn_facts(self) -> dict:
         """Read launchd's own restart record for the job, from one ``launchctl print``.
 
-        ``looping`` is True when launchd keeps restarting a job that keeps failing:
-        ``runs`` >= :data:`RESPAWN_LOOP_MIN_RUNS` since it was loaded, the last run
-        exited non-zero, and right now it is either ``state = spawn scheduled`` (between
-        attempts, no pid) or running a process younger than
-        :data:`STARTUP_GRACE_SECONDS`. Field names are as real ``launchctl print``
-        prints them (fixtures in tests/fixtures/launchctl_print). Anything missing or
-        unparseable reads as NOT looping: this only ever adds a report, so "could not
-        tell" falls back to the checks that existed before it.
+        ``suspicious``: ``runs`` >= :data:`RESPAWN_LOOP_MIN_RUNS` since it was loaded,
+        the last run exited non-zero, and right now it is either ``state = spawn
+        scheduled`` (between attempts, no pid) or running a process younger than
+        :data:`STARTUP_GRACE_SECONDS`. That alone is NOT a loop: ``runs`` only resets
+        on bootstrap, so a healthy job restarted twice since then (``launchctl
+        kickstart -k``, two crashes weeks apart) looks exactly the same until its pid
+        ages past the grace window.
 
-        None of the older behaviours match: a healthy server has never exited
-        (``last exit code = (never exited)``); a server that exits 0 on a fatal error
-        (0.6.x) is not restarted and shows ``last exit code = 0``; 1.2.2 stays running.
+        ``looping``: suspicious AND ``runs`` is higher than it was at the first
+        suspicious sample — launchd is still restarting it. The baseline is kept on the
+        instance, set by the first suspicious sample, and cleared by any sample that is
+        not suspicious (and by a bootstrap). Reading the same ``runs`` again changes
+        nothing, so callers may read this more than once per tick. A real loop
+        (~10 s per restart) is therefore confirmed on the second sample.
+
+        Field names are as real ``launchctl print`` prints them (fixtures in
+        tests/fixtures/launchctl_print). A process killed by a signal has no ``last
+        exit code`` line at all (``last terminating signal = …`` instead), so it is
+        never suspicious. Anything missing or unparseable reads as not suspicious:
+        this only ever adds a report, so "could not tell" falls back to the checks
+        that existed before it.
         """
-        facts = {"looping": False, "runs": None, "last_exit": None, "state": None, "pid": None}
+        facts = {"looping": False, "suspicious": False, "runs": None, "last_exit": None,
+                 "state": None, "pid": None}
         result = self._launchctl("print", f"gui/{os.getuid()}/{self.spec.label}")
         if result is None or result.returncode != 0:
+            self._respawn_baseline_runs = None
             return facts
         for line in (result.stdout or "").splitlines():
             key, sep, value = line.strip().partition(" = ")
@@ -2146,24 +2181,30 @@ class LaunchAgent:
                     facts["last_exit" if key == "last exit code" else key] = int(value)
                 except ValueError:
                     pass                    # "(never exited)", a signal description, …
-        if not facts["last_exit"] or (facts["runs"] or 0) < RESPAWN_LOOP_MIN_RUNS:
-            return facts
-        if facts["pid"] is None:
-            facts["looping"] = facts["state"] == "spawn scheduled"
+        if facts["last_exit"] and (facts["runs"] or 0) >= RESPAWN_LOOP_MIN_RUNS:
+            if facts["pid"] is None:
+                facts["suspicious"] = facts["state"] == "spawn scheduled"
+            else:
+                age = self._process_age_seconds(facts["pid"])
+                facts["suspicious"] = age is not None and age < STARTUP_GRACE_SECONDS
+        if not facts["suspicious"]:
+            self._respawn_baseline_runs = None
+        elif self._respawn_baseline_runs is None:
+            self._respawn_baseline_runs = facts["runs"]
         else:
-            age = self._process_age_seconds(facts["pid"])
-            facts["looping"] = age is not None and age < STARTUP_GRACE_SECONDS
+            facts["looping"] = facts["runs"] > self._respawn_baseline_runs
         return facts
 
-    def _respawn_loop_report(self) -> Optional[str]:
+    def _respawn_loop_report(self, facts: dict) -> Optional[str]:
         """The message for a job launchd keeps restarting (issue #374), else None.
+
+        ``facts`` is :meth:`_respawn_facts`'s answer for this sample.
 
         Deliberately the SAME text in every phase of the loop and on every attempt, so
         the plugin's "log only when the report changes" logs it once: it never names
         our own pid (new on every respawn), and the FATAL line's own timestamp is
         dropped. A rival holding the port is named, since its pid is stable.
         """
-        facts = self._respawn_facts()
         if not facts["looping"]:
             return None
         cause = self.describe_fatal_cause()
@@ -2172,7 +2213,7 @@ class LaunchAgent:
         else:
             why = "The last error it logged: " + _FATAL_TIMESTAMP_RE.sub("", cause.message, count=1).strip()
         message = (
-            f"{self.spec.package} keeps failing to start: it exits with code "
+            f"{self.spec.package} {RESPAWN_LOOP_PHRASE}: it exits with code "
             f"{facts['last_exit']} and macOS restarts it about every 10 seconds. "
             f"{why.rstrip('.')}."
         )
