@@ -2186,8 +2186,9 @@ class LaunchAgent:
         * otherwise :data:`RESPAWN_SUSPECTED`, nothing changed.
 
         A sample that is not suspicious clears the baseline: :data:`RESPAWN_NOT_LOOPING`.
-        One that cannot be read (``launchctl`` failed, or the pid's age could not be
-        read — it died between the two reads) is :data:`RESPAWN_UNKNOWN` and changes
+        One that cannot be read (``launchctl`` failed, the pid's age could not be read
+        — it died between the two reads — or the port probe was unusable) is
+        :data:`RESPAWN_UNKNOWN` and changes
         nothing. Field names are as real ``launchctl print`` prints them (fixtures in
         tests/fixtures/launchctl_print). Returns ``(state, facts)``.
         """
@@ -2211,9 +2212,11 @@ class LaunchAgent:
             suspicious = facts["state"] == "spawn scheduled"
         elif suspicious:
             age = self._process_age_seconds(facts["pid"])
-            if age is None:
+            young = age is not None and age < STARTUP_GRACE_SECONDS
+            listeners = self._port_listener_pids() if young else []
+            if age is None or listeners is None:    # ps or lsof unusable: not "nobody is listening"
                 return RESPAWN_UNKNOWN, facts
-            suspicious = age < STARTUP_GRACE_SECONDS and facts["pid"] not in (self._port_listener_pids() or [])
+            suspicious = young and facts["pid"] not in listeners
         if not suspicious:
             self._respawn_baseline = None
             return RESPAWN_NOT_LOOPING, facts
@@ -2247,8 +2250,13 @@ class LaunchAgent:
             f"{facts['last_exit']} and macOS restarts it about every 10 seconds. "
             f"{why.rstrip('.')}."
         )
-        holders = [pid for pid in (self._port_listener_pids() or []) if pid != facts["pid"]]
-        if holders:                         # never our own pid: never "stop" our own server
+        listeners = self._port_listener_pids() or []
+        # Never our own pid: never "stop" our own server. Read the managed pid again
+        # AFTER the probe — a sample taken between attempts has none, and launchd may
+        # have started (and bound) the next attempt since.
+        ours = {facts["pid"], self._managed_pid()}
+        holders = [pid for pid in listeners if pid not in ours]
+        if holders:
             procs = self._ps_map()
             others = ", ".join(f"pid {pid} ({procs.get(pid, 'unknown command')})" for pid in holders)
             message += (f" Port {self.spec.port} is held by {others}; stop that process "

@@ -1027,6 +1027,32 @@ def test_a_loop_report_never_names_our_own_pid_as_the_port_holder(tmp_path, mock
     assert "777" in report and "33602" not in report
 
 
+def test_a_loop_report_sampled_between_attempts_still_never_names_our_own_pid(tmp_path, mock_logger, monkeypatch):
+    # The sample saw no pid ("spawn scheduled"); by the time the port is probed launchd
+    # has started the next attempt and it is listening. Telling the user to stop that
+    # pid would stop the managed server, so it is excluded by its identity NOW.
+    agent, _clock, runner = _state_agent(tmp_path, mock_logger, monkeypatch, listen_pids=[777, 33602])
+    runner.ps_lines = ["777 node /elsewhere/MatterServer.js --port 5580"]
+    report = agent._respawn_loop_report({"pid": None, "last_exit": 1})
+    assert "777" in report and "33602" not in report
+    runner.listen_pids = [33602]
+    assert "is held by" not in agent._respawn_loop_report({"pid": None, "last_exit": 1})
+
+
+def test_an_unusable_port_probe_is_unknown_not_a_pid_that_is_not_listening(tmp_path, mock_logger, monkeypatch):
+    # lsof failing says nothing about who holds the port: it must not count a young
+    # managed process as "not listening" and so feed a loop report.
+    import launch_agent as la
+    agent, clock, _runner = _state_agent(tmp_path, mock_logger, monkeypatch)
+    assert agent.respawn_state() == la.RESPAWN_SUSPECTED
+    baseline = agent._respawn_baseline
+    agent._port_listener_pids = lambda: None
+    clock["t"] += 15
+    clock["runs"] = 4
+    assert agent.respawn_state() == la.RESPAWN_UNKNOWN
+    assert agent._respawn_baseline == baseline
+
+
 # ---------------------------------------------------------------------------
 # adopt_pending_bootstrap_verification() — a rebuild whose own ensure_installed()
 # left a healthy job alone must not silently drop the replaced instance's
