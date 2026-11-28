@@ -70,7 +70,7 @@ def test_the_bridge_is_a_second_agent_with_its_own_everything(tmp_path, mock_log
 
 
 def test_the_install_spec_is_a_registry_pin(tmp_path, mock_logger):
-    """One constant, exact-pinned, exactly like matter-server@1.2.2.
+    """One constant, exact-pinned, exactly like matter-server@1.6.1.
 
     This is the whole point of the AgentSpec extraction: installing the bridge is
     ``npm install --prefix ~/indigo-matter <spec>`` with a different string, not

@@ -90,6 +90,26 @@ STARTUP_GRACE_SECONDS = 120
 VERDICT_DEAD = "dead"
 VERDICT_CONFLICT_FREE = "conflict_free"
 VERDICT_PENDING = "pending"
+# Issue #374: the job keeps failing to start and launchd keeps restarting it (see
+# LaunchAgent._respawn_loop_report). A verdict, unlike PENDING: waiting cannot end it.
+VERDICT_RESPAWNING = "respawning"
+# The least launchd `runs` (since the job was loaded) for a sample to be SUSPECTED of a
+# respawn loop; one crash and a restart is runs = 2. Not proof on its own: `runs` only
+# resets on bootstrap, so a healthy job restarted twice since then also has runs >= 3.
+# A loop is confirmed only by `runs` climbing between samples (LaunchAgent.respawn_state).
+RESPAWN_LOOP_MIN_RUNS = 3
+# LaunchAgent.respawn_state() outcomes (issue #374).
+RESPAWN_NOT_LOOPING = "not_looping"
+RESPAWN_SUSPECTED = "suspected"
+RESPAWN_LOOPING = "looping"
+RESPAWN_UNKNOWN = "unknown"
+#: What port_conflict_report() returns while a suspected loop is undecided: falsy, so a
+#: caller that only logs truthy reports logs nothing, and distinct from None ("nothing
+#: wrong"), which the plugin tick needs to tell apart (it must not log "resolved").
+RESPAWN_UNDECIDED = ""
+#: The words every respawn-loop report starts with after the package name; the plugin
+#: uses them to say "start-up problem resolved" rather than "port conflict resolved".
+RESPAWN_LOOP_PHRASE = "keeps failing to start"
 
 # LaunchAgent._stale_reason_for_live_pid() outcomes (stale-lock review). Collapsing
 # LIVE_PID_OURS and LIVE_PID_UNDECIDED into the same (False, "") is what let the
@@ -279,6 +299,10 @@ class LaunchAgent:
         # due_for_bootstrap_verification() has been acted on (issue #187). See that
         # method's docstring for why this exists alongside port_conflict_report().
         self._bootstrap_verify_after: Optional[float] = None
+        # (runs, monotonic time) of the sample a suspected respawn loop is measured
+        # against (issue #374; see respawn_state). Cleared by a sample that does not look
+        # like a loop, and by a bootstrap (launchd's `runs` restarts at 1).
+        self._respawn_baseline: Optional[tuple] = None
         # Wall-clock time this instance last bootstrapped something itself (via
         # _bootstrap_and_record's two callers, or the older-macOS `launchctl load`
         # fallback in _apply_plist) — the freshness anchor for describe_fatal_cause().
@@ -782,17 +806,21 @@ class LaunchAgent:
                 # tell it from an orphan — don't risk killing it.
                 return False
             if managed_pid is None:
-                # Loaded with NO pid line: the job is dead and launchd has decided not to
-                # respawn it (#104 fault 2 — matter-server exits 0 on a fatal startup
-                # error, which KeepAlive {SuccessfulExit: false} reads as a clean exit).
-                # There is no healthy server to protect here, so fall through to the
-                # bootout + bootstrap below, which is the only thing that revives it.
+                # Loaded with NO pid line. Version-dependent (issue #374): a server that
+                # exits 0 on a fatal startup error (#104 fault 2, matter-server 0.6.x) is
+                # read by KeepAlive {SuccessfulExit: false} as a clean exit and never
+                # respawned. matter-server 1.6.1 exits 1 instead (observed: ~9 s after a
+                # lost port bind), so launchd respawns it every ~10 s, and between
+                # attempts `launchctl print` shows "state = spawn scheduled" with no pid
+                # line — this same branch. Either way there is no healthy server to
+                # protect here, so fall through to the bootout + bootstrap below, which
+                # revives the first case and costs nothing in the second.
                 self.logger.warning(
-                    "the %s LaunchAgent is loaded but not running, and launchd "
-                    "will not respawn it on its own (%s exits 0 even on a fatal "
-                    "startup error such as 'listen EADDRINUSE', which its KeepAlive policy "
-                    "treats as a clean exit). Restarting it now; see %s for the cause.",
-                    self.spec.package, self.spec.package,
+                    "the %s LaunchAgent is loaded but not running (a fatal startup error "
+                    "such as 'listen EADDRINUSE' stops it; depending on how it exited, "
+                    "launchd either leaves it stopped or keeps retrying every few seconds). "
+                    "Restarting it now; see %s for the cause.",
+                    self.spec.package,
                     os.path.join(self.log_dir, self.spec.err_log),
                 )
             elif self.reap_orphan_servers(exclude_pid=managed_pid) == 0:
@@ -823,6 +851,8 @@ class LaunchAgent:
                 # the port, restarting ours only fails again and costs every device's
                 # CASE session. The value here is an accurate, actionable diagnosis —
                 # a port holder that IS one of ours was already reaped by the call above.
+                # (A suspected respawn loop, #374, answers RESPAWN_UNDECIDED, falsy, and
+                # port_conflict_report has already armed the next sample.)
                 conflict = self.port_conflict_report(managed_pid=managed_pid)
                 if conflict:
                     self.logger.error(conflict)
@@ -888,6 +918,7 @@ class LaunchAgent:
         if plist_bytes is not None:
             self._record_applied_digest(self._digest_of(plist_bytes))
         self._bootstrap_verify_after = time.monotonic() + STARTUP_GRACE_SECONDS
+        self._respawn_baseline = None
         return True
 
     @staticmethod
@@ -1135,11 +1166,13 @@ class LaunchAgent:
         * :data:`NOT_LOADED` — launchd has no such label.
         * :data:`RUNNING` — loaded, with a pid we parsed. The ONLY positive
           signal; nothing may claim the process is up without it.
-        * :data:`LOADED_NOT_RUNNING` — loaded with no ``pid =`` line at all.
-          launchd reports ``state = not running`` and, under our ``KeepAlive
-          {SuccessfulExit: false}``, has decided not to respawn it (a node that
-          exits 0 on a fatal startup error reads as a clean exit). Loaded and
-          dead, indefinitely.
+        * :data:`LOADED_NOT_RUNNING` — loaded with no ``pid =`` line at all. Two
+          cases. ``state = not running``: under our ``KeepAlive {SuccessfulExit:
+          false}`` launchd has decided not to respawn it (a server that exits 0 on a
+          fatal startup error, such as matter-server 0.6.x, reads as a clean exit) —
+          loaded and dead, indefinitely. ``state = spawn scheduled``: it exited
+          non-zero and launchd will start it again in a few seconds (matter-server
+          1.6.1 failing to start, issue #374) — the gap between respawns.
         * :data:`UNKNOWN` — a ``pid =`` line we could not parse. The job may
           well be alive and we cannot prove it either way, so callers must
           neither claim success nor report a failure.
@@ -1838,6 +1871,17 @@ class LaunchAgent:
         (It also corrects the older assumption, recorded in :meth:`_managed_job`, that
         such a server exits 0 and leaves the job visibly dead — 1.2.2 does not.)
 
+        matter-server 1.6.1 (the pin since issue #374) behaves differently again: it
+        exits 1 on the same FATAL (observed ~9 s after the bind fails; upstream bounds
+        it at 30 s), so launchd respawns it every ~10 s while the port stays taken. A
+        sample that lands while one of those attempts is alive gets the authoritative
+        verdict below; one that lands between attempts sees no pid and returns None,
+        leaving the report to :meth:`post_bootstrap_verdict` (``VERDICT_DEAD`` with the
+        EADDRINUSE cause from the err log). The age-gated branch cannot fire for such a
+        loop — every attempt is younger than :data:`STARTUP_GRACE_SECONDS` — which is
+        correct: nothing is lingering without a listener. Older servers can still be
+        running against this code, so the 1.2.2 handling stays.
+
         Signals, in order of trust:
 
         * **Authoritative** — the port is held by a pid that is not ours. Whatever our
@@ -1855,10 +1899,29 @@ class LaunchAgent:
         subsequent startup for ever — the log can establish that a conflict happened
         once, never that one is happening now.
 
-        Returns a message for the caller to log, or None when nothing is wrong.
+        **Respawn loop (issue #374) comes first.** matter-server 1.6.1 exits 1 when it
+        cannot start, and launchd restarts it about every 10 s. Every attempt is
+        younger than the grace window and the gap between attempts has no pid, so none
+        of the signals below can see it, and the conflict message would name a
+        different pid of ours on every respawn. :meth:`respawn_state` decides it:
+        LOOPING returns :meth:`_respawn_loop_report`'s one message, the same text in
+        every phase of the loop. SUSPECTED, and UNKNOWN while a loop is under way,
+        return :data:`RESPAWN_UNDECIDED` and skip the checks below (they would name our
+        own short-lived pid, or read the gap between attempts as "resolved"); a
+        SUSPECTED sample also arms the bootstrap verification due at once, so the
+        watchdog's next tick takes the deciding sample. NOT_LOOPING, and UNKNOWN with
+        no loop under way, fall through to the checks below exactly as before #374.
+
+        Returns a message for the caller to log, :data:`RESPAWN_UNDECIDED`, or None
+        when nothing is wrong.
         """
-        if self.spec.port is None:
-            return None
+        state, facts = self._respawn_sample() if self.spec.port is not None else (None, {})
+        if state == RESPAWN_SUSPECTED and self._bootstrap_verify_after is None:
+            self._bootstrap_verify_after = time.monotonic()
+        undecided = state == RESPAWN_SUSPECTED or (state == RESPAWN_UNKNOWN and self._respawn_baseline is not None)
+        if state is None or state == RESPAWN_LOOPING or undecided:
+            looping = state == RESPAWN_LOOPING
+            return self._respawn_loop_report(facts) if looping else (RESPAWN_UNDECIDED if undecided else None)
         if managed_pid is None:
             managed_pid = self._managed_job()["pid"]
         if managed_pid is None:
@@ -1908,9 +1971,9 @@ class LaunchAgent:
             message = (
                 f"{self.spec.package} (pid {managed_pid}) has been running for {age}s "
                 f"but NOTHING is listening on port {self.spec.port}, so the plugin "
-                f"cannot reach it. This is what a lost port race leaves behind: "
-                f"{self.spec.package} logs a fatal '{EADDRINUSE_MARKER}' and keeps "
-                f"running without its WebSocket server. Restart it from "
+                f"cannot reach it. Older versions of {self.spec.package} do this after "
+                f"losing a port race: they log a fatal '{EADDRINUSE_MARKER}' and keep "
+                f"running without a connection. Restart it from "
                 f"Plugins ▸ Matter, and see "
                 f"{os.path.join(self.log_dir, self.spec.err_log)}."
             )
@@ -1967,11 +2030,16 @@ class LaunchAgent:
         still inside (or unknowably within) the startup grace window, or the
         managed job has no pid at all. That last one is the #187 fault itself:
         bootstrap succeeded, but the process then lost the port bind race, logged
-        EADDRINUSE, and exited — and ``KeepAlive {SuccessfulExit: False}`` never
-        respawns it (see :meth:`_apply_plist`'s "loaded but not running" branch).
-        It is exactly the case ``port_conflict_report`` deliberately declines to
-        call a conflict, because calling it one would send a caller hunting for a
+        EADDRINUSE, and exited 0 — and ``KeepAlive {SuccessfulExit: False}`` never
+        respawns an exit 0 (see :meth:`_apply_plist`'s "loaded but not running"
+        branch). It is exactly the case ``port_conflict_report`` deliberately declines
+        to call a conflict, because calling it one would send a caller hunting for a
         rival process that does not exist.
+
+        A server that exits NON-zero instead (matter-server 1.6.1, issue #374) is
+        respawned by launchd about every 10 s, so "no pid" and "young pid" alternate
+        and neither DEAD nor PENDING is true; that is :data:`VERDICT_RESPAWNING`,
+        checked first. ``port_conflict_report`` normally reports it before this runs.
 
         Returns one of:
 
@@ -1982,10 +2050,16 @@ class LaunchAgent:
           * :data:`VERDICT_PENDING` — a pid is present but its age is still
             inside the grace window, or unknowable. NOT a verdict — the caller
             must leave the verification armed and let the next tick retry.
-
-        Reuses :meth:`_managed_job` rather than re-parsing ``launchctl print`` a
-        second time in the same tick.
+          * :data:`VERDICT_RESPAWNING` — launchd keeps restarting a job that keeps
+            failing (:meth:`respawn_state` is LOOPING). A verdict: waiting cannot end
+            it. SUSPECTED, and UNKNOWN while a loop is under way, are PENDING instead:
+            the next sample decides.
         """
+        state = self.respawn_state()
+        if state == RESPAWN_LOOPING:
+            return VERDICT_RESPAWNING
+        if state == RESPAWN_SUSPECTED or (state == RESPAWN_UNKNOWN and self._respawn_baseline is not None):
+            return VERDICT_PENDING
         pid = self._managed_job()["pid"]
         if pid is None:
             return VERDICT_DEAD
@@ -1993,6 +2067,15 @@ class LaunchAgent:
         if age is not None and age >= STARTUP_GRACE_SECONDS:
             return VERDICT_CONFLICT_FREE
         return VERDICT_PENDING
+
+    def managed_pid_holds_port(self) -> bool:
+        """True only if the managed job's pid is the one listening on our port (#374).
+
+        Authoritative where :meth:`managed_job_has_pid` is not: a freshly started
+        attempt has a pid long before it serves. An unusable probe answers False.
+        """
+        pid = self._managed_job()["pid"]
+        return pid is not None and pid in (self._port_listener_pids() or [])
 
     def managed_job_has_pid(self) -> bool:
         """True if the managed launchd job currently reports a pid.
@@ -2036,7 +2119,7 @@ class LaunchAgent:
           difference between "loaded but NOT running" (no such line; launchd reports
           ``state = not running``) and "running, but we could not parse the pid", and
           the two must not be conflated. #104's fault 2 lives in that gap: matter-server
-          exits 0 on the ``EADDRINUSE`` FATAL, so launchd's ``KeepAlive
+          0.6.x exits 0 on the ``EADDRINUSE`` FATAL, so launchd's ``KeepAlive
           {SuccessfulExit: false}`` policy classes it a clean exit and deliberately
           never respawns it — the job sits loaded-and-dead indefinitely. Treating that
           as "healthy, hands off" is why a plugin reload could not recover it either.
@@ -2045,7 +2128,11 @@ class LaunchAgent:
           perfectly healthy from here while having no WebSocket listener at all. A pid
           from this method therefore means "launchd has a live process", never "our
           server is reachable" — :meth:`port_conflict_report` answers that second
-          question. Both behaviours are in the wild, so neither may be assumed.
+          question. 1.6.1 is a third case (issue #374): it exits 1, which this
+          KeepAlive policy DOES respawn, so the job alternates between a short-lived
+          pid and ``state = spawn scheduled`` with no pid line (see
+          :meth:`respawn_state`, which reads that state). All three behaviours are in
+          the wild, so none may be assumed.
         * ``arguments`` — the ProgramArguments launchd actually cached at bootstrap,
           which is NOT necessarily what the plist on disk now says (fault 3).
         """
@@ -2072,6 +2159,109 @@ class LaunchAgent:
                 except (ValueError, IndexError):
                     job["pid"] = None
         return job
+
+    def respawn_state(self) -> str:
+        """:data:`RESPAWN_NOT_LOOPING`, ``_SUSPECTED``, ``_LOOPING`` or ``_UNKNOWN`` (#374)."""
+        return self._respawn_sample()[0]
+
+    def _respawn_sample(self) -> tuple:
+        """Read launchd's restart record for the job (one ``launchctl print``) and judge it.
+
+        A sample is **suspicious** when ``runs`` >= :data:`RESPAWN_LOOP_MIN_RUNS` since
+        the job was loaded, ``last exit code`` is a non-zero integer, and the job is
+        either ``state = spawn scheduled`` (between attempts, no pid) or running a pid
+        younger than :data:`STARTUP_GRACE_SECONDS` that is NOT itself listening on our
+        port (a pid holding the port has started, whatever came before). A process
+        killed by a signal prints no ``last exit code`` at all, so is never suspicious.
+
+        ``runs`` only resets on bootstrap, so a healthy job restarted twice since then
+        looks the same; a loop is told apart by launchd's count still climbing. The
+        baseline is ``(runs, monotonic time)`` of a suspicious sample:
+
+        * no baseline, or one older than the grace window → it becomes this sample:
+          :data:`RESPAWN_SUSPECTED` (restarts minutes apart never confirm);
+        * ``runs`` above the baseline's → :data:`RESPAWN_LOOPING`, and the baseline's
+          TIME is renewed (its runs kept), so a continuing loop stays LOOPING however
+          far apart the samples are, and reading again in the same tick agrees;
+        * otherwise :data:`RESPAWN_SUSPECTED`, nothing changed.
+
+        A sample that is not suspicious clears the baseline: :data:`RESPAWN_NOT_LOOPING`.
+        One that cannot be read (``launchctl`` failed, the pid's age could not be read
+        — it died between the two reads — or the port probe was unusable) is
+        :data:`RESPAWN_UNKNOWN` and changes
+        nothing. Field names are as real ``launchctl print`` prints them (fixtures in
+        tests/fixtures/launchctl_print). Returns ``(state, facts)``.
+        """
+        facts = {"runs": None, "last_exit": None, "state": None, "pid": None}
+        result = self._launchctl("print", f"gui/{os.getuid()}/{self.spec.label}")
+        if result is None or result.returncode != 0:
+            return RESPAWN_UNKNOWN, facts
+        for line in (result.stdout or "").splitlines():
+            key, sep, value = line.strip().partition(" = ")
+            if not sep or (key in facts and facts[key] is not None):
+                continue                    # nested blocks repeat "state"; keep the first
+            if key == "state":
+                facts["state"] = value
+            elif key in ("runs", "pid", "last exit code"):
+                try:
+                    facts["last_exit" if key == "last exit code" else key] = int(value)
+                except ValueError:
+                    pass                    # "(never exited)", a signal description, …
+        suspicious = bool(facts["last_exit"]) and (facts["runs"] or 0) >= RESPAWN_LOOP_MIN_RUNS
+        if suspicious and facts["pid"] is None:
+            suspicious = facts["state"] == "spawn scheduled"
+        elif suspicious:
+            age = self._process_age_seconds(facts["pid"])
+            young = age is not None and age < STARTUP_GRACE_SECONDS
+            listeners = self._port_listener_pids() if young else []
+            if age is None or listeners is None:    # ps or lsof unusable: not "nobody is listening"
+                return RESPAWN_UNKNOWN, facts
+            suspicious = young and facts["pid"] not in listeners
+        if not suspicious:
+            self._respawn_baseline = None
+            return RESPAWN_NOT_LOOPING, facts
+        now = time.monotonic()
+        base = self._respawn_baseline
+        if base is None or now - base[1] > STARTUP_GRACE_SECONDS or facts["runs"] < base[0]:
+            self._respawn_baseline = (facts["runs"], now)
+            return RESPAWN_SUSPECTED, facts
+        if facts["runs"] > base[0]:
+            self._respawn_baseline = (base[0], now)
+            return RESPAWN_LOOPING, facts
+        return RESPAWN_SUSPECTED, facts
+
+    def _respawn_loop_report(self, facts: dict) -> Optional[str]:
+        """The message for a job launchd keeps restarting (issue #374), else None.
+
+        ``facts`` is :meth:`_respawn_sample`'s reading of this sample.
+
+        Deliberately the SAME text in every phase of the loop and on every attempt, so
+        the plugin's "log only when the report changes" logs it once: it never names
+        our own pid (new on every respawn), and the FATAL line's own timestamp is
+        dropped. A rival holding the port is named, since its pid is stable.
+        """
+        cause = self.describe_fatal_cause()
+        if cause is None:
+            why = "Its error log does not say why"
+        else:
+            why = "The last error it logged: " + _FATAL_TIMESTAMP_RE.sub("", cause.message, count=1).strip()
+        message = (
+            f"{self.spec.package} {RESPAWN_LOOP_PHRASE}: it exits with code "
+            f"{facts['last_exit']} and macOS restarts it about every 10 seconds. "
+            f"{why.rstrip('.')}."
+        )
+        listeners = self._port_listener_pids() or []
+        # Never our own pid: never "stop" our own server. Read the managed pid again
+        # AFTER the probe — a sample taken between attempts has none, and launchd may
+        # have started (and bound) the next attempt since.
+        ours = {facts["pid"], self._managed_pid()}
+        holders = [pid for pid in listeners if pid not in ours]
+        if holders:
+            procs = self._ps_map()
+            others = ", ".join(f"pid {pid} ({procs.get(pid, 'unknown command')})" for pid in holders)
+            message += (f" Port {self.spec.port} is held by {others}; stop that process "
+                        f"(or its LaunchAgent).")
+        return f"{message} See {os.path.join(self.log_dir, self.spec.err_log)}."
 
     def _managed_pid(self) -> Optional[int]:
         """The pid of the LaunchAgent's currently-running job, or None if not running.

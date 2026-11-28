@@ -116,6 +116,24 @@ def test_parse_result_raises_on_error_frame(proto):
     assert "PASE failed" in exc.value.details
 
 
+def test_error_frame_with_1_6_1_extra_keys_still_raises_with_code_and_details(proto):
+    # matter-server 1.6.1 may add status / cluster_status / reason to an error frame
+    # (ws-controller WebSocketControllerHandler.ts), plus keys we do not know yet.
+    frame = {"message_id": "9", "error_code": 1, "details": "Commission failed: x",
+             "status": 135, "cluster_status": 2, "reason": "not-discovered", "future_key": [1]}
+    with pytest.raises(ProtocolError) as exc:
+        proto.parse_result(frame)
+    assert exc.value.code == 1 and exc.value.details == "Commission failed: x"
+    assert exc.value.reason == "not-discovered"
+    assert (exc.value.status, exc.value.cluster_status) == (135, 2)
+
+
+def test_an_error_frame_without_the_new_keys_leaves_them_none(proto):
+    with pytest.raises(ProtocolError) as exc:
+        proto.parse_result({"message_id": "9", "error_code": 5, "details": "Node 4242 does not exist"})
+    assert (exc.value.reason, exc.value.status, exc.value.cluster_status) == (None, None, None)
+
+
 # ----------------------------------------------------------------------
 # Inbound events
 # ----------------------------------------------------------------------
@@ -220,7 +238,8 @@ def test_node_not_exists_recognised_when_the_code_arrives_as_a_string():
 def test_other_error_codes_are_not_node_not_exists():
     # Fails CLOSED: misreading a real failure as "already gone" would forget a node
     # that is still commissioned, which is worse than making the user retry.
-    for code in (0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 100):
+    # 101 (OTA upload, matter-server 1.4.0) and 102-106 (camera, 1.5.0) included.
+    for code in (0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 100, 101, 102, 103, 104, 105, 106):
         assert not protocol.is_node_not_exists(protocol.ProtocolError(code, "boom"))
 
 
@@ -289,7 +308,7 @@ def test_node_unreachable_recognised_from_zero_padded_string_codes():
 def test_node_unreachable_false_for_other_codes():
     # Fails CLOSED, like is_node_not_exists — a code we cannot read as 3/4 is
     # never guessed to be one.
-    for code in (0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 100):
+    for code in (0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 100, 101, 102, 103, 104, 105, 106):
         assert not protocol.is_node_unreachable(protocol.ProtocolError(code, "boom"))
     assert not protocol.is_node_unreachable(protocol.ProtocolError(None, "no code"))
     assert not protocol.is_node_unreachable(ConnectionError("offline"))

@@ -1303,7 +1303,7 @@ class DeviceSync:
             # retract the node's battery endpoints and AttributeLists on a
             # routine restart — and, since #190, RESURRECT exactly the spurious-0
             # states #190 removes (unknown keeps a state), for the next warm
-            # snapshot to withdraw them again. Verified in matter-server 1.2.2:
+            # snapshot to withdraw them again. Verified in matter-server 1.2.2 (and 1.6.1):
             # @matter-server/ws-controller ControllerCommandHandler.js
             # getNodeDetails + AttributeDataCache.js #runPopulate, which collects
             # into a local object and does ONE #cache.set once complete — so the
@@ -4052,15 +4052,16 @@ class DeviceSync:
             # them cannot hide anything.
             self._forget_node_capabilities(evt.node_id)
         elif evt.kind == protocol.EVT_ENDPOINT_ADDED:
-            # matter-server ALWAYS fires node_updated (via structureChanged) after
-            # endpoint_added — verified against PairedNode.ts #triggerNodeStructureChanges
-            # (line 954) in matter.js.  The full node-details object in node_updated
+            # matter-server always sends a node_updated (via structureChanged) for the
+            # structure change that adds an endpoint: AFTER endpoint_added up to 1.4.0
+            # (1.2.2 included), BEFORE it from 1.5.0 (pinned 1.6.1) — see the protocol.py note above
+            # EVT_ENDPOINT_ADDED.  The full node-details object in node_updated
             # lets _on_node_added run create_devices (idempotent) to pick up the new
             # endpoint.  Here we just log at debug so the sequence is visible in the
             # event log, and avoid a redundant create pass with incomplete data.
             if evt.node_id is not None and evt.endpoint is not None:
                 self.logger.debug(
-                    "endpoint_added: node %s endpoint %s — awaiting node_updated",
+                    "endpoint_added: node %s endpoint %s — handled via node_updated",
                     evt.node_id, evt.endpoint,
                 )
             else:

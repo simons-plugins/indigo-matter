@@ -96,5 +96,5 @@ def test_real_attribute_updated_maps_to_onoff_state():
 
 
 def test_real_server_info_version_drift_against_the_pin():
-    from server_process import version_drift
-    assert version_drift(REAL_SERVER_INFO["sdk_version"]) == ("0.6.2", "1.2.2", "older")
+    from server_process import PINNED_VERSION, version_drift
+    assert version_drift(REAL_SERVER_INFO["sdk_version"]) == ("0.6.2", PINNED_VERSION, "older")

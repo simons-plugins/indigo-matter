@@ -30,7 +30,7 @@ from typing import Any, Callable, Optional
 
 NPX_CANDIDATES = ("/opt/homebrew/bin/npx", "/usr/local/bin/npx")
 
-# matter-server 1.2.2's package.json declares engines node >= 22.13.0. npm's engines
+# matter-server 1.2.2's and 1.6.1's package.json declare engines node >= 22.13.0. npm's engines
 # check is advisory by default (exits 0 on an older node), so install() gates on this
 # itself — otherwise a too-old node "successfully" installs an unrunnable server.
 # Shared by every agent for the same reason INSTALL_NODE_STAMP is shared: they all run

@@ -24,12 +24,12 @@ from datetime import datetime
 import pytest
 
 from launch_agent import (
-    FATAL_FRESHNESS_SLACK_SECONDS, INSTALL_NODE_STAMP, NO_BOOTSTRAP_RECENT_WINDOW_SECONDS,
+    EADDRINUSE_MARKER, FATAL_FRESHNESS_SLACK_SECONDS, INSTALL_NODE_STAMP, NO_BOOTSTRAP_RECENT_WINDOW_SECONDS,
     VERDICT_CONFLICT_FREE, VERDICT_DEAD, VERDICT_PENDING, AgentSpec, FatalCause, LaunchAgent,
 )
-from server_process import APPLIED_PLIST_MARKER, LABEL, ServerProcess
+from server_process import APPLIED_PLIST_MARKER, DEFAULT_INSTALL_SPEC, LABEL, ServerProcess
 
-from test_server_process import FakeRunner, ProcRunner
+from test_server_process import FakeRunner, ProcRunner, launchctl_print_fixture
 
 
 def _argv(agent):
@@ -811,6 +811,249 @@ def test_verdict_is_pending_when_the_pids_age_is_unknowable(tmp_path, mock_logge
 
 
 # ---------------------------------------------------------------------------
+# Issue #374 — matter-server 1.6.1 EXITS 1 on a failed start, and launchd's KeepAlive
+# respawns it about every 10 s. Every attempt is young and the gap between attempts
+# has no pid, so "pending" and "dead" alternate and neither is the truth. The real
+# `launchctl print` text (tests/fixtures/launchctl_print) is what tells them apart.
+# ---------------------------------------------------------------------------
+
+def _write_fatal(agent, text):
+    """Append a matter-server-style FATAL line stamped NOW to the agent's err log."""
+    os.makedirs(agent.log_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    with open(os.path.join(agent.log_dir, agent.spec.err_log), "a", encoding="utf-8") as handle:
+        handle.write(f"{stamp} FATAL MatterServer Server failed to start {text}\n")
+
+
+_EADDRINUSE = "listen EADDRINUSE: address already in use 127.0.0.1:5580"
+
+
+def _with_runs(fixture, runs):
+    """A real fixture with its top-level ``runs = N`` set to *runs* (a loop's counter climbs)."""
+    text = launchctl_print_fixture(fixture)
+    assert "\truns = 3\n" in text
+    return text.replace("\truns = 3\n", f"\truns = {runs}\n", 1)
+
+
+@pytest.mark.parametrize("fixture,etime", [
+    ("respawn_attempt_running", "00:04"),    # sampled while one attempt is alive
+    ("respawn_spawn_scheduled", "00:04"),    # sampled between attempts: no pid at all
+])
+def test_verdict_is_not_pending_for_a_job_launchd_keeps_respawning(tmp_path, mock_logger, fixture, etime):
+    # One suspicious sample is not enough (a healthy job restarted twice looks the
+    # same): it stays PENDING. A second sample whose `runs` has climbed is a loop.
+    import launch_agent
+    state = {"runs": 3}
+    agent = _portful(tmp_path, mock_logger,
+                     ProcRunner(print_text=lambda: _with_runs(fixture, state["runs"]), proc_etime=etime))
+    assert agent.post_bootstrap_verdict() == VERDICT_PENDING
+    state["runs"] = 4
+    assert agent.post_bootstrap_verdict() == launch_agent.VERDICT_RESPAWNING
+
+
+@pytest.mark.parametrize("fixture,etime,expected", [
+    ("first_run_never_exited", "10:00", VERDICT_CONFLICT_FREE),   # healthy, long running
+    ("first_run_never_exited", "00:05", VERDICT_PENDING),         # healthy, slow first start
+    # Two failed starts long ago, then a server that has stayed up: not a loop now.
+    ("respawn_attempt_running", "3-04:00:00", VERDICT_CONFLICT_FREE),
+])
+def test_verdict_for_a_job_that_is_not_respawning_is_unchanged(tmp_path, mock_logger, fixture, etime, expected):
+    agent = _portful(tmp_path, mock_logger,
+                     ProcRunner(print_text=launchctl_print_fixture(fixture), proc_etime=etime))
+    assert agent.post_bootstrap_verdict() == expected
+
+
+@pytest.mark.parametrize("fixture", ["respawn_attempt_running", "respawn_spawn_scheduled"])
+def test_a_respawn_loop_is_a_report_in_every_phase_with_the_fatal_cause(tmp_path, mock_logger, fixture):
+    # Port free (nothing listening): before #374 this answered None in BOTH phases —
+    # nobody holds the port and every attempt is younger than the grace window.
+    state = {"runs": 3}
+    agent = _portful(tmp_path, mock_logger,
+                     ProcRunner(print_text=lambda: _with_runs(fixture, state["runs"]), proc_etime="00:01"))
+    _write_fatal(agent, "[storage-lock] Storage is locked by another process (pid 607)")
+    assert not agent.port_conflict_report()              # first suspicious sample: not yet
+    state["runs"] = 5
+    report = agent.port_conflict_report()
+    assert report is not None
+    assert "keeps failing to start" in report and "restart" in report
+    assert "Storage is locked by another process" in report     # the cause, from the err log
+
+
+def test_a_respawn_loop_report_is_the_same_text_whichever_attempt_is_sampled(tmp_path, mock_logger):
+    """A rival holds the port. The old conflict message named OUR pid, which changes
+    on every respawn, so the plugin's "log only when it changes" never deduplicated
+    it. The respawn report must read identically in every phase, across attempts."""
+    state = {"text": _with_runs("respawn_attempt_running", 3)}
+    runner = ProcRunner(print_text=lambda: state["text"], proc_etime="00:03", listen_pids=[777],
+                        ps_lines=["777 node /elsewhere/MatterServer.js --port 5580"])
+    agent = _portful(tmp_path, mock_logger, runner)
+    _write_fatal(agent, _EADDRINUSE)
+    assert not agent.port_conflict_report()               # baseline sample, deferred
+    state["text"] = _with_runs("respawn_attempt_running", 4)
+    first = agent.port_conflict_report()
+    state["text"] = _with_runs("respawn_spawn_scheduled", 4)
+    time.sleep(0.002)                                    # next attempt's FATAL: new timestamp
+    _write_fatal(agent, _EADDRINUSE)
+    between = agent.port_conflict_report()
+    state["text"] = _with_runs("respawn_attempt_running", 5).replace("33602", "33688")
+    later = agent.port_conflict_report()
+    assert first is not None and first == between == later
+    assert "777" in first and EADDRINUSE_MARKER in first
+    assert "33602" not in first and "33688" not in later
+
+
+def test_a_single_crash_and_restart_is_not_called_a_loop(tmp_path, mock_logger):
+    # runs = 2 with last exit code 1: it failed once and the restart is (so far) fine.
+    text = launchctl_print_fixture("respawn_attempt_running").replace("runs = 3", "runs = 2")
+    agent = _portful(tmp_path, mock_logger, ProcRunner(print_text=text, proc_etime="00:04"))
+    assert agent.port_conflict_report() is None
+    assert agent.post_bootstrap_verdict() == VERDICT_PENDING
+
+
+@pytest.mark.parametrize("fixture", [
+    "kickstarted_twice_exit_1",           # a server that exits 1 on SIGTERM, `kickstart -k`ed twice
+    "kickstarted_twice_signal_death",     # killed by the signal: "last terminating signal = Terminated: 15"
+])
+def test_a_job_restarted_twice_but_healthy_is_never_called_a_loop(tmp_path, mock_logger, fixture):
+    """runs = 3 and a young pid, from two deliberate restarts (or two crashes weeks
+    apart) since the job was loaded. `runs` never climbs again, so however many
+    times it is sampled before the pid ages past the grace window, it is not a loop."""
+    state = {"etime": "00:05"}
+    agent = _portful(tmp_path, mock_logger,
+                     ProcRunner(print_text=launchctl_print_fixture(fixture), proc_etime=lambda: state["etime"]))
+    for etime in ("00:05", "00:20", "00:35", "01:50"):
+        state["etime"] = etime
+        assert not agent.port_conflict_report()
+        assert agent.post_bootstrap_verdict() == VERDICT_PENDING
+    state["etime"] = "02:05"
+    assert agent.post_bootstrap_verdict() == VERDICT_CONFLICT_FREE
+
+
+def test_two_reads_in_one_tick_with_the_same_runs_change_nothing(tmp_path, mock_logger):
+    import launch_agent
+    state = {"runs": 3}
+    agent = _portful(tmp_path, mock_logger,
+                     ProcRunner(print_text=lambda: _with_runs("respawn_attempt_running", state["runs"]),
+                                proc_etime="00:04"))
+    for _ in range(3):                    # one tick: report, then verdict — repeated, same runs
+        assert not agent.port_conflict_report()
+        assert agent.post_bootstrap_verdict() == VERDICT_PENDING
+    state["runs"] = 4
+    assert agent.port_conflict_report() is not None
+    assert agent.post_bootstrap_verdict() == launch_agent.VERDICT_RESPAWNING   # same tick: still a loop
+    assert agent.port_conflict_report() is not None
+
+
+def _state_agent(tmp_path, mock_logger, monkeypatch, *, listen_pids=()):
+    """An agent whose `launchctl print` text, ps age and port holders a test can change."""
+    clock = {"t": 10_000.0, "runs": 3, "etime": "00:04", "text": "respawn_attempt_running", "fail": False}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+    runner = ProcRunner(print_text=lambda: _with_runs(clock["text"], clock["runs"]),
+                        proc_etime=lambda: clock["etime"], listen_pids=list(listen_pids))
+    agent = _portful(tmp_path, mock_logger, runner)
+    real = agent._launchctl
+    agent._launchctl = lambda *a, **k: None if clock["fail"] and a[0] == "print" else real(*a, **k)
+    return agent, clock, runner
+
+
+def test_respawn_state_needs_a_climb_within_the_grace_window(tmp_path, mock_logger, monkeypatch):
+    import launch_agent as la
+    agent, clock, _runner = _state_agent(tmp_path, mock_logger, monkeypatch)
+    assert agent.respawn_state() == la.RESPAWN_SUSPECTED          # baseline (3, t)
+    assert agent.respawn_state() == la.RESPAWN_SUSPECTED          # same runs: nothing moves
+    clock["t"] += 15
+    clock["runs"] = 4
+    assert agent.respawn_state() == la.RESPAWN_LOOPING
+    assert agent.respawn_state() == la.RESPAWN_LOOPING            # same tick, read again
+    for runs in (12, 21):                                         # 200 s on: past the grace window…
+        clock["t"] += 100
+        clock["runs"] = runs
+        assert agent.respawn_state() == la.RESPAWN_LOOPING        # …but each LOOPING sample renewed it
+
+
+def test_a_baseline_older_than_the_grace_window_is_replaced_not_compared(tmp_path, mock_logger, monkeypatch):
+    import launch_agent as la
+    agent, clock, _runner = _state_agent(tmp_path, mock_logger, monkeypatch)
+    assert agent.respawn_state() == la.RESPAWN_SUSPECTED          # runs 3
+    clock["t"] += la.STARTUP_GRACE_SECONDS + 1                    # an ordinary restart, minutes later
+    clock["runs"] = 4
+    assert agent.respawn_state() == la.RESPAWN_SUSPECTED          # fresh baseline (4, now), not a climb
+    clock["t"] += 15
+    assert agent.respawn_state() == la.RESPAWN_SUSPECTED
+
+
+def test_a_managed_pid_listening_on_the_port_is_never_suspected(tmp_path, mock_logger, monkeypatch):
+    import launch_agent as la
+    agent, clock, _runner = _state_agent(tmp_path, mock_logger, monkeypatch, listen_pids=[33602])
+    for runs in (3, 4, 5):
+        clock["runs"] = runs
+        clock["t"] += 15
+        assert agent.respawn_state() == la.RESPAWN_NOT_LOOPING
+    assert agent.port_conflict_report() is None
+
+
+@pytest.mark.parametrize("unreadable", ["launchctl", "ps"])
+def test_an_unreadable_sample_is_unknown_and_changes_nothing(tmp_path, mock_logger, monkeypatch, unreadable):
+    import launch_agent as la
+    agent, clock, _runner = _state_agent(tmp_path, mock_logger, monkeypatch)
+    agent.respawn_state()
+    clock["t"] += 15
+    clock["runs"] = 4
+    assert agent.respawn_state() == la.RESPAWN_LOOPING
+    clock["t"] += 15
+    if unreadable == "launchctl":
+        clock["fail"] = True
+    else:
+        clock["etime"] = None
+    assert agent.respawn_state() == la.RESPAWN_UNKNOWN
+    assert agent.port_conflict_report() == la.RESPAWN_UNDECIDED  # mid-loop: say nothing at all
+    clock["fail"], clock["etime"], clock["runs"] = False, "00:03", 5
+    clock["t"] += 15
+    assert agent.respawn_state() == la.RESPAWN_LOOPING            # the baseline survived
+
+
+def test_unknown_with_no_loop_in_progress_falls_back_to_the_old_checks(tmp_path, mock_logger, monkeypatch):
+    # Never a report from what could not be read: with no loop under way, an unreadable
+    # launchctl leaves port_conflict_report exactly as it was before #374.
+    agent, clock, _runner = _state_agent(tmp_path, mock_logger, monkeypatch)
+    clock["fail"] = True
+    assert agent.port_conflict_report() is None
+
+
+def test_a_loop_report_never_names_our_own_pid_as_the_port_holder(tmp_path, mock_logger, monkeypatch):
+    agent, _clock, runner = _state_agent(tmp_path, mock_logger, monkeypatch, listen_pids=[777, 33602])
+    runner.ps_lines = ["777 node /elsewhere/MatterServer.js --port 5580"]
+    report = agent._respawn_loop_report({"pid": 33602, "last_exit": 1})
+    assert "777" in report and "33602" not in report
+
+
+def test_a_loop_report_sampled_between_attempts_still_never_names_our_own_pid(tmp_path, mock_logger, monkeypatch):
+    # The sample saw no pid ("spawn scheduled"); by the time the port is probed launchd
+    # has started the next attempt and it is listening. Telling the user to stop that
+    # pid would stop the managed server, so it is excluded by its identity NOW.
+    agent, _clock, runner = _state_agent(tmp_path, mock_logger, monkeypatch, listen_pids=[777, 33602])
+    runner.ps_lines = ["777 node /elsewhere/MatterServer.js --port 5580"]
+    report = agent._respawn_loop_report({"pid": None, "last_exit": 1})
+    assert "777" in report and "33602" not in report
+    runner.listen_pids = [33602]
+    assert "is held by" not in agent._respawn_loop_report({"pid": None, "last_exit": 1})
+
+
+def test_an_unusable_port_probe_is_unknown_not_a_pid_that_is_not_listening(tmp_path, mock_logger, monkeypatch):
+    # lsof failing says nothing about who holds the port: it must not count a young
+    # managed process as "not listening" and so feed a loop report.
+    import launch_agent as la
+    agent, clock, _runner = _state_agent(tmp_path, mock_logger, monkeypatch)
+    assert agent.respawn_state() == la.RESPAWN_SUSPECTED
+    baseline = agent._respawn_baseline
+    agent._port_listener_pids = lambda: None
+    clock["t"] += 15
+    clock["runs"] = 4
+    assert agent.respawn_state() == la.RESPAWN_UNKNOWN
+    assert agent._respawn_baseline == baseline
+
+
+# ---------------------------------------------------------------------------
 # adopt_pending_bootstrap_verification() — a rebuild whose own ensure_installed()
 # left a healthy job alone must not silently drop the replaced instance's
 # still-pending #187 verification (bridge_agent_menu_mixin.py's _start_bridge_agent).
@@ -916,7 +1159,7 @@ def test_controller_spec_pins_matter_server(tmp_path, mock_logger):
     sp = ServerProcess({"serverLocation": "local"}, mock_logger, home=str(home),
                        npx_path="/opt/homebrew/bin/npx", runner=FakeRunner())
     assert sp.spec.package == "matter-server"
-    assert sp.spec.install_spec == "matter-server@1.2.2"
+    assert sp.spec.install_spec == DEFAULT_INSTALL_SPEC   # the constant; its value is pinned in test_server_process
     assert sp.spec.default_entry == "dist/esm/MatterServer.js"
     assert sp.spec.port == 5580                 # int for lsof; sp.port stays the CLI string
     assert sp.port == "5580"

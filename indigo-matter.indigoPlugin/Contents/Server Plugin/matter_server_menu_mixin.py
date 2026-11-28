@@ -552,7 +552,7 @@ class MatterServerMenuMixin:
         for the export bridge's own pairing codes.
 
         **Why there is no "is a window already open" pre-check.**
-        matter-server 1.2.2 has no command to ask, and no way to re-read a
+        matter-server (1.2.2 through 1.6.1) has no command to ask, and no way to re-read a
         code once issued — a lost code is unrecoverable, which is why every
         refusal path below says so rather than implying a retry is free.
         """

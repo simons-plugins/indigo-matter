@@ -985,13 +985,31 @@ def test_apply_plist_warns_when_stale_job_wont_bootout(sp):
 # (forum t=21404). bootout only stops the managed job — we must reap the stray.
 # ---------------------------------------------------------------------------
 
+#: REAL ``launchctl print`` output, captured on macOS 2026-11-26 from a throwaway
+#: LaunchAgent that exits 1 two seconds after start under this plugin's own KeepAlive
+#: policy {SuccessfulExit: false, Crashed: true} — the shape matter-server 1.6.1 takes
+#: when it cannot start (issue #374). Path and socket names anonymised; nothing else.
+_LAUNCHCTL_FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "launchctl_print")
+
+
+def launchctl_print_fixture(name: str) -> str:
+    """``respawn_attempt_running`` (an attempt is alive: runs = 3, pid, last exit code = 1),
+    ``respawn_spawn_scheduled`` (between attempts: no pid line) or
+    ``first_run_never_exited`` (runs = 1, last exit code = (never exited))."""
+    with open(os.path.join(_LAUNCHCTL_FIXTURES, f"{name}.txt"), encoding="utf-8") as handle:
+        return handle.read()
+
+
 class ProcRunner(FakeRunner):
     """Models `ps`, `kill` (simulating process exit), and `launchctl print` (pid)."""
 
     def __init__(self, ps_lines=None, print_pid=None, ignore_term=False,
                  omit_pid_line=False, garbled_pid=False, listen_pids=None,
-                 job_arguments=None, returncode=0, proc_etime="10:00"):
+                 job_arguments=None, returncode=0, proc_etime="10:00", print_text=None):
         super().__init__(returncode)
+        # Verbatim `launchctl print` output (or a zero-arg callable returning it), which
+        # overrides the synthesised one below — for the real captured fixtures above.
+        self.print_text = print_text
         # What `ps -o etime=` reports for any pid. Defaults to 10 minutes — safely past
         # STARTUP_GRACE_SECONDS, so tests that don't care about age behave as "settled".
         # None models a ps that cannot tell us.
@@ -1018,9 +1036,10 @@ class ProcRunner(FakeRunner):
             if "etime=" in cmd:
                 # `ps -o etime= -p N` — process age, for the #183 startup-grace gate.
                 # None models "ps could not tell us" (rc 1, no such process).
-                if self.proc_etime is None:
+                etime = self.proc_etime() if callable(self.proc_etime) else self.proc_etime
+                if etime is None:
                     return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
-                return subprocess.CompletedProcess(cmd, 0, stdout=f"  {self.proc_etime}\n", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"  {etime}\n", stderr="")
             return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(self.ps_lines) + "\n", stderr="")
         # Basename, not equality: the port probe resolves lsof by absolute path
         # (/usr/sbin/lsof) and only falls back to the bare name (#182).
@@ -1035,6 +1054,9 @@ class ProcRunner(FakeRunner):
                 self.ps_lines = [ln for ln in self.ps_lines if ln.split()[0] != pid]
             return subprocess.CompletedProcess(cmd, 0, "", "")
         if len(cmd) >= 2 and cmd[0] == "launchctl" and cmd[1] == "print":
+            if self.print_text is not None:
+                text = self.print_text() if callable(self.print_text) else self.print_text
+                return subprocess.CompletedProcess(cmd, 0, stdout=text, stderr="")
             if self.print_pid is None:
                 return subprocess.CompletedProcess(cmd, 1, "", "")
             out = "\tstate = running\n"
@@ -1204,6 +1226,34 @@ def test_reload_leaves_healthy_job_untouched_when_no_orphan(tmp_path, mock_logge
     subs = [c[1] for c in runner.calls if len(c) > 1]
     assert "bootout" not in subs
     assert not runner.signals
+
+
+def test_reload_over_a_respawning_job_is_not_left_alone_silently(tmp_path, mock_logger):
+    """Issue #374: matter-server 1.6.1 exits 1 on a failed start and launchd respawns it
+    about every 10 s. A plugin reload that samples a live attempt sees a pid, a matching
+    digest and no orphan — every pre-#374 signal for "healthy, hands off" — and used to
+    log nothing and schedule nothing. One sample cannot tell a loop from a healthy job
+    restarted twice since it was loaded, so the reload arms a verification that is due
+    at once: the watchdog's next sample, with `runs` climbed, reports the loop. Nothing
+    may be stopped or signalled to get there (restarting would only fail the same way)."""
+    runner = ProcRunner(print_text=launchctl_print_fixture("first_run_never_exited"))
+    sp = _sp_proc_installed(tmp_path, mock_logger, runner)
+    sp.ensure_installed()                                # records the marker
+    sp.clear_bootstrap_verification(sp._bootstrap_verify_after)
+    runner.print_text = launchctl_print_fixture("respawn_attempt_running")      # runs = 3
+    runner.proc_etime = "00:04"
+    runner.calls.clear()
+    mock_logger.reset_mock()
+
+    def fatal_if_restarted(cmd, **kwargs):
+        if cmd[:2] in (["launchctl", "bootout"], ["launchctl", "bootstrap"]) or cmd[:1] == ["kill"]:
+            raise AssertionError(f"a reload must not restart a respawning job: {cmd}")
+        return ProcRunner.__call__(runner, cmd, **kwargs)
+    sp._run = fatal_if_restarted
+    assert sp.ensure_installed() is False                # left running…
+    assert sp.due_for_bootstrap_verification() is not None   # …but not left alone
+    runner.print_text = runner.print_text.replace("\truns = 3\n", "\truns = 4\n", 1)
+    assert "keeps failing to start" in (sp.port_conflict_report() or "")
 
 
 def test_reload_reports_a_foreign_port_holder_instead_of_declaring_health(tmp_path,
@@ -1640,7 +1690,7 @@ def test_install_not_blocked_when_node_version_unreadable(tmp_path, prefs, mock_
 # ---------------------------------------------------------------------------
 # version_drift (issue #75): running matter-server vs this release's pin
 # ---------------------------------------------------------------------------
-from server_process import version_drift  # noqa: E402
+from server_process import PINNED_VERSION, version_drift  # noqa: E402
 
 _MJS = " (matter.js/0.17.0-alpha.0-20260101-abc)"
 
@@ -1698,6 +1748,24 @@ def test_version_drift_defaults_to_pin():
     from server_process import DEFAULT_INSTALL_SPEC
     pinned = DEFAULT_INSTALL_SPEC.split("@", 1)[1]
     assert version_drift("matter-server/0.0.1")[1] == pinned
+
+
+# sdk_version exactly as matter-server 1.6.1 reported it in server_info, captured from a
+# throwaway local instance on 2026-11-26 (issue #374).
+_REAL_1_6_1 = "matter-server/1.6.1 (matter.js/0.18.1)"
+
+
+def test_version_drift_default_pin_matches_the_real_1_6_1_server():
+    assert version_drift(_REAL_1_6_1) == ("1.6.1", "1.6.1", "current")
+
+
+@pytest.mark.parametrize("running", [
+    "matter-server/1.2.2 (matter.js/0.17.5-alpha.0-20260710-82b39217b)",  # the previous pin
+    "matter-server/1.6.0 (matter.js/0.18.1-alpha.0-20261114-0000000)",
+    f"matter-server/{PINNED_VERSION}-alpha.0-20261125-0000000 (matter.js/0.18.1)",   # pre-release of the pin
+])
+def test_version_drift_default_pin_calls_anything_below_1_6_1_older(running):
+    assert version_drift(running)[1:] == (PINNED_VERSION, "older")
 
 
 def test_version_drift_oversized_numeric_component_is_unknown_not_an_exception():

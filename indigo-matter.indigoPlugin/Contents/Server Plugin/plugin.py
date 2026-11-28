@@ -31,6 +31,7 @@ import threading
 import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
+from typing import Optional
 
 import indigo  # provided by the Indigo runtime
 
@@ -52,7 +53,8 @@ from export_recovery_menu_mixin import ExportRecoveryMenuMixin
 from export_store import ExportStore
 from http_api_mixin import HttpApiMixin
 from http_handlers import HttpApi
-from launch_agent import STARTUP_GRACE_SECONDS, VERDICT_CONFLICT_FREE, VERDICT_DEAD
+from launch_agent import (RESPAWN_LOOP_PHRASE, RESPAWN_UNDECIDED, STARTUP_GRACE_SECONDS, VERDICT_CONFLICT_FREE,
+                          VERDICT_DEAD, VERDICT_RESPAWNING)
 from matter_client import MatterClient
 from matter_handlers.registry import HandlerRegistry
 from node_replace_menu_mixin import NodeReplaceMenuMixin
@@ -116,6 +118,24 @@ def _dead_verdict_cause_text(agent) -> str:
     # ". See <path>." after this text, so a trailing period here would double up.
     return cause.message.rstrip(".")
 
+
+
+def _resolved_text(agent, previous: str) -> Optional[str]:
+    """The line announcing that a report from :meth:`Plugin._check_agent_port_conflict`
+    has cleared, "" to clear it silently, or None to keep it standing.
+
+    A start-up loop (issue #374) is resolved only when our managed pid is the one
+    listening on the port — authoritative; a fresh attempt that has a pid but has not
+    bound yet is not "running again". A #182 port conflict keeps its old gate: a pid.
+    """
+    if RESPAWN_LOOP_PHRASE in previous:
+        if not agent.managed_pid_holds_port():
+            return None
+        return f"{agent.spec.package} is running again; the start-up problem reported earlier is resolved."
+    if not agent.managed_job_has_pid():
+        return ""
+    return (f"{agent.spec.package} now owns port {agent.spec.port} again; the port conflict reported "
+            f"earlier is resolved.")
 
 
 def _unreachable_state(dev_id, logger=None):
@@ -1133,7 +1153,10 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             )
             setattr(self, next_attr, now + PORT_CONFLICT_CHECK_INTERVAL)
             return
-        if due_token is None and now < getattr(self, next_attr, 0.0):
+        # A standing start-up loop report (#374) is re-checked every tick, so its end is
+        # announced as soon as the controller serves again, not up to an interval later.
+        if (due_token is None and now < getattr(self, next_attr, 0.0)
+                and RESPAWN_LOOP_PHRASE not in (getattr(self, last_attr, None) or "")):
             return
         setattr(self, next_attr, now + PORT_CONFLICT_CHECK_INTERVAL)
         try:
@@ -1142,6 +1165,11 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
             # a diagnostic must never kill the watchdog
             self.logger.debug("port conflict check failed: %s", exc)
             return  # leave any pending #187 verification armed; the next tick retries
+        if conflict == RESPAWN_UNDECIDED:
+            # #374: a suspected respawn loop, or a sample that could not be read in the
+            # middle of one. Not healthy and not yet a report: leave the remembered
+            # report, any armed verification (the agent armed one) and the log alone.
+            return
         if due_token is not None:
             if conflict:
                 agent.clear_bootstrap_verification(due_token)  # a verdict; the error path below logs it
@@ -1160,21 +1188,32 @@ class Plugin(HttpApiMixin, ExportDialogMixin, PairingMenuMixin, MatterServerMenu
                         os.path.join(agent.log_dir, agent.spec.err_log),
                     )
                     agent.clear_bootstrap_verification(due_token)
-                elif verdict == VERDICT_CONFLICT_FREE:
+                elif verdict in (VERDICT_CONFLICT_FREE, VERDICT_RESPAWNING):
+                    # RESPAWNING (issue #374) is normally already the report above; if a
+                    # loop only showed up on this second launchd read, the next interval
+                    # check reports it. Either way waiting cannot end it, so never let it
+                    # run on into the "abandoned" warning.
                     agent.clear_bootstrap_verification(due_token)
                 # else VERDICT_PENDING: too young (or unknowable) to render a verdict yet —
                 # leave the flag armed so the next tick retries.
+        self._log_report_change(agent, last_attr, conflict)
+
+    def _log_report_change(self, agent, last_attr: str, conflict: Optional[str]) -> None:
+        """Log *conflict* only if it differs from the last one logged for this agent."""
         previous = getattr(self, last_attr, None)
         if conflict == previous:
             return
         if conflict:
             self.logger.error(conflict)
-        elif previous and agent.managed_job_has_pid():
-            # Gated on a pid (#187 review): port_conflict_report() also goes quiet when the
+        elif previous:
+            # Gated (#187 review, #374): port_conflict_report() also goes quiet when the
             # managed job has NO pid at all — the dead-process branch above already reported
-            # that, and it is the opposite of resolved.
-            self.logger.info("%s now owns port %s again; the port conflict reported "
-                             "earlier is resolved.", agent.spec.package, agent.spec.port)
+            # that, and it is the opposite of resolved. See _resolved_text.
+            text = _resolved_text(agent, previous)
+            if text is None:
+                return
+            if text:
+                self.logger.info("%s", text)
         setattr(self, last_attr, conflict)
 
     # ------------------------------------------------------------------

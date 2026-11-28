@@ -1,0 +1,76 @@
+gui/502/com.example.scratch-exit1-probe = {
+	active count = 1
+	path = /Users/example/Library/LaunchAgents/com.example.scratch-exit1-probe.plist
+	type = LaunchAgent
+	state = running
+
+	program = /bin/sh
+	arguments = {
+		/bin/sh
+		-c
+		sleep 2; exit 1
+	}
+
+	inherited environment = {
+		SSH_AUTH_SOCK => /var/run/com.apple.launchd.XXXX/Listeners
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => com.example.scratch-exit1-probe
+	}
+
+	domain = gui/502 [100023]
+	asid = 100023
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 3
+	pid = 33602
+	immediate reason = semaphore
+	forks = 1
+	execs = 2
+	initialized = 1
+	trampolined = 1
+	started suspended = 0
+	proxy started suspended = 0
+	checked allocations = 0 (queried = 1)
+	checked allocations reason = no host
+	checked allocations flags = 0x0
+	last exit code = 1
+
+	semaphores = {
+		successful exit => 0
+		after crash => 1
+	}
+
+	resource coalition = {
+		ID = 42861
+		type = resource
+		state = active
+		active count = 1
+		name = com.example.scratch-exit1-probe
+	}
+
+	jetsam coalition = {
+		ID = 42862
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.example.scratch-exit1-probe
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	sanitizer flags = 0x0
+
+	properties = runatload | inferred program
+}

@@ -174,7 +174,7 @@ class PowerSourceHandler(ClusterHandler):
         # gaining/losing a child, which IS a structure change — and that DOES
         # fire node_updated (see handle_event's EVT_ENDPOINT_ADDED branch in
         # device_sync.py, and the protocol.py note above EVT_ENDPOINT_ADDED
-        # citing matter.js PairedNode.ts #triggerNodeStructureChanges), which
+        # on how that ordering differs between matter-server versions), which
         # triggers a fresh create_devices pass that rebuilds the coverage map
         # from the whole snapshot. A pure value rewrite without a structure
         # change would instead wait for the next reconcile — acceptable for

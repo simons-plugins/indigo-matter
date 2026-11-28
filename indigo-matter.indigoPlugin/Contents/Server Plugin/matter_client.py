@@ -117,7 +117,7 @@ class MatterClient(WsJsonClient):
         # on_connect reconcile, so nothing here needs the response.
         await self._send_frame(self.proto.build_request(protocol.CMD_START_LISTENING))
         # Log the server version so a restart/install can be confirmed to have landed on
-        # the intended version (sdk_version e.g. "matter-server/1.2.2 (matter.js/…)").
+        # the intended version (sdk_version e.g. "matter-server/1.6.1 (matter.js/0.18.1)").
         version = (self.server_info or {}).get("sdk_version", "version unknown")
         self.logger.info("connected to matter-server (%s), listening", version)
 
@@ -183,7 +183,7 @@ class MatterClient(WsJsonClient):
 
         ``CMD_READ_ATTR`` has been defined in :mod:`protocol` since the first
         build with no caller; the arg shape below is live-verified against
-        matter-server 1.2.2.
+        matter-server 1.2.2, and 1.6.1 accepts it (live, against a missing node only).
         """
         path = self.proto.attr_key(endpoint, cluster, attribute)
         result = await self.request(

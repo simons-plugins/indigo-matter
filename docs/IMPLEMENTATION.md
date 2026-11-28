@@ -17,9 +17,10 @@ contract (including `node_scoped` fan-out and `on_node_event`), `on_off.py` is
 the canonical simple handler, `thermostat.py` the precedent for attribute
 writes, and `registry.py` lists everything wired in.
 
-> **Install note (hard-won):** the npm package `matter-server` has **no `bin`
-> entry** — `npx matter-server` fails with "could not determine executable to
-> run". The managed LaunchAgent therefore launches
+> **Install note (hard-won):** the npm package `matter-server` had **no `bin`
+> entry** up to 1.4.0 — `npx matter-server` failed with "could not determine
+> executable to run". 1.5.0 added one, which only turns on source maps and
+> imports the same file. The managed LaunchAgent launches
 > `node …/node_modules/matter-server/dist/esm/MatterServer.js` directly. Full
 > install/setup lives in [`INSTALL.md`](./INSTALL.md).
 
@@ -51,7 +52,7 @@ the **only** module that may know these wire names.
 | `get_nodes` | `{}` | Returns ALL commissioned nodes regardless of liveness — use each node's `available` flag, not mere presence |
 | `get_node` | `{node_id}` | |
 | `commission_with_code` | `{code, network_only}` | `network_only: true` in this architecture (share model, no BLE). LAN discovery can exceed 60 s — plugin RPC timeout is 300 s |
-| `open_commissioning_window` | `{node_id, timeout}` | Issue #210: `timeout` here is the commissioning-window DURATION in seconds, NOT an RPC deadline — verified against matter-server v1.2.2's `WebSocketControllerHandler.ts`. Omit it and the window defaults to 900 s (matter.js's own default). Result is `{setup_pin_code, setup_manual_code, setup_qr_code}` (snake_case — NOT the camelCase `manualPairingCode`/`qrPairingCode` our own outbound `bridge_protocol` emits, a different wire contract). 1.2.2 accepts `iteration`/`option`/`discriminator` in the arg type but has them commented out of the destructure, so every window opened this way is an Enhanced window. There is no command to ask whether a window is already open, and no way to re-read a code once issued |
+| `open_commissioning_window` | `{node_id, timeout}` | Issue #210: `timeout` here is the commissioning-window DURATION in seconds, NOT an RPC deadline — verified against matter-server v1.2.2's and v1.6.1's `WebSocketControllerHandler.ts`. Omit it and the window defaults to 900 s (matter.js's own default). Result is `{setup_pin_code, setup_manual_code, setup_qr_code}`, plus `discriminator`, `vendor_id`, `product_id` and `commissioning_timeout` from 1.5.0, which the plugin ignores (snake_case — NOT the camelCase `manualPairingCode`/`qrPairingCode` our own outbound `bridge_protocol` emits, a different wire contract). 1.2.2 and 1.6.1 accept `iteration`/`option`/`discriminator` in the arg type but have them commented out of the destructure, so every window opened this way is an Enhanced window. 1.6.1 refuses a `timeout` that is not a positive number with InvalidArguments (8). There is no command to ask whether a window is already open, and no way to re-read a code once issued |
 | `interview_node` | `{node_id}` | |
 | `remove_node` | `{node_id}` | |
 | `read_attribute` | `{node_id, attribute_path}` | `attribute_path` is `"endpoint/cluster/attribute"`, decimal |

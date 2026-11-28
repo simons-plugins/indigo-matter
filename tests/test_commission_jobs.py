@@ -1909,6 +1909,42 @@ def test_other_commissioning_failures_get_no_hint(mock_logger, details):
     assert final["error"]["message"] == f"matter-server error 50: {details}"
 
 
+# matter-server 1.6.1 (issue #374) sends a machine-readable `reason` on commissioning
+# errors (@matter-server/ws-client models/model.ts CommissionFailureReason), and its
+# matter.js can report a failed discovery in words other than the phrase above.
+
+def test_reason_not_discovered_gets_the_hint_without_the_phrase(mock_logger):
+    from protocol import ProtocolError
+    details = "Commission failed: discovery of node with discriminator 3840 failed: Node not found"
+    _j, _b, final = _fail_with(
+        mock_logger, lambda: ProtocolError(1, details, reason="not-discovered"))
+    assert details in final["error"]["message"]
+    assert f"Plugins ▸ Matter ▸ {_RESTART_MENU_ITEM}" in final["error"]["message"]
+
+
+@pytest.mark.parametrize("reason", ["passcode-mismatch", "invalid-payload", "attestation-rejected",
+                                    "timeout", "other"])
+def test_any_other_reason_gets_no_hint(mock_logger, reason):
+    # "timeout" too: in 1.6.1 it covers DiscoveryIncompleteError, where a device WAS found.
+    from protocol import ProtocolError
+    _j, _b, final = _fail_with(mock_logger, lambda: ProtocolError(1, "Commission failed: x", reason=reason))
+    assert final["error"]["code"] == "commissioning_failed"
+    assert _RESTART_MENU_ITEM not in final["error"]["message"]
+
+
+def test_no_reason_falls_back_to_the_phrase_as_1_2_2_needs(mock_logger):
+    from protocol import ProtocolError
+    _j, _b, final = _fail_with(mock_logger, lambda: ProtocolError(1, _DISCOVERY_DETAILS))
+    assert _RESTART_MENU_ITEM in final["error"]["message"]
+
+
+def test_a_reason_with_empty_details_does_not_end_in_a_bare_colon():
+    from protocol import ProtocolError
+    exc = ProtocolError(1, "", reason="not-discovered")
+    assert not str(exc).rstrip().endswith(":")
+    assert "not-discovered" in str(exc)
+
+
 def test_a_commission_error_with_the_phrase_is_hinted_too(mock_logger):
     _j, _b, final = _fail_with(
         mock_logger, lambda: CommissionError("commissioning_failed", _DISCOVERY_DETAILS))
